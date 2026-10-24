@@ -1,0 +1,229 @@
+from __future__ import annotations
+
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from sonus.events import EventBus
+from sonus.memory import MemoryStore
+from sonus.policy import ApprovalManager, PathGuard
+from sonus.storage import ArtifactStore
+from sonus.tools import ToolExecutor, find_ripgrep, tool_schemas
+
+
+class ToolTests(unittest.TestCase):
+    def test_tool_schemas_include_structured_output_and_documents(self) -> None:
+        names = {item["function"]["name"] for item in tool_schemas()}
+        self.assertIn("submit_result", names)
+        self.assertIn("write_document", names)
+        self.assertIn("memory_context_metrics", names)
+
+    def make_executor(
+        self,
+        root: Path,
+        *,
+        memory: MemoryStore | None = None,
+    ) -> ToolExecutor:
+        return ToolExecutor(
+            workspace=root,
+            path_guard=PathGuard(root),
+            approvals=ApprovalManager(
+                auto_approve=False,
+                interactive=False,
+                workspace=root,
+            ),
+            artifacts=ArtifactStore(root, root / ".data"),
+            events=EventBus(root / ".data"),
+            memory=memory,
+        )
+
+    def test_read_write_patch_search_and_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root)
+            write = executor.execute("write_file", {"path": "a.txt", "content": "hello\n"})
+            self.assertTrue(write.ok)
+            patch = executor.execute(
+                "patch_file",
+                {"path": "a.txt", "old_text": "hello", "new_text": "hello sonus"},
+            )
+            self.assertTrue(patch.ok)
+            read = executor.execute("read_file", {"path": "a.txt"})
+            self.assertIn("hello sonus", read.content)
+            search = executor.execute("search_text", {"query": "sonus"})
+            self.assertIn("a.txt", search.content)
+            listing = executor.execute("list_files", {"depth": 2})
+            self.assertIn("a.txt", listing.content)
+
+    def test_command_output_and_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            executor = self.make_executor(Path(temp))
+            result = executor.execute("run_command", {"command": "printf 'ok\\n'"})
+            self.assertTrue(result.ok)
+            self.assertIn("exit_code=0", result.content)
+            self.assertIn("ok", result.content)
+
+    def test_pipeline_masked_python_error_is_marked_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            executor = self.make_executor(Path(temp))
+            result = executor.execute(
+                "run_command",
+                {
+                    "command": (
+                        "python3 -c 'import sonus_missing_tokenizer' "
+                        "2>&1 | head -2"
+                    )
+                },
+            )
+            self.assertFalse(result.ok)
+            self.assertIn("exit_code=0", result.content)
+            self.assertIn("semantic_check", result.content)
+            self.assertIn("Python traceback", result.content)
+
+    def test_memory_context_metrics_is_read_only_and_allowed_for_question(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            memory = MemoryStore(root / ".data" / "memory.db")
+            memory.add(
+                content="用户偏好：先给结论",
+                scope="global",
+                kind="preference",
+                status="supported",
+            )
+            executor = self.make_executor(root, memory=memory)
+            executor.begin_request("每次送入上下文的 token 有多少？")
+
+            result = executor.execute("memory_context_metrics", {})
+
+            self.assertTrue(result.ok)
+            self.assertIn("偏好", result.content)
+            self.assertIn("exact=false", result.content)
+            memory.close()
+
+    def test_outside_path_is_denied(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            executor = self.make_executor(Path(temp) / "workspace")
+            result = executor.execute("read_file", {"path": "/etc/hosts"})
+            self.assertFalse(result.ok)
+            self.assertIn("路径越界", result.content)
+
+    def test_bounded_fallback_ignores_large_and_sensitive_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root)
+            (root / "src").mkdir()
+            (root / "src" / "visible.txt").write_text("needle\n", encoding="utf-8")
+            for directory in (".git", "node_modules", ".ssh", "Library"):
+                path = root / directory
+                path.mkdir()
+                (path / "hidden.txt").write_text("needle\n", encoding="utf-8")
+            (root / ".env").write_text("needle=secret\n", encoding="utf-8")
+
+            with patch("sonus.tools.find_ripgrep", return_value=None):
+                result = executor.execute(
+                    "search_text",
+                    {"query": "needle", "timeout_sec": 2},
+                )
+
+            self.assertTrue(result.ok)
+            self.assertIn("src/visible.txt", result.content)
+            self.assertNotIn(".git", result.content)
+            self.assertNotIn("node_modules", result.content)
+            self.assertNotIn(".ssh", result.content)
+            self.assertNotIn(".env", result.content)
+            self.assertIn("bounded-python-fallback", result.content)
+
+    def test_fallback_timeout_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root)
+            (root / "a.txt").write_text("needle\n", encoding="utf-8")
+
+            with (
+                patch("sonus.tools.find_ripgrep", return_value=None),
+                patch("sonus.tools.time.monotonic", side_effect=[0.0, 2.0]),
+            ):
+                result = executor.execute(
+                    "search_text",
+                    {"query": "needle", "timeout_sec": 1},
+                )
+
+            self.assertFalse(result.ok)
+            self.assertIn("超过 1 秒", result.content)
+            self.assertIn("bounded-python-fallback", result.content)
+
+    def test_find_ripgrep_honors_explicit_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            executable = Path(temp) / "rg"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o700)
+            with patch.dict(os.environ, {"SONUS_RG_PATH": str(executable)}):
+                self.assertEqual(find_ripgrep(), str(executable.resolve()))
+
+    def test_write_document_uses_profile_and_rejects_missing_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root)
+            valid = executor.execute(
+                "write_document",
+                {
+                    "path": "docs/DESIGN.md",
+                    "profile": "design",
+                    "title": "设计",
+                    "summary": "摘要",
+                    "sections": [
+                        {"heading": "目标", "body": "目标"},
+                        {"heading": "架构", "body": "架构"},
+                        {"heading": "数据流", "body": "数据流"},
+                        {"heading": "安全边界", "body": "边界"},
+                        {"heading": "验证", "body": "验证"},
+                    ],
+                    "sources": ["src/a.py"],
+                },
+            )
+            self.assertTrue(valid.ok)
+            content = (root / "docs" / "DESIGN.md").read_text(encoding="utf-8")
+            self.assertIn("sonus_document: design", content)
+            self.assertIn("## 架构", content)
+
+            invalid = executor.execute(
+                "write_document",
+                {
+                    "path": "docs/INVALID.md",
+                    "profile": "report",
+                    "title": "报告",
+                    "sections": [{"heading": "结论", "body": "结论"}],
+                },
+            )
+            self.assertFalse(invalid.ok)
+            self.assertIn("缺少章节", invalid.content)
+            self.assertFalse((root / "docs" / "INVALID.md").exists())
+
+    def test_unrequested_side_effects_are_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "note.txt").write_text("safe", encoding="utf-8")
+            executor = self.make_executor(root)
+            executor.begin_request("这个文件为什么有问题？只分析。")
+            read = executor.execute("read_file", {"path": "note.txt"})
+            write = executor.execute(
+                "write_file",
+                {"path": "new.txt", "content": "unrequested"},
+            )
+            command = executor.execute("run_command", {"command": "ls"})
+            fetch = executor.execute(
+                "fetch_url",
+                {"url": "https://example.com"},
+            )
+            self.assertTrue(read.ok)
+            for result in (write, command, fetch):
+                self.assertFalse(result.ok)
+                self.assertIn("没有明确要求", result.content)
+            self.assertFalse((root / "new.txt").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
+

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sonus-agent"
+version = "0.1.0"
+description = "A local-first, voice-ready coding agent with evidence-based memory and proactive companionship."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Sonus" }]
+dependencies = []
+
+[project.scripts]
+sonus = "sonus.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

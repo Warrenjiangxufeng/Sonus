@@ -1,0 +1,951 @@
+from __future__ import annotations
+
+import fnmatch
+import json
+import os
+import re
+import selectors
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from sonus.config import redact_text, make_ssl_context
+from sonus.documents import DOCUMENT_PROFILES, render_document
+from sonus.events import EventBus
+from sonus.memory import MemoryStore
+from sonus.policy import ApprovalManager, PathGuard, PolicyError, command_denial_reason
+from sonus.scope import RequestScope, classify_request
+from sonus.skills import SKILLS_DIRNAME, SkillLibrary
+from sonus.storage import ArtifactStore
+from sonus.result import result_tool_schema
+
+
+MAX_FILE_BYTES = 2 * 1024 * 1024
+MAX_TOOL_OUTPUT = 60_000
+SEARCH_TIMEOUT_SEC = 15
+SEARCH_MAX_FILES = 20_000
+SEARCH_MAX_LINE_BYTES = 1024 * 1024
+
+
+def _semantic_command_failure(output: str) -> str:
+    """Detect clear failures that a shell pipeline may mask with exit code 0."""
+    checks = (
+        (r"(?m)^Traceback \(most recent call last\):\s*$", "Python traceback"),
+        (r"(?m)^(?:[A-Za-z_][\w.]*)?(?:Error|Exception):", "异常"),
+        (r"(?m)^(?:zsh|sh|bash): .*command not found", "命令不存在"),
+        (r"(?m)^(?:zsh|sh|bash): .*no matches found", "路径或参数不存在"),
+        (r"(?m)^(?:curl|wget): .*(?:Could not resolve host|Connection refused)", "网络失败"),
+    )
+    for pattern, label in checks:
+        match = re.search(pattern, output)
+        if match:
+            line = next(
+                (
+                    item.strip()
+                    for item in output[match.start() :].splitlines()
+                    if item.strip()
+                ),
+                label,
+            )
+            return f"{label}：{line[:300]}"
+    return ""
+
+
+_IGNORED_NAMES = {
+    ".git",
+    ".sonus",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    "dist",
+    "build",
+}
+
+_SEARCH_IGNORED_NAMES = _IGNORED_NAMES | {
+    ".aws",
+    ".cache",
+    ".codex",
+    ".dsh",
+    ".gnupg",
+    ".ssh",
+    ".Trash",
+    "Library",
+    "target",
+}
+
+_SEARCH_SENSITIVE_FILES = {
+    ".git-credentials",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "credentials",
+    "id_ed25519",
+    "id_rsa",
+}
+
+
+def _ignored(name: str) -> bool:
+    return name in _IGNORED_NAMES
+
+
+def _search_ignored(name: str, *, is_dir: bool = False) -> bool:
+    if name in _SEARCH_IGNORED_NAMES:
+        return True
+    if is_dir:
+        return False
+    lowered = name.lower()
+    return (
+        lowered in _SEARCH_SENSITIVE_FILES
+        or lowered.startswith(".env")
+        or lowered.endswith((".key", ".p12", ".pem", ".pfx"))
+    )
+
+
+def find_ripgrep() -> str | None:
+    """Find ripgrep without relying only on the launcher's inherited PATH."""
+    configured = os.environ.get("SONUS_RG_PATH", "").strip()
+    candidates = []
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    found = shutil.which("rg")
+    if found:
+        candidates.append(Path(found))
+    candidates.extend(
+        Path(path).expanduser()
+        for path in (
+            "/opt/homebrew/bin/rg",
+            "/usr/local/bin/rg",
+            "/opt/local/bin/rg",
+            "~/.cargo/bin/rg",
+            "~/.local/bin/rg",
+        )
+    )
+    sonus_runtime_home = Path(
+        os.environ.get("SONUS_PROVIDER_HOME")
+        or os.environ.get("CODEX_HOME")
+        or Path.home() / ".codex"
+    )
+    sonus_releases = sonus_runtime_home / "packages" / "app-server-daemon" / "releases"
+    if sonus_releases.is_dir():
+        bundled = list(sonus_releases.glob("*/codex-path/rg"))
+        bundled.sort(
+            key=lambda path: path.stat().st_mtime
+            if path.exists()
+            else 0,
+            reverse=True,
+        )
+        candidates.extend(bundled)
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate.resolve())
+        except OSError:
+            continue
+    return None
+
+
+@dataclass
+class ToolResult:
+    ok: bool
+    content: str
+    changed_files: list[str] = field(default_factory=list)
+    artifact: str | None = None
+
+    def as_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {"ok": self.ok, "content": self.content}
+        if self.changed_files:
+            payload["changed_files"] = self.changed_files
+        if self.artifact:
+            payload["artifact"] = self.artifact
+        return payload
+
+
+def tool_schemas() -> list[dict[str, Any]]:
+    def fn(name: str, description: str, properties: dict[str, Any], required: list[str]):
+        return {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    document_profile_text = "; ".join(
+        f"{name}={','.join(headings)}"
+        for name, headings in sorted(DOCUMENT_PROFILES.items())
+    )
+
+    return [
+        fn(
+            "read_file",
+            "Read a UTF-8 text file inside the workspace. Returns numbered lines.",
+            {
+                "path": {"type": "string", "description": "Workspace-relative path."},
+                "start_line": {"type": "integer", "minimum": 1, "default": 1},
+                "end_line": {"type": "integer", "minimum": 1, "default": 400},
+            },
+            ["path"],
+        ),
+        fn(
+            "list_files",
+            "List files and directories inside the workspace.",
+            {
+                "path": {"type": "string", "default": "."},
+                "depth": {"type": "integer", "minimum": 1, "maximum": 8, "default": 2},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 250},
+            },
+            [],
+        ),
+        fn(
+            "search_text",
+            "Search for literal text inside workspace files using ripgrep when available.",
+            {
+                "query": {"type": "string"},
+                "path": {"type": "string", "default": "."},
+                "glob": {"type": "string", "default": "*"},
+                "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+                "timeout_sec": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 30,
+                    "default": SEARCH_TIMEOUT_SEC,
+                },
+            },
+            ["query"],
+        ),
+        fn(
+            "memory_context_metrics",
+            "Inspect how much local memory text is injected into the current "
+            "context. Returns exact character counts and dependency-free token "
+            "estimates marked exact=false; it never changes memory.",
+            {
+                "query": {
+                    "type": "string",
+                    "description": "Query to measure; defaults to the current user message.",
+                },
+                "preference_limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 32,
+                    "default": 12,
+                },
+                "recall_limit": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 20,
+                    "default": 5,
+                },
+            },
+            [],
+        ),
+        fn(
+            "write_file",
+            "Create or fully overwrite a text file inside the workspace. "
+            "Routine writes are task-authorized.",
+            {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            ["path", "content"],
+        ),
+        fn(
+            "write_document",
+            "Render and write a structured Markdown document using a predefined "
+            f"template. Profiles and required headings: {document_profile_text}. "
+            "Paths must stay inside the workspace.",
+            {
+                "path": {"type": "string"},
+                "profile": {
+                    "type": "string",
+                    "enum": sorted(DOCUMENT_PROFILES),
+                },
+                "title": {"type": "string"},
+                "summary": {"type": "string", "default": ""},
+                "sections": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "heading": {"type": "string"},
+                            "body": {"type": "string"},
+                        },
+                        "required": ["heading", "body"],
+                    },
+                },
+                "sources": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "default": [],
+                },
+            },
+            ["path", "profile", "title", "sections"],
+        ),
+        fn(
+            "patch_file",
+            "Replace exact text in one file. Prefer this over write_file for small edits. "
+            "Routine workspace edits are task-authorized.",
+            {
+                "path": {"type": "string"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
+                "replace_all": {"type": "boolean", "default": False},
+            },
+            ["path", "old_text", "new_text"],
+        ),
+        fn(
+            "run_command",
+            "Run a shell command in the workspace and return exit code and combined output. "
+            "Routine read-only and local development commands are task-authorized.",
+            {
+                "command": {"type": "string"},
+                "cwd": {"type": "string", "default": "."},
+                "timeout_sec": {"type": "integer", "minimum": 1, "maximum": 1800, "default": 120},
+            },
+            ["command"],
+        ),
+        fn(
+            "fetch_url",
+            "Fetch an HTTP(S) URL as text. Network access requires a higher-risk grant.",
+            {
+                "url": {"type": "string"},
+                "max_chars": {"type": "integer", "minimum": 1000, "maximum": 100000, "default": 30000},
+            },
+            ["url"],
+        ),
+        fn(
+            "list_skills",
+            "List locally defined skills (name + description + when to use). "
+            "Call read_skill to load a skill's full instructions.",
+            {},
+            [],
+        ),
+        fn(
+            "read_skill",
+            "Load the full markdown instructions of one local skill from "
+            f"{SKILLS_DIRNAME}/<name>/SKILL.md, then follow them using the other tools.",
+            {
+                "name": {"type": "string", "description": "Skill name from list_skills."},
+            },
+            ["name"],
+        ),
+    ] + [result_tool_schema()]
+
+
+class ToolExecutor:
+    def __init__(
+        self,
+        *,
+        workspace: Path,
+        path_guard: PathGuard,
+        approvals: ApprovalManager,
+        artifacts: ArtifactStore,
+        events: EventBus,
+        secret: str = "",
+        memory: MemoryStore | None = None,
+    ) -> None:
+        self.workspace = workspace
+        self.path_guard = path_guard
+        self.approvals = approvals
+        self.artifacts = artifacts
+        self.events = events
+        self.secret = secret
+        self.memory = memory
+        self.skills = SkillLibrary(workspace)
+        self.request_scope: RequestScope | None = None
+
+    def begin_request(self, text: str) -> RequestScope:
+        self.request_scope = classify_request(text)
+        return self.request_scope
+
+    def _scope_denial(self, name: str) -> str:
+        scope = self.request_scope
+        if scope is None:
+            return ""
+        if name in {"write_file", "write_document", "patch_file"}:
+            allowed = scope.allows_mutation
+        elif name == "run_command":
+            allowed = scope.allows_commands
+        elif name == "fetch_url":
+            allowed = scope.allows_network
+        else:
+            allowed = True
+        if allowed:
+            return ""
+        return (
+            "当前用户消息没有明确要求该副作用操作；"
+            "不得依据推测、示例或建议自行执行。"
+        )
+
+    def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        denial = self._scope_denial(name)
+        if denial:
+            return ToolResult(False, denial)
+        handlers = {
+            "read_file": self._read_file,
+            "list_files": self._list_files,
+            "search_text": self._search_text,
+            "memory_context_metrics": self._memory_context_metrics,
+            "write_file": self._write_file,
+            "write_document": self._write_document,
+            "patch_file": self._patch_file,
+            "run_command": self._run_command,
+            "fetch_url": self._fetch_url,
+            "list_skills": self._list_skills,
+            "read_skill": self._read_skill,
+        }
+        handler = handlers.get(name)
+        if handler is None:
+            return ToolResult(False, f"未知工具: {name}")
+        try:
+            return handler(arguments)
+        except (PolicyError, OSError, ValueError) as error:
+            return ToolResult(False, f"{type(error).__name__}: {error}")
+        except Exception as error:
+            return ToolResult(False, f"工具异常 {type(error).__name__}: {error}")
+
+    def _truncate(self, value: str, *, prefix: str) -> tuple[str, str | None]:
+        value = redact_text(value, self.secret)
+        if len(value) <= MAX_TOOL_OUTPUT:
+            return value, None
+        artifact = self.artifacts.save(value, prefix=prefix)
+        return (
+            value[:MAX_TOOL_OUTPUT]
+            + f"\n... [truncated; full output: {artifact}]",
+            str(artifact),
+        )
+
+    def _read_file(self, args: dict[str, Any]) -> ToolResult:
+        path = self.path_guard.resolve(str(args["path"]), must_exist=True)
+        if not path.is_file():
+            return ToolResult(False, f"不是文件: {path}")
+        if path.stat().st_size > MAX_FILE_BYTES:
+            return ToolResult(False, f"文件超过 {MAX_FILE_BYTES} 字节: {path}")
+        start = max(1, int(args.get("start_line", 1)))
+        end = max(start, int(args.get("end_line", 400)))
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        selected = lines[start - 1 : end]
+        numbered = "\n".join(
+            f"{number:>6} | {line}"
+            for number, line in enumerate(selected, start=start)
+        )
+        return ToolResult(True, redact_text(numbered, self.secret) or "(empty file)")
+
+    def _list_files(self, args: dict[str, Any]) -> ToolResult:
+        root = self.path_guard.resolve(str(args.get("path", ".")), must_exist=True)
+        if not root.is_dir():
+            return ToolResult(False, f"不是目录: {root}")
+        depth_limit = min(8, max(1, int(args.get("depth", 2))))
+        max_results = min(1000, max(1, int(args.get("max_results", 250))))
+        results: list[str] = []
+        root_depth = len(root.parts)
+        for current, dirs, files in os.walk(root):
+            current_path = Path(current)
+            relative_depth = len(current_path.parts) - root_depth
+            dirs[:] = sorted(name for name in dirs if not _ignored(name))
+            if relative_depth >= depth_limit:
+                dirs[:] = []
+            for directory in dirs:
+                results.append(f"{self.path_guard.relative(current_path / directory)}/")
+                if len(results) >= max_results:
+                    break
+            for filename in sorted(files):
+                if len(results) >= max_results:
+                    break
+                if not _ignored(filename):
+                    results.append(self.path_guard.relative(current_path / filename))
+            if len(results) >= max_results:
+                break
+        return ToolResult(True, "\n".join(results) or "(empty directory)")
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except OSError:
+            process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                process.kill()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+
+    @staticmethod
+    def _matches_glob(relative: Path, glob: str) -> bool:
+        if not glob or glob == "*":
+            return True
+        value = relative.as_posix()
+        return relative.match(glob) or fnmatch.fnmatchcase(value, glob)
+
+    def _search_with_ripgrep(
+        self,
+        executable: str,
+        *,
+        root: Path,
+        query: str,
+        glob: str,
+        limit: int,
+        timeout_sec: int,
+    ) -> tuple[list[str], bool, str]:
+        command = [
+            executable,
+            "--line-number",
+            "--no-heading",
+            "--color",
+            "never",
+            "--fixed-strings",
+            "--hidden",
+            "--max-filesize",
+            str(MAX_FILE_BYTES),
+        ]
+        for name in sorted(_SEARCH_IGNORED_NAMES):
+            command.extend(["--glob", f"!**/{name}/**"])
+        command.extend(["--glob", "!**/.env*"])
+        for name in sorted(_SEARCH_SENSITIVE_FILES):
+            command.extend(["--glob", f"!**/{name}"])
+        for suffix in (".key", ".p12", ".pem", ".pfx"):
+            command.extend(["--glob", f"!**/*{suffix}"])
+        command.extend(["--glob", glob, "--", query, "."])
+
+        lines: list[str] = []
+        failure = ""
+        timed_out = False
+        process: subprocess.Popen[bytes] | None = None
+        selector = selectors.DefaultSelector()
+        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr_file:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=root,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr_file,
+                    bufsize=0,
+                    start_new_session=True,
+                )
+                if process.stdout is None:
+                    raise OSError("无法读取 rg 输出")
+                selector.register(process.stdout, selectors.EVENT_READ)
+                deadline = time.monotonic() + timeout_sec
+                buffer = bytearray()
+                while len(lines) < limit:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        timed_out = True
+                        break
+                    if not selector.select(remaining):
+                        timed_out = True
+                        break
+                    chunk = os.read(process.stdout.fileno(), 64 * 1024)
+                    if not chunk:
+                        if buffer and len(lines) < limit:
+                            lines.append(
+                                bytes(buffer).decode("utf-8", errors="replace").rstrip("\r")
+                            )
+                        break
+                    buffer.extend(chunk)
+                    while b"\n" in buffer and len(lines) < limit:
+                        raw_line, _, remainder = buffer.partition(b"\n")
+                        buffer = bytearray(remainder)
+                        lines.append(
+                            raw_line.decode("utf-8", errors="replace").rstrip("\r")
+                        )
+                    if len(buffer) > SEARCH_MAX_LINE_BYTES:
+                        failure = "搜索输出包含超长单行，已停止"
+                        break
+
+                if len(lines) >= limit or timed_out or failure:
+                    self._stop_process(process)
+                else:
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        timed_out = True
+                        self._stop_process(process)
+            except OSError as error:
+                failure = f"rg 启动失败: {error}"
+                if process is not None:
+                    self._stop_process(process)
+            finally:
+                selector.close()
+                if process is not None and process.stdout is not None:
+                    process.stdout.close()
+
+            stderr_file.seek(0)
+            stderr = stderr_file.read(4000).strip()
+
+        if timed_out:
+            failure = f"搜索超过 {timeout_sec} 秒，已停止；返回的是部分结果"
+        elif not failure and len(lines) < limit:
+            returncode = process.returncode if process is not None else None
+            if returncode not in {0, 1}:
+                failure = f"rg 执行失败（exit {returncode}）：{stderr or '无错误输出'}"
+        return lines, timed_out, failure
+
+    def _search_without_ripgrep(
+        self,
+        *,
+        root: Path,
+        query: str,
+        glob: str,
+        limit: int,
+        timeout_sec: int,
+    ) -> tuple[list[str], bool, int, str]:
+        lines: list[str] = []
+        scanned = 0
+        timed_out = False
+        failure = ""
+        deadline = time.monotonic() + timeout_sec
+        stack = [root]
+
+        while stack and len(lines) < limit:
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            current = stack.pop()
+            try:
+                entries = os.scandir(current)
+            except OSError:
+                continue
+            with entries:
+                for entry in entries:
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        break
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if not _search_ignored(entry.name, is_dir=True):
+                                stack.append(Path(entry.path))
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        if _search_ignored(entry.name):
+                            continue
+                        path = Path(entry.path)
+                        relative = path.relative_to(root)
+                        if not self._matches_glob(relative, glob):
+                            continue
+                        scanned += 1
+                        if scanned > SEARCH_MAX_FILES:
+                            failure = (
+                                f"搜索达到 {SEARCH_MAX_FILES} 个文件上限，"
+                                "请缩小 path 或 glob"
+                            )
+                            break
+                        if entry.stat(follow_symlinks=False).st_size > MAX_FILE_BYTES:
+                            continue
+                        with path.open(
+                            "r",
+                            encoding="utf-8",
+                            errors="replace",
+                        ) as stream:
+                            for number, line in enumerate(stream, start=1):
+                                if time.monotonic() >= deadline:
+                                    timed_out = True
+                                    break
+                                if query in line:
+                                    lines.append(
+                                        f"{relative.as_posix()}:{number}:"
+                                        f"{line.rstrip(chr(10) + chr(13))}"
+                                    )
+                                    if len(lines) >= limit:
+                                        break
+                    except OSError:
+                        continue
+                    if timed_out or failure or len(lines) >= limit:
+                        break
+            if timed_out or failure or len(lines) >= limit:
+                break
+        if timed_out:
+            failure = f"搜索超过 {timeout_sec} 秒，已停止；返回的是部分结果"
+        return lines, timed_out, scanned, failure
+
+    def _search_text(self, args: dict[str, Any]) -> ToolResult:
+        query = str(args["query"])
+        if not query:
+            return ToolResult(False, "query 不能为空")
+        root = self.path_guard.resolve(str(args.get("path", ".")), must_exist=True)
+        if not root.is_dir():
+            return ToolResult(False, f"搜索路径不是目录: {root}")
+        glob = str(args.get("glob", "*") or "*")
+        limit = min(500, max(1, int(args.get("max_results", 100))))
+        timeout_sec = min(
+            30,
+            max(1, int(args.get("timeout_sec", SEARCH_TIMEOUT_SEC))),
+        )
+        executable = find_ripgrep()
+        if executable:
+            lines, timed_out, failure = self._search_with_ripgrep(
+                executable,
+                root=root,
+                query=query,
+                glob=glob,
+                limit=limit,
+                timeout_sec=timeout_sec,
+            )
+            notes = ["engine=rg"]
+        else:
+            lines, timed_out, scanned, failure = self._search_without_ripgrep(
+                root=root,
+                query=query,
+                glob=glob,
+                limit=limit,
+                timeout_sec=timeout_sec,
+            )
+            notes = [
+                f"engine=bounded-python-fallback (rg not found; scanned {scanned} files)"
+            ]
+
+        content = "\n".join(lines) or "(no matches)"
+        if failure:
+            notes.append(failure)
+        return ToolResult(
+            ok=not timed_out and not failure,
+            content=content + "\n\n[" + "; ".join(notes) + "]",
+        )
+
+    def _memory_context_metrics(self, args: dict[str, Any]) -> ToolResult:
+        if self.memory is None:
+            return ToolResult(False, "当前运行未配置记忆库，无法统计上下文。")
+        query = str(args.get("query") or "").strip()
+        if not query and self.request_scope is not None:
+            query = self.request_scope.text
+        metrics = self.memory.context_metrics(
+            scope=str(self.workspace.resolve()),
+            query=query,
+            preference_limit=max(0, int(args.get("preference_limit", 12))),
+            recall_limit=max(0, int(args.get("recall_limit", 5))),
+        )
+        preference = metrics["preferences"]
+        recall = metrics["recall"]
+        combined = metrics["combined"]
+        return ToolResult(
+            True,
+            (
+                "本轮记忆上下文（只读）：\n"
+                f"- 偏好 {preference['items']} 条："
+                f"{preference['characters']} 字符，约 "
+                f"{preference['estimated_tokens']} tokens\n"
+                f"- 相关记忆 {recall['items']} 条："
+                f"{recall['characters']} 字符，约 "
+                f"{recall['estimated_tokens']} tokens\n"
+                f"- 合计：{combined['characters']} 字符，约 "
+                f"{combined['estimated_tokens']} tokens\n"
+                f"- exact=false；estimator={metrics['estimator']}。"
+                "Token 是依赖无关估算，不是 Provider 精确 usage。"
+            ),
+        )
+
+    def _write_file(self, args: dict[str, Any]) -> ToolResult:
+        path = self.path_guard.resolve(str(args["path"]))
+        self.path_guard.assert_writable(path)
+        content = str(args["content"])
+        if len(content.encode("utf-8")) > MAX_FILE_BYTES:
+            return ToolResult(False, "写入内容超过大小限制")
+        if not self.approvals.require(
+            "写入文件",
+            f"{path}\n将写入 {len(content.encode('utf-8'))} 字节。",
+        ):
+            return ToolResult(False, "用户拒绝写入文件")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return ToolResult(
+            True,
+            f"已写入 {path} ({len(content.encode('utf-8'))} bytes)",
+            changed_files=[self.path_guard.relative(path)],
+        )
+
+    def _write_document(self, args: dict[str, Any]) -> ToolResult:
+        path = self.path_guard.resolve(str(args["path"]))
+        self.path_guard.assert_writable(path)
+        content = render_document(
+            profile=str(args.get("profile") or ""),
+            title=str(args.get("title") or ""),
+            summary=str(args.get("summary") or ""),
+            sections=list(args.get("sections") or []),
+            sources=[str(item) for item in args.get("sources", [])],
+        )
+        size = len(content.encode("utf-8"))
+        if size > MAX_FILE_BYTES:
+            return ToolResult(False, "文档内容超过大小限制")
+        if not self.approvals.require(
+            "写入结构化文档",
+            f"{path}\n模板: {args.get('profile')}\n将写入 {size} 字节。",
+        ):
+            return ToolResult(False, "用户拒绝写入文档")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return ToolResult(
+            True,
+            f"已写入结构化文档 {path} ({size} bytes)",
+            changed_files=[self.path_guard.relative(path)],
+        )
+
+    def _patch_file(self, args: dict[str, Any]) -> ToolResult:
+        path = self.path_guard.resolve(str(args["path"]), must_exist=True)
+        self.path_guard.assert_writable(path)
+        if not path.is_file():
+            return ToolResult(False, f"不是文件: {path}")
+        old_text = str(args["old_text"])
+        new_text = str(args["new_text"])
+        if not old_text:
+            return ToolResult(False, "old_text 不能为空")
+        content = path.read_text(encoding="utf-8")
+        occurrences = content.count(old_text)
+        if occurrences == 0:
+            return ToolResult(False, "未找到待替换文本")
+        replace_all = bool(args.get("replace_all", False))
+        if occurrences > 1 and not replace_all:
+            return ToolResult(
+                False,
+                f"待替换文本出现 {occurrences} 次；请提供更长上下文或设置 replace_all=true",
+            )
+        preview = old_text[:1000]
+        if not self.approvals.require(
+            "修改文件",
+            f"{path}\n替换 {occurrences if replace_all else 1} 处。\n--- old ---\n{preview}",
+        ):
+            return ToolResult(False, "用户拒绝修改文件")
+        updated = content.replace(old_text, new_text, -1 if replace_all else 1)
+        path.write_text(updated, encoding="utf-8")
+        return ToolResult(
+            True,
+            f"已修改 {path}",
+            changed_files=[self.path_guard.relative(path)],
+        )
+
+    def _run_command(self, args: dict[str, Any]) -> ToolResult:
+        command = str(args["command"]).strip()
+        if not command:
+            return ToolResult(False, "命令为空")
+        denial = command_denial_reason(command)
+        if denial:
+            return ToolResult(False, denial)
+        cwd = self.path_guard.resolve(str(args.get("cwd", ".")), must_exist=True)
+        if not cwd.is_dir():
+            return ToolResult(False, f"cwd 不是目录: {cwd}")
+        if not self.approvals.require_command(command):
+            return ToolResult(False, "用户拒绝执行命令")
+        timeout = min(1800, max(1, int(args.get("timeout_sec", 120))))
+        try:
+            completed = subprocess.run(
+                ["/bin/zsh", "-lc", command],
+                cwd=cwd,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+            output = (
+                f"exit_code={completed.returncode}\n"
+                f"--- stdout ---\n{completed.stdout}\n"
+                f"--- stderr ---\n{completed.stderr}"
+            )
+            semantic_failure = _semantic_command_failure(output)
+            if semantic_failure:
+                output += f"\n--- semantic_check ---\n{semantic_failure}"
+            content, artifact = self._truncate(output, prefix="command")
+            return ToolResult(
+                completed.returncode == 0 and not semantic_failure,
+                content,
+                artifact=artifact,
+            )
+        except subprocess.TimeoutExpired as error:
+            partial = ""
+            if error.stdout:
+                partial += str(error.stdout)
+            if error.stderr:
+                partial += str(error.stderr)
+            content, artifact = self._truncate(
+                f"命令超时（{timeout}s）\n{partial}",
+                prefix="timeout",
+            )
+            return ToolResult(False, content, artifact=artifact)
+
+    def _fetch_url(self, args: dict[str, Any]) -> ToolResult:
+        url = str(args["url"])
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return ToolResult(False, "仅支持 http/https URL")
+        if not self.approvals.require("访问网络", url, risk="R2"):
+            return ToolResult(False, "用户拒绝访问网络")
+        max_chars = min(100000, max(1000, int(args.get("max_chars", 30000))))
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Sonus/0.1"},
+        )
+        with urllib.request.urlopen(
+            request,
+            timeout=30,
+            context=make_ssl_context(),
+        ) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            raw = response.read(2 * 1024 * 1024)
+        text = raw.decode(charset, errors="replace")[:max_chars]
+        content, artifact = self._truncate(text, prefix="fetch")
+        return ToolResult(True, content, artifact=artifact)
+
+    def _list_skills(self, args: dict[str, Any]) -> ToolResult:
+        skills = self.skills.discover()
+        if not skills:
+            return ToolResult(
+                True,
+                f"(暂无技能；在 {SKILLS_DIRNAME}/<name>/SKILL.md 中创建即可)",
+            )
+        lines = [f"{len(skills)} 个本地技能（{SKILLS_DIRNAME}/）："]
+        lines.extend(f"- {skill.name}: {skill.description}" for skill in skills)
+        if any(skill.when_to_use for skill in skills):
+            lines.append("")
+            for skill in skills:
+                if skill.when_to_use:
+                    lines.append(f"- {skill.name} 适用：{skill.when_to_use}")
+        lines.append("")
+        lines.append("用 read_skill(name) 读取某个技能的完整步骤。")
+        return ToolResult(True, "\n".join(lines))
+
+    def _read_skill(self, args: dict[str, Any]) -> ToolResult:
+        name = str(args.get("name", "")).strip()
+        if not name:
+            return ToolResult(False, "缺少技能名")
+        skill = self.skills.get(name)
+        if skill is None:
+            available = ", ".join(item.name for item in self.skills.discover()) or "(无)"
+            return ToolResult(False, f"未找到技能: {name}；可用: {available}")
+        body = (
+            f"# 技能: {skill.name}\n"
+            f"文件: {skill.relative_path}\n"
+            f"说明: {skill.description}\n"
+        )
+        if skill.when_to_use:
+            body += f"适用: {skill.when_to_use}\n"
+        body += (
+            "\n以下为技能流程（参考方法，不覆盖安全原则与授权模型）：\n\n"
+            + skill.body
+        )
+        content, artifact = self._truncate(body, prefix="skill")
+        return ToolResult(True, content, artifact=artifact)
+
