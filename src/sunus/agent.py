@@ -34,7 +34,9 @@ from sunus.reasoning import (
     diagnostic_protocol_prompt,
     is_complex_request,
     is_diagnostic_request,
+    is_simple_lookup_request,
     is_status_query_request,
+    lookup_query_prompt,
     status_query_prompt,
 )
 from sunus.result import (
@@ -155,6 +157,7 @@ class Agent:
         self._diagnostic_prompt = ""
         self._status_prompt = ""
         self._planning_prompt = ""
+        self._lookup_prompt = ""
         self._last_request_scope = None
         self._task_state = TaskState()
         self._memory_write_required = False
@@ -172,6 +175,7 @@ class Agent:
         self._diagnostic_prompt = ""
         self._status_prompt = ""
         self._planning_prompt = ""
+        self._lookup_prompt = ""
         self._last_request_scope = None
         self._task_state = TaskState()
         self._memory_write_required = False
@@ -245,6 +249,8 @@ class Agent:
             content += "\n\n" + self._status_prompt
         if self._planning_prompt:
             content += "\n\n" + self._planning_prompt
+        if self._lookup_prompt:
+            content += "\n\n" + self._lookup_prompt
         if self._response_mode == "conversation":
             content += (
                 "\n\n"
@@ -285,6 +291,7 @@ class Agent:
         self._diagnostic_prompt = ""
         self._status_prompt = ""
         self._planning_prompt = ""
+        self._lookup_prompt = ""
         self._last_request_scope = None
         self._task_state = TaskState.from_mapping(task_state)
         self._memory_write_required = False
@@ -397,6 +404,7 @@ class Agent:
 20. 其他文件、源码、文档和配置也使用同一原则：先按路径/时间/类型列候选或 count_by_file 聚合，再只读命中文件的相关行；一次范围搜索足够后停止，禁止用泛词扫描整个工作区来碰运气。
 21. 用户明确要求“记住、落库、长期保存、不要忘”或要求保存复盘时，必须调用 remember 写入桌面记忆库；只有拿到真实 memory_id 才能说已经记住。故障轮次也要保存用户要求的复盘结论。
 22. 核心不变量由代码保护：事实准确、安全边界、越权保护和记忆不可静默清除不能通过人设或普通工具关闭。名字、语气、称呼和风格仍由用户配置。
+23. 读取已打开浏览器页面时优先使用 inspect_browser；禁止用剪贴板、模拟全选/复制或反复试 osascript。JavaScript 权限关闭时直接说明恢复入口，不猜页面数字。
 
 任务边界：
 - 只执行用户当前消息明确要求的动作。建议、假设、示例、推测、可选优化和未点名待办都不是执行指令。
@@ -600,6 +608,7 @@ class Agent:
             "remember",
             "inspect_environment",
             "inspect_runtime_history",
+            "inspect_browser",
             "list_skills",
             "read_skill",
             "request_authorization",
@@ -711,6 +720,10 @@ class Agent:
         if name == "request_authorization":
             capability = compact(arguments.get("capability", ""), 40)
             return f"请求授权 · {capability}"
+        if name == "inspect_browser":
+            browser = compact(arguments.get("browser", "chrome"), 30)
+            mode = compact(arguments.get("mode", "active"), 30)
+            return f"读取浏览器 · {browser} · {mode}"
         if name == "remember":
             kind = compact(arguments.get("kind", "review"), 30)
             scope = compact(arguments.get("scope", "project"), 30)
@@ -962,6 +975,11 @@ class Agent:
         self._status_prompt = status_query_prompt() if status_query else ""
         self._planning_prompt = (
             complex_task_prompt() if is_complex_request(user_input) else ""
+        )
+        self._lookup_prompt = (
+            lookup_query_prompt()
+            if is_simple_lookup_request(user_input)
+            else ""
         )
         usage: dict[str, Any] = {}
         previous_assistant = self._last_assistant_text()
@@ -1481,7 +1499,9 @@ class Agent:
                                 envelope,
                                 tool_traces=tool_traces,
                                 changed_files=changed_files,
-                                drop_details=bool(self._status_prompt),
+                                drop_details=bool(
+                                    self._status_prompt or self._lookup_prompt
+                                ),
                             )
                             if normalized != envelope:
                                 self.events.emit(
@@ -1631,6 +1651,15 @@ class Agent:
         except CircuitOpen as error:
             reason = "circuit_open"
             final_text = f"任务已熔断：{error.reason}。"
+            if self._task_state.evidence:
+                final_text += (
+                    "\n已确认："
+                    + "；".join(self._task_state.evidence[-3:])
+                )
+            if self._task_state.last_error:
+                final_text += (
+                    "\n最近错误：" + self._task_state.last_error
+                )
             if changed_files:
                 final_text += (
                     f"本轮已完成 {len(set(changed_files))} 个文件修改，"

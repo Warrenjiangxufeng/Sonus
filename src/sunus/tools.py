@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from sunus.config import redact_text, make_ssl_context
+from sunus.browser_inspect import inspect_browser_page
 from sunus.documents import DOCUMENT_PROFILES, render_document
 from sunus.environment import discover_environment, login_shell, shell_invocation
 from sunus.events import EventBus
@@ -375,6 +376,24 @@ def tool_schemas() -> list[dict[str, Any]]:
             [],
         ),
         fn(
+            "inspect_browser",
+            "Read the active tab title/URL or visible text from an already-open "
+            "Chrome/Safari page. Does not navigate, click, log in, or modify settings.",
+            {
+                "browser": {
+                    "type": "string",
+                    "enum": ["chrome", "safari"],
+                    "default": "chrome",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["active", "content"],
+                    "default": "active",
+                },
+            },
+            [],
+        ),
+        fn(
             "write_file",
             "Create or fully overwrite a text file inside the workspace. "
             "Routine writes are task-authorized.",
@@ -531,6 +550,7 @@ class ToolExecutor:
             "remember": self._remember,
             "inspect_environment": self._inspect_environment,
             "inspect_runtime_history": self._inspect_runtime_history,
+            "inspect_browser": self._inspect_browser,
             "write_file": self._write_file,
             "write_document": self._write_document,
             "patch_file": self._patch_file,
@@ -554,6 +574,7 @@ class ToolExecutor:
         parallel_safe = set(read_only) - {"submit_result"}
         risks = {
             "fetch_url": "R2",
+            "inspect_browser": "R2",
             "write_file": "R1",
             "write_document": "R1",
             "patch_file": "R1",
@@ -1152,6 +1173,22 @@ class ToolExecutor:
             turn_id=str(args.get("turn_id") or ""),
             exclude_session=self.current_session_id,
         )
+        return ToolResult(
+            bool(payload.get("ok")),
+            json.dumps(payload, ensure_ascii=False),
+        )
+
+    def _inspect_browser(self, args: dict[str, Any]) -> ToolResult:
+        browser = str(args.get("browser") or "chrome")
+        mode = str(args.get("mode") or "active")
+        if not self.approvals.require(
+            "读取浏览器页面",
+            f"{browser} · {mode}",
+            risk="R2",
+            capability="command",
+        ):
+            return ToolResult(False, "用户拒绝读取浏览器页面")
+        payload = inspect_browser_page(browser=browser, mode=mode)
         return ToolResult(
             bool(payload.get("ok")),
             json.dumps(payload, ensure_ascii=False),

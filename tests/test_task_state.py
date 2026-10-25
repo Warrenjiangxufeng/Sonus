@@ -45,6 +45,7 @@ class TaskStateTests(unittest.TestCase):
 
         self.assertIn("read_file", state.evidence[-1])
         self.assertEqual(state.blocker, "authorization")
+        self.assertIn("当前用户消息没有明确要求", state.last_error)
         self.assertEqual(state.phase, "blocked")
 
     def test_task_state_is_persisted_and_restored(self) -> None:

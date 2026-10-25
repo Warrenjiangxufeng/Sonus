@@ -36,6 +36,7 @@ class ToolRegistryTests(unittest.TestCase):
             command = tools.registry.get("run_command")
             authorization = tools.registry.get("request_authorization")
             runtime_history = tools.registry.get("inspect_runtime_history")
+            browser = tools.registry.get("inspect_browser")
             remember = tools.registry.get("remember")
             result = tools.registry.get("submit_result")
 
@@ -51,6 +52,8 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertFalse(authorization.parallel_safe)
             self.assertTrue(runtime_history.read_only)
             self.assertTrue(runtime_history.parallel_safe)
+            self.assertFalse(browser.read_only)
+            self.assertFalse(browser.parallel_safe)
             self.assertFalse(remember.read_only)
             self.assertFalse(remember.parallel_safe)
             self.assertFalse(result.parallel_safe)
@@ -63,6 +66,7 @@ class ToolRegistryTests(unittest.TestCase):
                     "memory_context_metrics",
                     "inspect_environment",
                     "inspect_runtime_history",
+                    "inspect_browser",
                     "remember",
                     "write_file",
                     "write_document",

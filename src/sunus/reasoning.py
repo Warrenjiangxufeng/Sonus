@@ -23,6 +23,11 @@ _COMPLEX_PATTERN = re.compile(
     r"迁移|架构|多步骤|全量测试|浏览器|跨轮|排查机制)",
     re.IGNORECASE,
 )
+_LOOKUP_PATTERN = re.compile(
+    r"(?:只读任务|只给.*(?:结论|结果|文件名)|只看|读取|查看|检查|"
+    r"告诉我.*(?:内容|结果|文件|页面|标题|URL))",
+    re.IGNORECASE,
+)
 
 
 def is_diagnostic_request(text: str) -> bool:
@@ -41,6 +46,21 @@ def is_complex_request(text: str) -> bool:
     return bool(_COMPLEX_PATTERN.search(value)) and not is_status_query_request(
         value
     )
+
+
+def is_simple_lookup_request(text: str) -> bool:
+    value = str(text or "")
+    return bool(_LOOKUP_PATTERN.search(value)) and not is_diagnostic_request(
+        value
+    )
+
+
+def lookup_query_prompt() -> str:
+    return """本轮是只读查证任务：
+1. 只检查用户点名的对象，用最少工具拿到结果。
+2. 首句直接回答结果；能力失败时只说明阻塞点和下一步。
+3. 不列工具日志、不截断粘贴整段内容、不重复调用已经给出答案的步骤。
+4. submit_result.details 留空，通常用 1-3 句完成。"""
 
 
 def complex_task_prompt() -> str:

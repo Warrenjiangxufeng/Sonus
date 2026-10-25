@@ -40,7 +40,7 @@ PERSONA_CONTEXT_LABELS: dict[str, str] = {
     "task": "任务",
     "risk": "风险提示",
 }
-LOOP_BUDGET_PROFILES: dict[str, dict[str, int]] = {
+LOOP_BUDGET_PROFILES: dict[str, dict[str, int | float]] = {
     "quick": {
         "max_model_calls": 8,
         "max_tool_calls": 24,
@@ -48,6 +48,7 @@ LOOP_BUDGET_PROFILES: dict[str, dict[str, int]] = {
         "max_total_tokens": 50_000,
         "max_response_tokens": 1024,
         "finalization_reserve": 1,
+        "warning_ratio": 0.75,
         "context_soft_tokens": 12_000,
         "context_hard_tokens": 24_000,
         "context_keep_recent": 10,

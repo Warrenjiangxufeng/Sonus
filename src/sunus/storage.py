@@ -154,6 +154,7 @@ def load_session(path: Path) -> SessionTranscript:
                     "evidence",
                     "attempted",
                     "blocker",
+                    "last_error",
                     "phase",
                     "turn_count",
                 }

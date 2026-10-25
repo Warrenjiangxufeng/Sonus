@@ -25,6 +25,7 @@ class ToolTests(unittest.TestCase):
         self.assertIn("memory_context_metrics", names)
         self.assertIn("remember", names)
         self.assertIn("inspect_environment", names)
+        self.assertIn("inspect_browser", names)
         self.assertIn("inspect_runtime_history", names)
         self.assertIn("request_authorization", names)
 
@@ -273,6 +274,34 @@ class ToolTests(unittest.TestCase):
             payload = json.loads(result.content)
             self.assertEqual(payload["total_failures"], 1)
             self.assertNotIn("rows", payload)
+
+    def test_browser_tool_returns_structured_active_page(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root, interactive=True)
+            executor.approvals.grant_capabilities(["command"])
+            with patch(
+                "sunus.tools.inspect_browser_page",
+                return_value={
+                    "ok": True,
+                    "browser": "chrome",
+                    "mode": "active",
+                    "title": "DeepSeek 开放平台",
+                    "url": "https://platform.deepseek.com/usage",
+                },
+            ):
+                result = executor.execute(
+                    "inspect_browser",
+                    {"browser": "chrome", "mode": "active"},
+                )
+
+            self.assertTrue(result.ok)
+            payload = json.loads(result.content)
+            self.assertEqual(payload["title"], "DeepSeek 开放平台")
+            self.assertEqual(
+                payload["url"],
+                "https://platform.deepseek.com/usage",
+            )
 
     def test_pipeline_masked_python_error_is_marked_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

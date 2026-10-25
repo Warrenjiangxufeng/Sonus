@@ -278,6 +278,7 @@ experimental_bearer_token ="sk-test-secret-value"
             self.assertEqual(config.loop_budget.max_tool_calls, 77)
             self.assertEqual(config.loop_budget.max_response_tokens, 1024)
             self.assertEqual(config.loop_budget.finalization_reserve, 1)
+            self.assertEqual(config.loop_budget.warning_ratio, 0.75)
             self.assertEqual(config.loop_budget.context_keep_recent, 10)
             self.assertEqual(config.max_steps, 8)
 

@@ -55,6 +55,7 @@ class TaskState:
     evidence: list[str] = field(default_factory=list)
     attempted: list[str] = field(default_factory=list)
     blocker: str = ""
+    last_error: str = ""
     phase: str = "idle"
     turn_count: int = 0
 
@@ -94,17 +95,20 @@ class TaskState:
         label = f"{name}:{signature}"
         self.attempted = [*self.attempted[-11:], label]
         if ok:
-            detail = name
+            summary = " ".join(str(content or "").split())[:180]
+            detail = f"{name}: {summary}" if summary else name
             if changed_files:
-                detail += f" 修改 {len(set(changed_files))} 个文件"
+                detail += f"；修改 {len(set(changed_files))} 个文件"
             elif name == "run_command":
-                detail += " 验证命令"
+                detail += "；验证命令"
             if detail not in self.evidence:
                 self.evidence = [*self.evidence[-7:], detail]
             self.blocker = ""
+            self.last_error = ""
             self.phase = "verifying" if name == "run_command" else "acting"
             return
         self.blocker = _failure_kind(content)
+        self.last_error = " ".join(str(content or "").split())[:300]
         self.phase = "blocked" if self.blocker == "authorization" else "recovering"
 
     def prompt_block(self) -> str:
@@ -127,6 +131,8 @@ class TaskState:
             lines.append("- 已获证据: " + "；".join(self.evidence[-4:]))
         if self.blocker:
             lines.append(f"- 当前阻塞类型: {self.blocker}")
+        if self.last_error:
+            lines.append(f"- 最近错误: {self.last_error}")
         lines.append(f"- 阶段: {self.phase}")
         return "\n".join(lines)
 
@@ -139,6 +145,7 @@ class TaskState:
             "evidence": list(self.evidence),
             "attempted": list(self.attempted),
             "blocker": self.blocker,
+            "last_error": self.last_error,
             "phase": self.phase,
             "turn_count": self.turn_count,
         }
@@ -161,6 +168,7 @@ class TaskState:
             evidence=[str(item) for item in value.get("evidence") or []][-8:],
             attempted=[str(item) for item in value.get("attempted") or []][-12:],
             blocker=str(value.get("blocker") or ""),
+            last_error=str(value.get("last_error") or ""),
             phase=str(value.get("phase") or "idle"),
             turn_count=int(value.get("turn_count") or 0),
         )

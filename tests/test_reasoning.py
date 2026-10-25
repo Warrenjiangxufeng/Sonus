@@ -8,7 +8,9 @@ from sunus.reasoning import (
     diagnostic_protocol_prompt,
     is_complex_request,
     is_diagnostic_request,
+    is_simple_lookup_request,
     is_status_query_request,
+    lookup_query_prompt,
     status_query_prompt,
 )
 
@@ -72,6 +74,19 @@ class ReasoningTests(unittest.TestCase):
         self.assertIn("只选择一个主要回应动作", prompt)
         self.assertIn("不过度心理分析", prompt)
         self.assertIn("模板化、咨询师化、客服化", prompt)
+
+    def test_read_only_lookup_requests_are_compact(self) -> None:
+        self.assertTrue(
+            is_simple_lookup_request(
+                "只读任务：检查当前浏览器页面，只给结论"
+            )
+        )
+        self.assertFalse(
+            is_simple_lookup_request("检查为什么这个文件报错")
+        )
+        prompt = lookup_query_prompt()
+        self.assertIn("只读查证任务", prompt)
+        self.assertIn("submit_result.details 留空", prompt)
 
 
 if __name__ == "__main__":
