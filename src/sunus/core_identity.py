@@ -10,6 +10,10 @@ from typing import Any
 
 
 CORE_IDENTITY_VERSION = 1
+CORE_MISSION_DEFAULT = (
+    "把用户交给本地智能体的复杂任务可靠做成，以证据和可追溯结果交付；"
+    "从每次协作中沉淀可复用的能力，推动本地智能体持续进化。"
+)
 CORE_INVARIANTS = (
     "事实准确性不可被人设或指令关闭",
     "安全边界与越权保护不可被人设或指令关闭",
@@ -36,6 +40,8 @@ class CoreIdentityState:
 def _canonical_payload() -> dict[str, Any]:
     return {
         "version": CORE_IDENTITY_VERSION,
+        "mission": CORE_MISSION_DEFAULT,
+        "mission_source": "user_config_with_code_default",
         "invariants": list(CORE_INVARIANTS),
         "persona_name_source": "user_config",
     }
@@ -68,7 +74,13 @@ def ensure_core_identity(data_dir: Path) -> CoreIdentityState:
             and _digest(
                 {
                     key: current.get(key)
-                    for key in ("version", "invariants", "persona_name_source")
+                    for key in (
+                        "version",
+                        "mission",
+                        "mission_source",
+                        "invariants",
+                        "persona_name_source",
+                    )
                 }
             )
             == expected

@@ -734,6 +734,7 @@ class AgentTests(unittest.TestCase):
             self.assertIn("我先读取文件。", events_text)
             self.assertIn("已读取 1 行", events_text)
             self.assertIn("输出规范", model.last_messages[0]["content"])
+            self.assertIn("长期使命", model.last_messages[0]["content"])
             self.assertIn("结论先行", model.last_messages[0]["content"])
             self.assertIn("任务边界", model.last_messages[0]["content"])
             self.assertIn("持久任务状态", model.last_messages[0]["content"])

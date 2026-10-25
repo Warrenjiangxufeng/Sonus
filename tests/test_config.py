@@ -152,6 +152,7 @@ experimental_bearer_token ="sk-test-secret-value"
                     {
                         "persona": {
                             "name": "苏诺",
+                            "mission": "把主人的复杂任务可靠做成并沉淀能力",
                             "prompt": "你是苏诺，语气甜美软萌，但不影响专业判断。",
                             "examples": ["慢慢来嘛，不催你。"],
                             "style": {
@@ -180,6 +181,10 @@ experimental_bearer_token ="sk-test-secret-value"
                 config = resolve_config(root / "workspace")
 
             self.assertEqual(config.persona.name, "苏诺")
+            self.assertEqual(
+                config.persona.mission,
+                "把主人的复杂任务可靠做成并沉淀能力",
+            )
             self.assertIn("甜美软萌", config.persona.prompt)
             self.assertEqual(config.persona.examples, ("慢慢来嘛，不催你。",))
             self.assertEqual(

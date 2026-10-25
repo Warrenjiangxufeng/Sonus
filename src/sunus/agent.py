@@ -18,7 +18,7 @@ from sunus.context import (
 from sunus.events import EventBus
 from sunus.config import redact_value
 from sunus.control import CircuitOpen, TurnController
-from sunus.core_identity import CORE_INVARIANTS
+from sunus.core_identity import CORE_INVARIANTS, CORE_MISSION_DEFAULT
 from sunus.environment import environment_prompt
 from sunus.memory import MemoryStore, text_metrics
 from sunus.model import (
@@ -288,6 +288,7 @@ class Agent:
 
     def _base_system_prompt(self) -> str:
         persona_name = self.config.persona.name or "Sunus"
+        mission = self.config.persona.mission or CORE_MISSION_DEFAULT
         persona_prompt = self.config.persona.prompt.strip()
         style = dict(self.config.persona.style)
         style_lines = "\n".join(
@@ -354,6 +355,7 @@ class Agent:
 当前时间：{datetime.now().astimezone():%Y-%m-%d %H:%M %Z}
 当前工作区：{self.scope}
 权威运行数据目录：{Path(self.config.data_dir).expanduser().resolve()}
+长期使命：{mission}
 {persona_block}
 
 {environment_prompt()}

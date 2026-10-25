@@ -471,9 +471,11 @@ MiniMax 使用官方 OpenAI 兼容地址 `https://api.minimax.io/v1`。工具调
 
 记忆按 `global` 或项目作用域隔离。明确偏好语句形成 `preference`，普通任务形成 `episode`，明确的表达/沟通反馈形成 `persona`，实际发出的主动消息形成 `self_share`。支持检索、信用、蒸馏和软归档。
 
-`~/.sunus/core-identity.json` 保存代码级核心不变量：事实准确、安全与越权边界、
-记忆不可静默清除。启动时会校验清单；被修改时先备份为 `core-identity.tampered-*`
-再恢复标准清单。`persona.name` 不进入核心清单，仍然完全由用户配置。
+`~/.sunus/core-identity.json` 保存代码级长期使命和核心不变量：事实准确、
+安全与越权边界、记忆不可静默清除。使命默认由代码提供，可由
+`persona.mission` 或 `SUNUS_PERSONA_MISSION` 覆盖；`persona.name` 也仍然
+完全由用户配置。启动时会校验清单；被修改时先备份为
+`core-identity.tampered-*` 再恢复标准清单。
 
 性格设定分为两层：`SUNUS_GENDER`、名字等属于明确身份设定；`persona_traits`
 属于可演化画像。你明确指定的性格或沟通方式会立即成为稳定特质；Sunus 从
@@ -629,7 +631,8 @@ export SUNUS_RG_PATH="/path/to/rg"
 
 用户配置可写在 `~/.sunus/config.json`：
 
-`persona.name` 和 `persona.prompt` 是可修改的人物设定。主对话和主动陪伴都会
+`persona.name`、`persona.mission` 和 `persona.prompt` 是可修改的人物设定。
+主对话和主动陪伴都会
 读取同一份配置；配置中的人物设定优先于旧的演化性格画像，但不会绕过安全原则、
 工具授权和事实准确性要求。
 

@@ -5,7 +5,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sunus.core_identity import CORE_INVARIANTS, ensure_core_identity
+from sunus.core_identity import (
+    CORE_INVARIANTS,
+    CORE_MISSION_DEFAULT,
+    ensure_core_identity,
+)
 
 
 class CoreIdentityTests(unittest.TestCase):
@@ -21,6 +25,11 @@ class CoreIdentityTests(unittest.TestCase):
                 (data / "core-identity.json").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["invariants"], list(CORE_INVARIANTS))
+            self.assertEqual(manifest["mission"], CORE_MISSION_DEFAULT)
+            self.assertEqual(
+                manifest["mission_source"],
+                "user_config_with_code_default",
+            )
             self.assertEqual(
                 manifest["persona_name_source"],
                 "user_config",

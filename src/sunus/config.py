@@ -8,7 +8,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from sunus.core_identity import CoreIdentityState, ensure_core_identity
+from sunus.core_identity import (
+    CORE_MISSION_DEFAULT,
+    CoreIdentityState,
+    ensure_core_identity,
+)
 
 
 class ConfigError(RuntimeError):
@@ -169,6 +173,7 @@ class ProactiveConfig:
 @dataclass(frozen=True)
 class PersonaConfig:
     name: str = ""
+    mission: str = ""
     prompt: str = ""
     examples: tuple[str, ...] = ()
     style: tuple[tuple[str, float], ...] = ()
@@ -232,6 +237,7 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
     "mcp_servers": {},
     "persona": {
         "name": "",
+        "mission": "",
         "prompt": "",
         "examples": [],
         "style": {},
@@ -655,6 +661,13 @@ def resolve_config(
             os.environ.get("SUNUS_PERSONA_NAME")
             or str(persona_payload.get("name") or "")
         ).strip()[:40],
+        mission=(
+            os.environ.get("SUNUS_PERSONA_MISSION")
+            or str(
+                persona_payload.get("mission")
+                or CORE_MISSION_DEFAULT
+            )
+        ).strip()[:4000],
         prompt=str(persona_payload.get("prompt") or "").strip()[:16_000],
         examples=persona_examples,
         style=tuple(style_values),
@@ -937,6 +950,7 @@ def config_summary(config: RuntimeConfig) -> dict[str, Any]:
         ],
         "persona": {
             "name": config.persona.name,
+            "mission": config.persona.mission,
             "configured": bool(config.persona.prompt),
             "example_count": len(config.persona.examples),
             "style": dict(config.persona.style),
