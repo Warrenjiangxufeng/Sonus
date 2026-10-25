@@ -18,10 +18,14 @@ _CONFIRM_ONLY = re.compile(
 _NEGATION_BEFORE = re.compile(
     r"(?:不要|别|无需|不用|不需要|不能|不可|不许|不准|禁止|避免).{0,8}$"
 )
+_NEGATED_FOLLOWUP = re.compile(
+    r"^\s*(?:不要|别|无需|不用|不需要|不能|不可|不许|不准|禁止|先别)"
+)
 _MUTATION_PATTERN = re.compile(
     r"(?:修改|修复|创建|新建|写入|写到|添加|新增|增加|删除|移除|"
     r"重命名|移动|复制|实现|重构|重写|更新|替换|补上|补全|"
-    r"生成|保存|落盘|改掉|改成|改一下|编写|写文档|整理|补充|"
+    r"生成|保存|落盘|改掉|改成|改一下|改下|直接改|给我改|动手改|"
+    r"继续改|按刚才.{0,8}改|照刚才.{0,8}改|编写|写文档|整理|补充|"
     r"清理|格式化|优化|输出到|输出文档|输出文件|写一|写个|写份|"
     r"write|create|edit|modify|fix|implement|refactor|generate|save|"
     r"delete|rename|update)",
@@ -64,7 +68,9 @@ _CASUAL_PATTERN = re.compile(
 _PATH_PATTERN = re.compile(r"(?:^|[\s`'\"])[~./][\w./-]+")
 _REFERENTIAL_FOLLOWUP = re.compile(
     r"^\s*(?:就|那)?(?:试一下|试试|继续|接着来|按你说的|照这个做|"
-    r"就这么办|来吧|开始吧)(?:[，,。.!！\s]|$)",
+    r"按刚才(?:的)?(?:来|做|继续|改|执行)?|"
+    r"照刚才(?:的)?(?:来|做|继续|改|执行)?|就这么办|来吧|开始吧)"
+    r"(?:[，,。.!！\s]|$)",
     re.IGNORECASE,
 )
 
@@ -116,11 +122,17 @@ def classify_request_with_context(
     text: str,
     *,
     previous_assistant: str = "",
+    previous_scope: RequestScope | None = None,
 ) -> RequestScope:
     scope = classify_request(text)
-    if not previous_assistant.strip() or not _REFERENTIAL_FOLLOWUP.search(text):
+    if (
+        (previous_scope is None and not previous_assistant.strip())
+        or not _REFERENTIAL_FOLLOWUP.search(text)
+        or _QUESTION_PREFIX.search(text)
+        or _NEGATED_FOLLOWUP.search(text)
+    ):
         return scope
-    previous = classify_request(previous_assistant)
+    previous = previous_scope or classify_request(previous_assistant)
     if not (
         previous.allows_mutation
         or previous.allows_commands

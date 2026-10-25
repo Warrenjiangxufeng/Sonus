@@ -12,7 +12,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -359,6 +359,28 @@ def tool_schemas() -> list[dict[str, Any]]:
             ["command"],
         ),
         fn(
+            "request_authorization",
+            "Ask the user to expand the current task scope when read-only tools are "
+            "insufficient. Use only when the requested result genuinely requires a "
+            "workspace mutation, local command, or network access.",
+            {
+                "capability": {
+                    "type": "string",
+                    "enum": [
+                        "mutation",
+                        "mutation_and_commands",
+                        "commands",
+                        "network",
+                    ],
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Brief explanation of the blocked task and needed capability.",
+                },
+            },
+            ["capability", "reason"],
+        ),
+        fn(
             "fetch_url",
             "Fetch an HTTP(S) URL as text. Network access requires a higher-risk grant.",
             {
@@ -425,6 +447,7 @@ class ToolExecutor:
             "write_document": self._write_document,
             "patch_file": self._patch_file,
             "run_command": self._run_command,
+            "request_authorization": self._request_authorization,
             "fetch_url": self._fetch_url,
             "list_skills": self._list_skills,
             "read_skill": self._read_skill,
@@ -498,10 +521,12 @@ class ToolExecutor:
         text: str,
         *,
         previous_assistant: str = "",
+        previous_scope: RequestScope | None = None,
     ) -> RequestScope:
         self.request_scope = classify_request_with_context(
             text,
             previous_assistant=previous_assistant,
+            previous_scope=previous_scope,
         )
         return self.request_scope
 
@@ -1072,6 +1097,45 @@ class ToolExecutor:
             process.returncode == 0 and not semantic_failure,
             content,
             artifact=artifact,
+        )
+
+    def _request_authorization(self, args: dict[str, Any]) -> ToolResult:
+        capability = str(args.get("capability") or "").strip()
+        reason = str(args.get("reason") or "").strip()
+        allowed = {
+            "mutation",
+            "mutation_and_commands",
+            "commands",
+            "network",
+        }
+        if capability not in allowed:
+            return ToolResult(False, "未知授权类型")
+        if self.request_scope is None:
+            return ToolResult(False, "当前没有可扩展的任务范围")
+        if not reason:
+            return ToolResult(False, "授权请求缺少原因")
+
+        approved = self.approvals.require(
+            "扩大当前任务授权",
+            f"需要能力：{capability}\n原因：{reason}",
+            risk="R2",
+        )
+        if not approved:
+            return ToolResult(False, "用户拒绝扩大任务授权")
+
+        mutation = capability in {"mutation", "mutation_and_commands"}
+        commands = capability in {"commands", "mutation_and_commands"} or mutation
+        self.request_scope = replace(
+            self.request_scope,
+            allows_mutation=self.request_scope.allows_mutation or mutation,
+            allows_commands=self.request_scope.allows_commands or commands,
+            allows_network=self.request_scope.allows_network
+            or capability == "network",
+        )
+        return ToolResult(
+            True,
+            f"已授权：{capability}。下一步可以使用新开放的工具；"
+            "授权只在当前任务回合有效。",
         )
 
     def _fetch_url(self, args: dict[str, Any]) -> ToolResult:

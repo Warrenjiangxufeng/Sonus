@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,19 +24,21 @@ class ToolTests(unittest.TestCase):
         self.assertIn("write_document", names)
         self.assertIn("memory_context_metrics", names)
         self.assertIn("inspect_environment", names)
+        self.assertIn("request_authorization", names)
 
     def make_executor(
         self,
         root: Path,
         *,
         memory: MemoryStore | None = None,
+        interactive: bool = False,
     ) -> ToolExecutor:
         return ToolExecutor(
             workspace=root,
             path_guard=PathGuard(root),
             approvals=ApprovalManager(
                 auto_approve=False,
-                interactive=False,
+                interactive=interactive,
                 workspace=root,
             ),
             artifacts=ArtifactStore(root, root / ".data"),
@@ -67,6 +71,30 @@ class ToolTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertIn("exit_code=0", result.content)
             self.assertIn("ok", result.content)
+
+    def test_authorization_request_can_expand_current_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root, interactive=True)
+            executor.begin_request("解释这个文件")
+
+            with (
+                patch("sunus.policy._choose_approval_option", return_value=0),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                result = executor.execute(
+                    "request_authorization",
+                    {
+                        "capability": "mutation_and_commands",
+                        "reason": "需要修改代码并运行测试",
+                    },
+                )
+
+            self.assertTrue(result.ok)
+            self.assertIsNotNone(executor.request_scope)
+            self.assertTrue(executor.request_scope.allows_mutation)
+            self.assertTrue(executor.request_scope.allows_commands)
 
     def test_command_timeout_terminates_the_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -23,6 +23,28 @@ class RequestScopeTests(unittest.TestCase):
         self.assertTrue(scope.allows_commands)
         self.assertFalse(scope.allows_network)
 
+    def test_explicit_change_imperatives_allow_mutation_and_commands(self) -> None:
+        for text in (
+            "我需要你改下 cli 的窗口逻辑",
+            "直接改",
+            "直接改主仓",
+            "给我改",
+            "动手改",
+            "继续改",
+            "按刚才的四步改",
+        ):
+            with self.subTest(text=text):
+                scope = classify_request(text)
+                self.assertTrue(scope.allows_mutation)
+                self.assertTrue(scope.allows_commands)
+
+    def test_change_questions_and_negations_do_not_authorize(self) -> None:
+        for text in ("改不改？", "不要直接改", "先别动手改，只分析"):
+            with self.subTest(text=text):
+                scope = classify_request(text)
+                self.assertFalse(scope.allows_mutation)
+                self.assertFalse(scope.allows_commands)
+
     def test_colloquial_install_command_is_recognized(self) -> None:
         scope = classify_request("你怎么可能没有shell工具？没有就装啊！")
         self.assertTrue(scope.allows_commands)
@@ -100,6 +122,17 @@ class RequestScopeTests(unittest.TestCase):
             previous_assistant="我刚才只是在解释概念。",
         )
         self.assertFalse(without_network_offer.allows_network)
+
+    def test_confirmation_inherits_previous_explicit_scope(self) -> None:
+        previous = classify_request("请修改 cli.py 并运行测试")
+        scope = classify_request_with_context(
+            "按刚才的来",
+            previous_scope=previous,
+        )
+
+        self.assertTrue(scope.allows_mutation)
+        self.assertTrue(scope.allows_commands)
+        self.assertFalse(scope.allows_network)
 
 
 if __name__ == "__main__":

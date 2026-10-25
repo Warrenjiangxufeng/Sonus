@@ -34,6 +34,7 @@ class ToolRegistryTests(unittest.TestCase):
             read = tools.registry.get("read_file")
             write = tools.registry.get("write_file")
             command = tools.registry.get("run_command")
+            authorization = tools.registry.get("request_authorization")
             result = tools.registry.get("submit_result")
 
             self.assertIsNotNone(read)
@@ -44,6 +45,8 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertFalse(write.parallel_safe)
             self.assertEqual(write.risk, "R1")
             self.assertFalse(command.parallel_safe)
+            self.assertFalse(authorization.read_only)
+            self.assertFalse(authorization.parallel_safe)
             self.assertFalse(result.parallel_safe)
             self.assertEqual(
                 {item.name for item in tools.specs()},
@@ -57,6 +60,7 @@ class ToolRegistryTests(unittest.TestCase):
                     "write_document",
                     "patch_file",
                     "run_command",
+                    "request_authorization",
                     "fetch_url",
                     "list_skills",
                     "read_skill",

@@ -6,10 +6,11 @@ import select
 import shlex
 import sys
 import termios
+import threading
 import tty
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Literal
+from typing import Callable, Iterable, Literal
 
 
 class PolicyError(RuntimeError):
@@ -390,7 +391,7 @@ def _read_choice_key() -> str:
     descriptor = sys.stdin.fileno()
     previous = termios.tcgetattr(descriptor)
     try:
-        tty.setcbreak(descriptor)
+        tty.setcbreak(descriptor, when=termios.TCSADRAIN)
         return _read_menu_key(descriptor)
     finally:
         termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
@@ -440,6 +441,9 @@ class ApprovalManager:
         interactive: bool | None = None,
         workspace: Path | None = None,
         default_grant: TaskGrant | None = None,
+        prompt_event: threading.Event | None = None,
+        before_prompt: Callable[[], None] | None = None,
+        after_prompt: Callable[[], None] | None = None,
     ) -> None:
         self.auto_approve = auto_approve
         self.workspace = (workspace or Path.cwd()).expanduser().resolve()
@@ -451,6 +455,9 @@ class ApprovalManager:
             else interactive
         )
         self.session_allow = auto_approve
+        self.prompt_event = prompt_event
+        self.before_prompt = before_prompt
+        self.after_prompt = after_prompt
 
     def begin_task(self) -> TaskGrant:
         self.grant = self.default_grant
@@ -476,13 +483,23 @@ class ApprovalManager:
                 file=sys.stderr,
             )
             return False
-        print(f"\nSunus 请求执行：{action}（风险 {risk}）")
-        print(detail.strip()[:3000])
         try:
-            choice = _choose_approval_option()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return False
+            if self.prompt_event is not None:
+                self.prompt_event.set()
+            if self.before_prompt is not None:
+                self.before_prompt()
+            print(f"\nSunus 请求执行：{action}（风险 {risk}）")
+            print(detail.strip()[:3000])
+            try:
+                choice = _choose_approval_option()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return False
+        finally:
+            if self.after_prompt is not None:
+                self.after_prompt()
+            if self.prompt_event is not None:
+                self.prompt_event.clear()
         if choice == 1:
             self.session_allow = True
             return True

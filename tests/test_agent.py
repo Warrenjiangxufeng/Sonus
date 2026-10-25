@@ -505,6 +505,48 @@ class StatusResultModel:
         )
 
 
+class AuthorizationThenResultModel:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.tool_name_sets: list[set[str]] = []
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.calls += 1
+        self.tool_name_sets.append(
+            {item["function"]["name"] for item in tools or []}
+        )
+        if self.calls == 1:
+            name = "request_authorization"
+            arguments = (
+                '{"capability":"mutation_and_commands",'
+                '"reason":"需要修改代码并运行测试"}'
+            )
+        else:
+            name = "submit_result"
+            arguments = (
+                '{"kind":"answer","status":"completed",'
+                '"summary":"授权后已完成。"}'
+            )
+        return ModelReply(
+            message={
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": f"call_{self.calls}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            },
+            usage={"total_tokens": 5},
+            finish_reason="tool_calls",
+        )
+
+
 class TextualDSMLResultModel:
     def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
         return ModelReply(
@@ -768,6 +810,57 @@ class AgentTests(unittest.TestCase):
             system_prompt = model.last_messages[0]["content"]
             self.assertIn("本轮是简单状态查询", system_prompt)
             self.assertNotIn("本轮是诊断或根因分析", system_prompt)
+            memory.close()
+
+    def test_authorization_refreshes_tools_for_next_model_call(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_authorize", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=True,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+            )
+            model = AuthorizationThenResultModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            with (
+                patch("sunus.policy._choose_approval_option", return_value=0),
+                patch("sunus.policy.sys.stdin.isatty", return_value=True),
+            ):
+                result = agent.run_turn("解释这个文件")
+
+            self.assertEqual(result.reason, "completed")
+            self.assertEqual(model.calls, 2)
+            self.assertIn("request_authorization", model.tool_name_sets[0])
+            self.assertNotIn("patch_file", model.tool_name_sets[0])
+            self.assertIn("patch_file", model.tool_name_sets[1])
+            self.assertIn("run_command", model.tool_name_sets[1])
             memory.close()
 
     def test_textual_dsml_result_is_converted_and_executed(self) -> None:

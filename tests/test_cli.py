@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import termios
 import threading
 import unittest
 from contextlib import redirect_stdout
@@ -9,12 +10,15 @@ from unittest.mock import patch
 from sunus.cli import (
     PendingTerminalInput,
     RuntimeEventRenderer,
+    TerminalInputDock,
     ThinkingStateObserver,
     _enable_utf8_input,
     _input_with_initial,
+    _read_active_turn_key,
     _remove_last_grapheme,
     _read_thinking_key,
     _thinking_interrupt_pressed,
+    _wrap_input_lines,
     make_parser,
     print_banner,
     render_terminal_markdown,
@@ -41,7 +45,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(pending.text(), "你")
         pending.feed("呀".encode("utf-8"))
         pending.feed(b"\r")
-        self.assertEqual(pending.text(), "你呀")
+        self.assertEqual(pending.text(), "")
+        self.assertEqual(pending.take_submitted(), ["你呀"])
 
     def test_remove_last_grapheme_handles_unicode_clusters(self) -> None:
         self.assertEqual(_remove_last_grapheme("你好"), "你")
@@ -71,7 +76,7 @@ class CliTests(unittest.TestCase):
             patch("sunus.cli.sys.stdin.fileno", return_value=0),
             patch("sunus.cli.termios.tcgetattr", return_value=[0, 0, 0, 0, 0, 0, []]),
             patch("sunus.cli.termios.tcsetattr"),
-            patch("sunus.cli.tty.setcbreak"),
+            patch("sunus.cli.tty.setcbreak") as set_cbreak,
             patch("sunus.cli.select.select", return_value=([0], [], [])),
             patch("sunus.cli.os.read", side_effect=[bytes([byte]) for byte in payload]),
             redirect_stdout(output),
@@ -81,6 +86,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result, "前缀第一段\n第二段")
         self.assertNotIn("[200~", result)
         self.assertNotIn("[201~", result)
+        set_cbreak.assert_called_once_with(0, when=termios.TCSADRAIN)
+        self.assertIn("\x1b[?2004l", output.getvalue())
 
     def test_bracketed_paste_marker_is_not_queued_as_text(self) -> None:
         marker = b"\x1b[200~"
@@ -94,6 +101,52 @@ class CliTests(unittest.TestCase):
             action, content = _read_thinking_key(0)
         self.assertEqual(action, "ignore")
         self.assertEqual(content, b"")
+
+    def test_active_turn_reader_detects_paste_markers(self) -> None:
+        for marker, expected in (
+            (b"\x1b[200~", "paste_start"),
+            (b"\x1b[201~", "paste_end"),
+        ):
+            with (
+                patch("sunus.cli.select.select", return_value=([0], [], [])),
+                patch(
+                    "sunus.cli.os.read",
+                    side_effect=[bytes([byte]) for byte in marker],
+                ),
+            ):
+                action, _ = _read_active_turn_key(0)
+            self.assertEqual(action, expected)
+
+    def test_wrapped_input_keeps_all_characters(self) -> None:
+        text = "前面输入的完整内容不能缩略"
+        lines, cursor_row, _ = _wrap_input_lines("你 › ", text, len(text), 16)
+
+        self.assertGreater(len(lines), 1)
+        restored = "".join(
+            line.replace("你 › ", "", 1).strip()
+            for line in lines
+        )
+        self.assertEqual(restored, text)
+        self.assertEqual(cursor_row, len(lines) - 1)
+
+    def test_input_dock_redraws_activity_and_input_together(self) -> None:
+        pending = PendingTerminalInput()
+        pending.feed("排队输入".encode("utf-8"))
+        output = io.StringIO()
+        dock = TerminalInputDock(
+            "你 › ",
+            pending,
+            stream=output,
+            is_tty=True,
+            color_enabled=False,
+        )
+
+        dock.set_activity("  思考中")
+        dock.refresh()
+
+        text = output.getvalue()
+        self.assertIn("思考中", text)
+        self.assertIn("你 › 排队输入", text)
 
     def test_parses_core_commands(self) -> None:
         parser = make_parser()

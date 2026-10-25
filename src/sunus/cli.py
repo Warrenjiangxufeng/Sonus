@@ -14,6 +14,7 @@ import threading
 import tty
 import unicodedata
 import uuid
+from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -163,8 +164,9 @@ def _enable_utf8_input(descriptor: int) -> bool:
 @dataclass
 class PendingTerminalInput:
     raw: bytearray = field(default_factory=bytearray)
+    submitted: deque[str] = field(default_factory=deque)
 
-    def feed(self, value: bytes) -> None:
+    def feed(self, value: bytes, *, submit_newline: bool = True) -> None:
         if not value:
             return
         if value in {b"\x7f", b"\x08"}:
@@ -174,6 +176,13 @@ class PendingTerminalInput:
                 self.raw.pop()
             return
         if value in {b"\r", b"\n"}:
+            if submit_newline:
+                text = self.text().strip()
+                if text:
+                    self.submitted.append(text)
+                self.clear()
+            else:
+                self.raw.extend(b"\n")
             return
         first = value[0]
         if first >= 0x20 or first >= 0x80:
@@ -184,6 +193,130 @@ class PendingTerminalInput:
 
     def clear(self) -> None:
         self.raw.clear()
+
+    def take_submitted(self) -> list[str]:
+        values = list(self.submitted)
+        self.submitted.clear()
+        return values
+
+
+def _wrap_input_lines(
+    prompt: str,
+    text: str,
+    cursor: int,
+    width: int,
+) -> tuple[list[str], int, int]:
+    """Wrap one editable input buffer without dropping its leading text."""
+    prompt_width = _display_width(prompt)
+    continuation = " " * prompt_width
+    hard_width = max(prompt_width + 8, width - 1)
+    cursor = max(0, min(cursor, len(text)))
+    rows = [prompt]
+    row = 0
+    column = prompt_width
+    cursor_row = 0
+    cursor_column = prompt_width
+
+    for index, character in enumerate(text):
+        if index == cursor:
+            cursor_row, cursor_column = row, column
+        if character == "\n":
+            rows.append(continuation)
+            row += 1
+            column = prompt_width
+            continue
+        character_width = _display_width(character)
+        if column + character_width > hard_width and column > prompt_width:
+            rows.append(continuation)
+            row += 1
+            column = prompt_width
+        rows[row] += character
+        column += character_width
+    if cursor >= len(text):
+        cursor_row, cursor_column = row, column
+    return rows, cursor_row, cursor_column
+
+
+class TerminalInputDock:
+    """Keep editable input visible below the live activity line."""
+
+    def __init__(
+        self,
+        prompt: str,
+        pending: PendingTerminalInput,
+        *,
+        stream: TextIO | None = None,
+        is_tty: bool | None = None,
+        color_enabled: bool | None = None,
+    ) -> None:
+        self.prompt = prompt
+        self.pending = pending
+        self.stream = stream or sys.stdout
+        self.is_tty = self.stream.isatty() if is_tty is None else is_tty
+        self.color_enabled = (
+            self.stream.isatty() if color_enabled is None else color_enabled
+        )
+        self._activity = ""
+        self._rendered_rows = 0
+        self._cursor_row = 0
+        self._lock = threading.RLock()
+
+    def _erase(self) -> None:
+        if not self.is_tty or self._rendered_rows <= 0:
+            return
+        up = self._rendered_rows - 1 - self._cursor_row
+        self.stream.write("\r")
+        if up:
+            self.stream.write(f"\x1b[{up}A")
+        for index in range(self._rendered_rows):
+            self.stream.write("\x1b[2K")
+            if index < self._rendered_rows - 1:
+                self.stream.write("\n")
+        if self._rendered_rows > 1:
+            self.stream.write(f"\x1b[{self._rendered_rows - 1}A")
+        self.stream.write("\r")
+        self.stream.flush()
+        self._rendered_rows = 0
+
+    def refresh(self) -> None:
+        if not self.is_tty:
+            return
+        with self._lock:
+            self._erase()
+            width = shutil.get_terminal_size((80, 24)).columns
+            activity_lines = self._activity.splitlines() or []
+            input_lines, cursor_row, cursor_column = _wrap_input_lines(
+                self.prompt,
+                self.pending.text(),
+                len(self.pending.text()),
+                width,
+            )
+            lines = [*activity_lines, *input_lines]
+            for index, line in enumerate(lines):
+                if index:
+                    self.stream.write("\n")
+                self.stream.write("\x1b[2K")
+                self.stream.write(line)
+            total_rows = len(lines)
+            target_row = len(activity_lines) + cursor_row
+            up = total_rows - 1 - target_row
+            self.stream.write("\r")
+            if up:
+                self.stream.write(f"\x1b[{up}A")
+            if cursor_column:
+                self.stream.write(f"\x1b[{cursor_column}C")
+            self.stream.flush()
+            self._rendered_rows = total_rows
+            self._cursor_row = target_row
+
+    def set_activity(self, text: str) -> None:
+        self._activity = str(text or "")
+        self.refresh()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._erase()
+            self._activity = ""
 
 
 class RuntimeEventRenderer:
@@ -207,12 +340,14 @@ class RuntimeEventRenderer:
         color_enabled: bool | None = None,
         is_tty: bool | None = None,
         activity_stream: TextIO | None = None,
+        input_dock: TerminalInputDock | None = None,
     ) -> None:
         self.color_enabled = (
             sys.stdout.isatty() if color_enabled is None else color_enabled
         )
         self.is_tty = sys.stdout.isatty() if is_tty is None else is_tty
         self.activity_stream = activity_stream or sys.stderr
+        self.input_dock = input_dock
         self._line_active = False
         self._analysis_count = 0
         self._tool_counts: dict[str, int] = {}
@@ -220,6 +355,12 @@ class RuntimeEventRenderer:
         self._turn_active = False
 
     def _status(self, text: str, code: str = "") -> None:
+        if self.input_dock is not None:
+            self.input_dock.set_activity(
+                color(text.strip(), code, self.color_enabled)
+            )
+            self._line_active = True
+            return
         if not self.is_tty:
             return
         self.activity_stream.write(
@@ -229,6 +370,12 @@ class RuntimeEventRenderer:
         self._line_active = True
 
     def _finish(self, text: str, code: str = "") -> None:
+        if self.input_dock is not None:
+            self.input_dock.set_activity(
+                color(text.strip(), code, self.color_enabled)
+            )
+            self._line_active = False
+            return
         if not self.is_tty:
             return
         if self._line_active:
@@ -479,6 +626,9 @@ def build_components(
     require_model: bool = True,
     renderer: Callable[[dict[str, Any]], None] | None = None,
     observer: Callable[[dict[str, Any]], None] | None = None,
+    approval_event: threading.Event | None = None,
+    approval_before_prompt: Callable[[], None] | None = None,
+    approval_after_prompt: Callable[[], None] | None = None,
     session_path: Path | None = None,
 ) -> Components:
     memory = MemoryStore(config.data_dir / "memory.db")
@@ -493,6 +643,9 @@ def build_components(
         auto_approve=config.auto_approve,
         interactive=interactive,
         workspace=config.workspace,
+        prompt_event=approval_event,
+        before_prompt=approval_before_prompt,
+        after_prompt=approval_after_prompt,
     )
     path_guard = PathGuard(config.workspace, allow_outside=config.allow_outside)
     artifacts = ArtifactStore(config.workspace, config.data_dir, config.api_key)
@@ -754,7 +907,10 @@ def _input_with_initial(
 
     try:
         _enable_utf8_input(descriptor)
-        tty.setcbreak(descriptor)
+        tty.setcbreak(descriptor, when=termios.TCSADRAIN)
+        attributes = termios.tcgetattr(descriptor)
+        attributes[3] &= ~termios.ECHO
+        termios.tcsetattr(descriptor, termios.TCSADRAIN, attributes)
         sys.stdout.write("\x1b[?2004h")
         redraw()
         in_paste = False
@@ -853,7 +1009,7 @@ def _input_with_initial(
                 if not in_paste:
                     redraw()
     finally:
-        sys.stdout.write("\x1b[?2004h")
+        sys.stdout.write("\x1b[?2004l")
         sys.stdout.flush()
         termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
 
@@ -1143,17 +1299,39 @@ def _read_thinking_key(descriptor: int) -> tuple[str, bytes]:
     return "ignore", b""
 
 
+def _read_active_turn_key(descriptor: int) -> tuple[str, bytes]:
+    """Read a task-time keypress while preserving paste and input events."""
+    try:
+        character = os.read(descriptor, 1)
+    except OSError:
+        return "ignore", b""
+    if character == b"\t":
+        return "interrupt", character
+    if character != b"\x1b":
+        return "text", character
+    sequence = _read_escape_sequence(descriptor)
+    if sequence == b"\x1b":
+        return "interrupt", character
+    if sequence == b"\x1b[200~":
+        return "paste_start", sequence
+    if sequence == b"\x1b[201~":
+        return "paste_end", sequence
+    return "ignore", b""
+
+
 def run_turn_with_interrupt(
     components: Components,
     user_input: str,
     thinking_event: threading.Event,
     pending_input: PendingTerminalInput | None = None,
-) -> AgentResult:
+    input_dock: TerminalInputDock | None = None,
+    approval_event: threading.Event | None = None,
+) -> tuple[AgentResult, list[str]]:
     agent = components.agent
     if agent is None:
         raise RuntimeError("模型未初始化")
     if not sys.stdin.isatty():
-        return agent.run_turn(user_input)
+        return agent.run_turn(user_input), []
 
     outcome: dict[str, Any] = {}
 
@@ -1167,34 +1345,52 @@ def run_turn_with_interrupt(
     thread.start()
     descriptor = sys.stdin.fileno()
     _enable_utf8_input(descriptor)
-    previous: list[Any] | None = None
+    previous: list[Any] | None = termios.tcgetattr(descriptor)
     cancelled = False
+    in_paste = False
     try:
+        tty.setcbreak(descriptor, when=termios.TCSADRAIN)
+        attributes = termios.tcgetattr(descriptor)
+        attributes[3] &= ~termios.ECHO
+        termios.tcsetattr(descriptor, termios.TCSADRAIN, attributes)
+        sys.stdout.write("\x1b[?2004h")
+        sys.stdout.flush()
         while thread.is_alive():
-            if thinking_event.is_set() and not cancelled:
-                if previous is None:
-                    previous = termios.tcgetattr(descriptor)
-                    tty.setcbreak(descriptor)
-                if select.select([descriptor], [], [], 0.05)[0]:
-                    action, character = _read_thinking_key(descriptor)
-                    if action == "interrupt":
-                        cancelled = True
-                        cancel = getattr(components.model, "cancel", None)
-                        if callable(cancel):
-                            cancel()
-                        if previous is not None:
-                            termios.tcsetattr(
-                                descriptor,
-                                termios.TCSADRAIN,
-                                previous,
-                            )
-                            previous = None
-                    elif action == "text" and pending_input is not None:
-                        pending_input.feed(character)
+            if approval_event is not None and approval_event.is_set():
+                thread.join(0.05)
                 continue
-            if previous is not None:
-                termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
-                previous = None
+            if select.select([descriptor], [], [], 0.05)[0]:
+                action, character = _read_active_turn_key(descriptor)
+                if action == "interrupt" and thinking_event.is_set() and not cancelled:
+                    cancelled = True
+                    cancel = getattr(components.model, "cancel", None)
+                    if callable(cancel):
+                        cancel()
+                elif action == "paste_start":
+                    in_paste = True
+                elif action == "paste_end":
+                    in_paste = False
+                    if input_dock is not None:
+                        input_dock.refresh()
+                elif action == "text" and pending_input is not None:
+                    if in_paste and character == b"\r":
+                        character = b"\n"
+                    submit = character in {b"\r", b"\n"} and not in_paste
+                    pending_input.feed(
+                        character,
+                        submit_newline=submit,
+                    )
+                    if input_dock is not None:
+                        if submit:
+                            input_dock.set_activity(
+                                color(
+                                    "  ⏎ 已排队 · 当前任务结束后发送",
+                                    DIM,
+                                    input_dock.color_enabled,
+                                )
+                            )
+                        else:
+                            input_dock.refresh()
             thread.join(0.05)
     except KeyboardInterrupt:
         cancel = getattr(components.model, "cancel", None)
@@ -1204,6 +1400,10 @@ def run_turn_with_interrupt(
     finally:
         if previous is not None:
             termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
+        sys.stdout.write("\x1b[?2004l")
+        sys.stdout.flush()
+        if input_dock is not None:
+            input_dock.clear()
         thread.join()
 
     if "error" in outcome:
@@ -1211,7 +1411,8 @@ def run_turn_with_interrupt(
     result = outcome.get("result")
     if not isinstance(result, AgentResult):
         raise RuntimeError("Agent 回合未返回结果")
-    return result
+    submitted = pending_input.take_submitted() if pending_input is not None else []
+    return result, submitted
 
 
 def residual_text(result_text: str, streamed_text: str) -> str:
@@ -1243,9 +1444,19 @@ def run_repl(
 ) -> int:
     identifier = transcript.session_id if transcript and forked_from is None else session_id()
     thinking_event = threading.Event()
+    approval_event = threading.Event()
     pending_input = PendingTerminalInput()
+    queued_inputs: deque[str] = deque()
+    input_dock = (
+        TerminalInputDock(
+            color("你 › ", CYAN, sys.stdout.isatty()),
+            pending_input,
+        )
+        if not verbose and sys.stdin.isatty()
+        else None
+    )
     renderer = (
-        RuntimeEventRenderer()
+        RuntimeEventRenderer(input_dock=input_dock)
         if not verbose
         else None
     )
@@ -1257,6 +1468,9 @@ def run_repl(
         verbose=verbose,
         renderer=renderer,
         observer=ThinkingStateObserver(thinking_event),
+        approval_event=approval_event,
+        approval_before_prompt=input_dock.clear if input_dock is not None else None,
+        approval_after_prompt=input_dock.refresh if input_dock is not None else None,
         session_path=transcript.path if transcript and forked_from is None else None,
     )
     try:
@@ -1280,17 +1494,20 @@ def run_repl(
             print(f"{action}会话 {transcript.session_id}，共 {transcript.turns} 轮。")
             print()
         while True:
-            try:
-                user_input = read_with_proactive(
-                    components,
-                    color("你 › ", CYAN, sys.stdout.isatty()),
-                    initial=pending_input.text(),
-                )
-                pending_input.clear()
-            except KeyboardInterrupt:
-                pending_input.clear()
-                print("\n已取消当前输入。")
-                continue
+            if queued_inputs:
+                user_input = queued_inputs.popleft()
+            else:
+                try:
+                    user_input = read_with_proactive(
+                        components,
+                        color("你 › ", CYAN, sys.stdout.isatty()),
+                        initial=pending_input.text(),
+                    )
+                    pending_input.clear()
+                except KeyboardInterrupt:
+                    pending_input.clear()
+                    print("\n已取消当前输入。")
+                    continue
             if user_input is None:
                 print("\n再见。")
                 break
@@ -1307,15 +1524,18 @@ def run_repl(
                 continue
             print(color("Sunus", GREEN, sys.stdout.isatty()), flush=True)
             try:
-                result = run_turn_with_interrupt(
+                result, submitted = run_turn_with_interrupt(
                     components,
                     user_input,
                     thinking_event,
                     pending_input,
+                    input_dock,
+                    approval_event,
                 )
             except KeyboardInterrupt:
                 print("\n操作已中断。")
                 continue
+            queued_inputs.extend(submitted)
             print_terminal_markdown(result.text)
             if renderer is not None:
                 renderer.streamed_text = ""

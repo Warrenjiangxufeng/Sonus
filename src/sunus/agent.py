@@ -148,6 +148,7 @@ class Agent:
         self._tool_visibility_prompt = ""
         self._diagnostic_prompt = ""
         self._status_prompt = ""
+        self._last_request_scope = None
         self._response_mode = ""
         self._last_prompt_tokens = 0
         self.reset()
@@ -160,6 +161,7 @@ class Agent:
         self._tool_visibility_prompt = ""
         self._diagnostic_prompt = ""
         self._status_prompt = ""
+        self._last_request_scope = None
         self._response_mode = ""
         self._last_prompt_tokens = 0
         self._session_memory_flushed = False
@@ -255,6 +257,7 @@ class Agent:
         self._tool_visibility_prompt = ""
         self._diagnostic_prompt = ""
         self._status_prompt = ""
+        self._last_request_scope = None
         self._response_mode = ""
         self._last_prompt_tokens = 0
         self.messages = [{"role": "system", "content": ""}, *repaired]
@@ -354,6 +357,7 @@ class Agent:
 14. 查找代码或文本时优先使用 `search_text`；不要把 `grep -r`/`rg` 扫描用户主目录、`Documents` 等大目录作为首选。确需跨目录搜索时，先锁定候选路径，显式排除缓存、依赖和运行数据，并设置短超时。
 15. 多个互相独立的只读检查必须在同一轮 `tool_calls` 中批量发起，避免逐项等待模型往返；只有后一项依赖前一项结果时才串行。
 16. 诊断、解释和评审类回答先给结论，再给最多 3 条关键依据和 1 条修复方向；除非用户明确索要，不展示完整代码、diff、函数实现或大段日志。
+17. 任务确实需要未开放的写入、命令或网络能力时，调用 request_authorization 发起授权；不要仅凭工具清单自行判断为永久无权限。
 
 任务边界：
 - 只执行用户当前消息明确要求的动作。建议、假设、示例、推测、可选优化和未点名待办都不是执行指令。
@@ -557,6 +561,7 @@ class Agent:
             "inspect_environment",
             "list_skills",
             "read_skill",
+            "request_authorization",
             "submit_result",
         }
         if scope.allows_mutation:
@@ -626,7 +631,7 @@ class Agent:
             (
                 "- 未开放只表示本轮不可调用；不得说成“Sunus 没有这个能力”"
                 "或“永远装不出来”。",
-                "- 完成任务确实需要未开放能力时，应说明所需权限；"
+                "- 完成任务确实需要未开放能力时，调用 request_authorization；"
                 "不得用读取工具的结果冒充命令或测试结果。",
             )
         )
@@ -662,6 +667,9 @@ class Agent:
             return f"修改文件 · {path}"
         if name == "run_command":
             return f"运行命令 · {compact(arguments.get('command', ''))}"
+        if name == "request_authorization":
+            capability = compact(arguments.get("capability", ""), 40)
+            return f"请求授权 · {capability}"
         if name == "fetch_url":
             return f"访问网络 · {compact(arguments.get('url', ''))}"
         if name == "memory_context_metrics":
@@ -894,7 +902,9 @@ class Agent:
         request_scope = self.tools.begin_request(
             user_input,
             previous_assistant=previous_assistant,
+            previous_scope=self._last_request_scope,
         )
+        self._last_request_scope = request_scope
         mode_hint = conversation_hint(
             user_input,
             previous_assistant=previous_assistant,
@@ -1507,6 +1517,18 @@ class Agent:
                         tool_traces=tool_traces,
                         changed_files=changed_files,
                     )
+                    if name == "request_authorization" and result.ok:
+                        available_tool_schemas = self._request_tool_schemas(
+                            all_tool_schemas,
+                            self.tools.request_scope or request_scope,
+                            conversation=conversation,
+                        )
+                        self._set_tool_visibility_prompt(
+                            all_tool_schemas,
+                            available_tool_schemas,
+                            self.tools.request_scope or request_scope,
+                            conversation=conversation,
+                        )
                     invocation_index += 1
                 if submitted:
                     break
