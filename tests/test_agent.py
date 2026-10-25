@@ -1151,6 +1151,18 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(model.tool_names, set())
             self.assertIn("本轮回应模式：日常对话", model.last_messages[0]["content"])
             self.assertIn("不要调用任何工具", model.last_messages[0]["content"])
+            self.assertIn(
+                "不要每句都用语气词、固定昵称或括号动作",
+                model.last_messages[0]["content"],
+            )
+            self.assertIn(
+                "不必把人际问题整理成完整框架",
+                model.last_messages[0]["content"],
+            )
+            self.assertIn(
+                "本轮是关系性对话",
+                model.last_messages[0]["content"],
+            )
             self.assertNotIn(
                 "必须调用 submit_result",
                 model.last_messages[0]["content"],

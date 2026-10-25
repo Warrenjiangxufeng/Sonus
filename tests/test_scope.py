@@ -80,6 +80,11 @@ class RequestScopeTests(unittest.TestCase):
             "聊天别这么呆板嘛，你是女孩吗",
             "是有点冷淡了",
             "怎么追一个不太喜欢你的相亲对象啊",
+            "今天有点累，不太想聊工作。你先别给建议，陪我缓一会儿。",
+            "你觉得我是那种太较真、把自己绷得太紧的人吗？说实话，但别教育我。",
+            "你刚才有点端着，别像客服，也别故意撒娇。就用正常朋友说话的方式。",
+            "你会怎么判断一个人是真的靠谱，不是嘴上会说？",
+            "我们聊得像人吗？你自己哪里最像机器人？",
         ):
             with self.subTest(text=text):
                 self.assertTrue(is_casual_conversation(text))
@@ -90,6 +95,7 @@ class RequestScopeTests(unittest.TestCase):
             "分析当前项目架构",
             "读取 Documents/Sunus/README.md",
             "读取 note.txt",
+            "你觉得这个代码哪里有问题？",
         ):
             with self.subTest(text=text):
                 self.assertFalse(is_casual_conversation(text))

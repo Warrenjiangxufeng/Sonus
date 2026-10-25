@@ -67,6 +67,12 @@ _CASUAL_PATTERN = re.compile(
     r"\b(?:hi|hello|thanks|good\s+night)\b)",
     re.IGNORECASE,
 )
+_RELATIONAL_PATTERN = re.compile(
+    r"(?:陪你|陪我|不想聊工作|太较真|绷得|别教育我|像客服|"
+    r"正常朋友|聊得像人|像机器人|你自己哪里|判断一个人|"
+    r"真的靠谱|嘴上会说|说实话|你觉得我|我们聊)",
+    re.IGNORECASE,
+)
 _PATH_PATTERN = re.compile(r"(?:^|[\s`'\"])[~./][\w./-]+")
 _REFERENTIAL_FOLLOWUP = re.compile(
     r"^\s*(?:就|那)?(?:试一下|试试|继续|接着来|按你说的|照这个做|"
@@ -194,6 +200,8 @@ def conversation_hint(
         return "task"
     if scope.allows_mutation or scope.allows_commands or scope.allows_network:
         return "task"
+    if _RELATIONAL_PATTERN.search(stripped):
+        return "casual"
     if _CASUAL_PATTERN.search(stripped):
         return "casual"
     if len(stripped) <= 24 and not _MUTATION_PATTERN.search(stripped):

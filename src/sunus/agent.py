@@ -30,6 +30,7 @@ from sunus.model import (
 from sunus.model_events import ModelEvent
 from sunus.reasoning import (
     complex_task_prompt,
+    conversation_thinking_prompt,
     diagnostic_protocol_prompt,
     is_complex_request,
     is_diagnostic_request,
@@ -246,10 +247,17 @@ class Agent:
             content += "\n\n" + self._planning_prompt
         if self._response_mode == "conversation":
             content += (
-                "\n\n本轮回应模式：日常对话。像熟人发消息一样自然回应；"
-                "先答对方刚说的内容，通常 1-2 句、控制在 80 个汉字左右。"
+                "\n\n"
+                + conversation_thinking_prompt()
+                + "\n\n本轮回应模式：日常对话。像熟人发消息一样自然回应；"
+                "先回应对方面向的情绪或真实问题，通常 1-3 句，内容需要时可到 4 句。"
+                "长度随内容变化，不固定凑字数。"
                 "除非对方明确要求，否则不列清单、不分析利弊、不主动给方案，"
                 "不追问多个问题，也不要把轻松聊天写成客服话术。"
+                "不要每句都用语气词、固定昵称或括号动作；只有对方主动角色扮演"
+                "或明确要求时才使用亲密动作描写。"
+                "表达个人判断时可以保留一点犹豫，不必把人际问题整理成完整框架；"
+                "对方指出机械或端着时，自然调整，不写检讨式总结。"
             )
         self._system_context = content
         if self.messages and self.messages[0].get("role") == "system":

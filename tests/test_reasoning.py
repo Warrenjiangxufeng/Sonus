@@ -4,6 +4,7 @@ import unittest
 
 from sunus.reasoning import (
     complex_task_prompt,
+    conversation_thinking_prompt,
     diagnostic_protocol_prompt,
     is_complex_request,
     is_diagnostic_request,
@@ -64,6 +65,13 @@ class ReasoningTests(unittest.TestCase):
         self.assertIn("第一次工具调用前", prompt)
         self.assertIn("失败后先归因", prompt)
         self.assertIn("立即收束", prompt)
+
+    def test_relational_conversation_has_a_thought_checkpoint(self) -> None:
+        prompt = conversation_thinking_prompt()
+        self.assertIn("陪伴、被理解、一个真实评价、建议", prompt)
+        self.assertIn("只选择一个主要回应动作", prompt)
+        self.assertIn("不过度心理分析", prompt)
+        self.assertIn("模板化、咨询师化、客服化", prompt)
 
 
 if __name__ == "__main__":
