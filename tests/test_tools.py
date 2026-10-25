@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -66,6 +67,20 @@ class ToolTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertIn("exit_code=0", result.content)
             self.assertIn("ok", result.content)
+
+    def test_command_timeout_terminates_the_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            executor = self.make_executor(Path(temp))
+            started = time.monotonic()
+            result = executor.execute(
+                "run_command",
+                {"command": "sh -c 'sleep 5'", "timeout_sec": 1},
+            )
+            elapsed = time.monotonic() - started
+
+            self.assertFalse(result.ok)
+            self.assertIn("命令超时（1s）", result.content)
+            self.assertLess(elapsed, 3)
 
     def test_environment_tool_queries_path_without_inventory_dump(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

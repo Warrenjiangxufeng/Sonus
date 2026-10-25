@@ -38,6 +38,14 @@ SEARCH_MAX_FILES = 20_000
 SEARCH_MAX_LINE_BYTES = 1024 * 1024
 
 
+def _command_output_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 def _semantic_command_failure(output: str) -> str:
     """Detect clear failures that a shell pipeline may mask with exit code 0."""
     checks = (
@@ -217,7 +225,9 @@ def tool_schemas() -> list[dict[str, Any]]:
         ),
         fn(
             "search_text",
-            "Search for literal text inside workspace files using ripgrep when available.",
+            "Preferred bounded literal-text search inside workspace files. Uses ripgrep with "
+            "sensitive/cache exclusions and a hard timeout when available; use this before "
+            "shell-level recursive grep or rg.",
             {
                 "query": {"type": "string"},
                 "path": {"type": "string", "default": "."},
@@ -337,7 +347,8 @@ def tool_schemas() -> list[dict[str, Any]]:
         fn(
             "run_command",
             "Run a shell command in the workspace and return exit code and combined output. "
-            "Routine read-only and local development commands are task-authorized.",
+            "Prefer search_text for file or text discovery; broad recursive grep/rg searches "
+            "must use bounded roots, explicit exclusions, and a short timeout.",
             {
                 "command": {"type": "string"},
                 "cwd": {"type": "string", "default": "."},
@@ -1024,41 +1035,42 @@ class ToolExecutor:
         timeout = min(1800, max(1, int(args.get("timeout_sec", 120))))
         try:
             shell = login_shell()
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 shell_invocation(shell, command),
                 cwd=cwd,
                 text=True,
-                capture_output=True,
-                timeout=timeout,
-                check=False,
-            )
-            output = (
-                f"exit_code={completed.returncode}\n"
-                f"--- stdout ---\n{completed.stdout}\n"
-                f"--- stderr ---\n{completed.stderr}"
-            )
-            semantic_failure = _semantic_command_failure(output)
-            if semantic_failure:
-                output += f"\n--- semantic_check ---\n{semantic_failure}"
-            content, artifact = self._truncate(output, prefix="command")
-            return ToolResult(
-                completed.returncode == 0 and not semantic_failure,
-                content,
-                artifact=artifact,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
             )
         except FileNotFoundError as error:
             return ToolResult(False, str(error))
+
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
         except subprocess.TimeoutExpired as error:
-            partial = ""
-            if error.stdout:
-                partial += str(error.stdout)
-            if error.stderr:
-                partial += str(error.stderr)
-            content, artifact = self._truncate(
-                f"命令超时（{timeout}s）\n{partial}",
-                prefix="timeout",
-            )
+            self._stop_process(process)
+            process.communicate()
+            partial = _command_output_text(error.stdout)
+            partial += _command_output_text(error.stderr)
+            output = f"命令超时（{timeout}s）\n{partial}"
+            content, artifact = self._truncate(output, prefix="timeout")
             return ToolResult(False, content, artifact=artifact)
+
+        output = (
+            f"exit_code={process.returncode}\n"
+            f"--- stdout ---\n{stdout}\n"
+            f"--- stderr ---\n{stderr}"
+        )
+        semantic_failure = _semantic_command_failure(output)
+        if semantic_failure:
+            output += f"\n--- semantic_check ---\n{semantic_failure}"
+        content, artifact = self._truncate(output, prefix="command")
+        return ToolResult(
+            process.returncode == 0 and not semantic_failure,
+            content,
+            artifact=artifact,
+        )
 
     def _fetch_url(self, args: dict[str, Any]) -> ToolResult:
         url = str(args["url"])

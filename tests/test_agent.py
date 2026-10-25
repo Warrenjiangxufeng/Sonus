@@ -1141,6 +1141,10 @@ class AgentTests(unittest.TestCase):
                 "本轮允许修改，因此已开放本地命令用于必要验证",
                 model.last_messages[0]["content"],
             )
+            self.assertIn(
+                "不要把 `grep -r`/`rg` 扫描用户主目录、`Documents` 等大目录作为首选",
+                model.last_messages[0]["content"],
+            )
             memory.close()
 
     def test_diagnostic_turn_injects_evidence_gated_reasoning(self) -> None:
