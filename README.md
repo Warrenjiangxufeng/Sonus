@@ -62,12 +62,10 @@ CLI / REPL / exec
           |
           +-- TaskGrant -------------------> Policy / PathGuard / 审批
           |
-          +-- ToolExecutor
-          |     +-- 文件工具
-          |     +-- 搜索工具
-          |     +-- 命令工具
-          |     +-- 网络工具
-          |     +-- 技能读取工具
+          +-- ToolRegistry
+          |     +-- ToolSpec：风险、只读、并行、超时、审批
+          |     +-- 文件 / 搜索 / 命令 / 网络 / 技能工具
+          |     +-- MCP stdio tools
           |
           +-- EventBus --------------------> 终端渲染 + JSONL 审计
           |
@@ -95,8 +93,11 @@ Sunus/
 │   ├── result.py             # 结构化终态 ResultEnvelope 与 Markdown 渲染
 │   ├── documents.py          # 结构化 Markdown 文档模板
 │   ├── model.py              # Provider 工厂、Chat Completions、Responses
+│   ├── model_events.py       # 结构化流式事件
 │   ├── policy.py             # TaskGrant、风险分级、路径守卫、审批菜单
-│   ├── tools.py              # 工具注册与执行器
+│   ├── tool_registry.py      # ToolSpec 与统一工具注册表
+│   ├── tools.py              # 内置工具与执行器
+│   ├── mcp.py                # stdio MCP 客户端与生命周期
 │   ├── events.py             # 事件写盘、渲染回调与脱敏
 │   ├── memory.py             # 证据化记忆、检索、信用与清理
 │   ├── proactive.py          # 主动陪伴调度与消息生成
@@ -119,9 +120,12 @@ Sunus/
 | `control.py` | 管理模型/工具/时间/Token 预算、空转检测、恢复提示与熔断。 |
 | `result.py` | 校验最终结果结构，并渲染为简洁 Markdown 回答。 |
 | `documents.py` | 为 README、设计、报告、变更和分析文档提供章节模板。 |
-| `model.py` | Provider 工厂；统一 Chat Completions / Responses 请求、重试和错误。 |
+| `model.py` | Provider 工厂；统一 Chat Completions / Responses 请求、流式与非流式回退、重试和错误。 |
+| `model_events.py` | 定义文本、推理、工具调用、usage 与完成事件。 |
 | `policy.py` | 区分 R0-R3 风险；管理工作区边界、命令规则和交互式授权。 |
+| `tool_registry.py` | 注册工具 schema、来源、风险、只读与并行能力、超时和审批模式。 |
 | `tools.py` | 执行文件、目录、搜索、命令、网络和技能工具；限制输出与搜索范围。 |
+| `mcp.py` | 启动 stdio MCP 服务器，完成初始化、工具发现、调用、超时和进程清理。 |
 | `events.py` | 同步写入 JSONL；将已脱敏事件交给终端渲染器或其他消费者。 |
 | `memory.py` | 保存偏好、情景和语义记忆；执行检索、使用记录、信用、蒸馏与显式删除。 |
 | `proactive.py` | 持久化主动消息排期；生成基于近期记忆的消息。 |
@@ -206,6 +210,12 @@ Sunus 的最终回答默认遵循：
 工具，回复目标为 1-2 句、约 80 个汉字，单次输出预算收紧到 512 tokens。
 若模型只生成内部推理、正文为空且 `finish_reason=length`，运行时会自动扩大
 到该 Profile 的完整回答预算并重试一次。
+
+规则无法明确判断的短消息会交给当前模型做一次轻量判定：只输出 `CASUAL` 或
+`TASK`。承接上一轮内容的追加要求优先判为 `TASK`，例如“加点卖萌的元素”；
+判定失败时默认按任务模式继续，避免把待生成正文截断在 512 tokens。明确的技术
+问题、授权动作和社交问候仍走规则快速路径，不额外调用模型。
+
 技术问答仍可按需使用只读工具；当前消息没有授权的写文件、shell 和联网工具
 不会出现在模型工具列表中，避免模型反复尝试必然被策略拒绝的动作。
 
@@ -311,6 +321,33 @@ Sunus
 16,000 字符；更大的结果自动转存 Artifact，并保留路径供后续按需读取。
 完整工具输出硬上限仍为 60,000 字符。
 
+工具由 `ToolRegistry` 统一注册。只读且无请求间依赖的工具可以在同一轮模型中
+有限并行执行，默认最多 4 个；结果仍按原始 `tool_calls` 顺序回填。写文件、
+命令、网络、MCP 工具和 `submit_result` 始终串行，`submit_result` 是终止屏障。
+
+stdio MCP 使用用户级 `~/.sunus/config.json` 配置。MCP 工具默认风险为 R2，
+默认要求审批，不继承任务的 R1 自动授权：
+
+```json
+{
+  "runtime": {
+    "streaming": true,
+    "max_parallel_tools": 4
+  },
+  "mcp_servers": {
+    "docs": {
+      "command": "npx",
+      "args": ["-y", "example-mcp-server"],
+      "enabled_tools": [],
+      "disabled_tools": [],
+      "tool_approval_modes": {"search": "ask"},
+      "startup_timeout_sec": 10,
+      "tool_timeout_sec": 60
+    }
+  }
+}
+```
+
 上下文统计直接复用本轮真实检索结果，不会为了计算再执行一次不同的查询。字符数是精确值；`estimated_tokens` 使用内置的 CJK/ASCII 启发式估算，并始终标记 `exact=false`。需要 Provider 精确 Token 时，应使用 API 返回的 usage，而不是把估算值当成账单或上下文窗口结论。
 
 ## 模型 Provider
@@ -323,6 +360,10 @@ Sunus 通过统一 Provider 接口选择模型服务：
 | `openai` | Chat Completions 或 Responses | 必须显式提供 OpenAI API 模型。 |
 | `minimax` | Chat Completions | 默认 `MiniMax-M3.1-Flash`，使用 `max_completion_tokens`。 |
 | `openai_compatible` | Chat Completions | 用于其他兼容服务，需要显式 base URL 和模型。 |
+
+Chat Completions 默认使用 SSE 流式事件，CLI 会按批次显示正文；Responses
+当前仍使用结构化响应并转换为同一事件接口。流式内容在进入终端前会经过
+DSML 标记延迟缓冲，协议异常的文本不会直接展示。
 
 选择 Provider：
 
@@ -551,6 +592,22 @@ export SUNUS_RG_PATH="/path/to/rg"
 
 用户配置可写在 `~/.sunus/config.json`：
 
+`persona.name` 和 `persona.prompt` 是可修改的人物设定。主对话和主动陪伴都会
+读取同一份配置；配置中的人物设定优先于旧的演化性格画像，但不会绕过安全原则、
+工具授权和事实准确性要求。
+
+`persona.style` 可设置 `sweetness`、`playfulness`、`warmth`、
+`independence`、`initiative`，取值 0-1。`context_intensity` 控制闲聊、
+任务和风险提示中的表现强度。当前用户消息中的明确修正优先于配置刻度；历史
+身份画像不会覆盖配置。`learn_from_self_share` 默认关闭，主动消息只作为表达
+记录，不自动成为性格证据。
+
+`persona.examples` 可提供少量语气样本，模型学习其语感而不照抄。主动消息会
+结合时段、空闲时间和可选的情境提示，在好奇、关心、分享、俏皮等表达意图中
+轮换；用户刚操作或空闲过久时自动延后。`proactive.min_idle_sec`、
+`max_idle_sec` 控制发言窗口，`typing_chars_per_second` 和 `bubble_seconds`
+供语音或宿主前端实现逐字呈现。
+
 ```json
 {
   "provider": "deepseek",
@@ -578,6 +635,29 @@ export SUNUS_RG_PATH="/path/to/rg"
   "max_steps": 60,
   "max_tokens": 16384,
   "request_timeout_sec": 120,
+  "runtime": {
+    "streaming": true,
+    "max_parallel_tools": 4
+  },
+  "mcp_servers": {},
+  "persona": {
+    "name": "",
+    "prompt": "",
+    "examples": [],
+    "style": {
+      "sweetness": 0.8,
+      "playfulness": 0.7,
+      "warmth": 0.8,
+      "independence": 0.7,
+      "initiative": 0.5
+    },
+    "context_intensity": {
+      "chat": 1.0,
+      "task": 0.65,
+      "risk": 0.3
+    },
+    "learn_from_self_share": false
+  },
   "proactive": {
     "enabled": true,
     "base_interval_sec": 300,
@@ -594,7 +674,11 @@ export SUNUS_RG_PATH="/path/to/rg"
     },
     "sunus_gender": "",
     "user_gender": "",
-    "custom_quirks": []
+    "custom_quirks": [],
+    "min_idle_sec": 8,
+    "max_idle_sec": 600,
+    "typing_chars_per_second": 28,
+    "bubble_seconds": 15
   }
 }
 ```
@@ -619,6 +703,11 @@ sunus doctor --network
 sunus proactive status|ratios|pause|resume|reset|trigger
 sunus memory recent|search|context-metrics|score|distill|add|forget
 ```
+
+`sunus doctor` 会在启动时实时扫描登录 shell 与进程 `PATH`，
+列出实际可执行命令、Python/pytest 候选及对应解释器，并核对权威数据目录、
+SQLite 主库、事件和会话文件。它不会依赖代码中写死的工具路径；安装或卸载
+命令后可用 `inspect_environment` 的 `refresh=true` 立即重新扫描。
 
 交互命令：
 
@@ -645,15 +734,19 @@ python3 -m unittest discover -s tests -v
 - Agent 工具循环、事件和 Receipt
 - 路径守卫、风险分级、授权菜单
 - 文件、搜索、命令和技能工具
+- ToolRegistry 能力元数据、只读并行与副作用串行屏障
+- SSE 文本增量、usage、分片 tool_call 与 DSML 延迟显示
+- stdio MCP 握手、工具过滤、审批、调用和进程清理
 - 记忆检索、上下文度量、去重、信用与删除
 - Token 感知压缩、工具配对修复、会话恢复与分叉
 - 语义错误识别、恢复提示和终态预算预留
 - 主动陪伴首触、指数退避和持久化
 - CLI 启动页与实时执行渲染
+- PATH 动态能力发现、pytest 解释器关联和诊断证据门控
 
 ## 已知边界
 
-- 当前模型调用为非流式请求；执行时间线实时显示模型轮次与工具过程，但模型文本仍是响应生成完成后呈现。
+- Chat Completions 支持 SSE 流式；Responses 仍以非流式响应转换为统一事件回退。
 - 当前支持 Chat Completions 与 Responses 两类协议；不直接支持 Anthropic、Gemini 的原生消息协议。
 - OpenAI 必须使用 API Key；ChatGPT 网页订阅、Cookie 和网页会话不能作为 Sunus 的 API 凭据。
 - 不提供操作系统级沙箱，不能安全执行来源不明的恶意代码。

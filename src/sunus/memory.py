@@ -26,6 +26,12 @@ PERSONA_SIGNAL_LABELS: dict[str, tuple[str, str]] = {
     "relationship_aware": ("尊重", "会用自然、尊重的方式称呼和交流"),
     "knowledgeable": ("博学", "愿意认真分享自己真正了解的知识"),
 }
+PERSONA_PINNED_TRAIT_KEYS = frozenset(
+    {
+        "sunus_name",
+        "gender_identity",
+    }
+)
 
 
 def utc_now() -> datetime:
@@ -417,9 +423,15 @@ class MemoryStore:
                   COALESCE(verified_at, created_at) DESC
                 LIMIT ?
                 """,
-                (scope, cutoff, limit),
+                (scope, cutoff, max(limit * 4, limit)),
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [
+            dict(row)
+            for row in rows
+            if self._looks_like_preference_statement(
+                str(row["content"] or "").removeprefix("用户偏好：")
+            )
+        ][:limit]
 
     def build_context(
         self,
@@ -627,27 +639,13 @@ class MemoryStore:
             rows = self._connection.execute(
                 """
                 SELECT * FROM memories
-                WHERE kind IN ('persona', 'self_share', 'preference')
+                WHERE kind IN ('persona', 'preference')
                   AND status IN ('supported', 'verified')
                 ORDER BY created_at
                 """
             ).fetchall()
         for row in rows:
             content = str(row["content"] or "")
-            if row["kind"] == "self_share":
-                topic = ""
-                try:
-                    metadata = json.loads(str(row["metadata"] or "{}"))
-                    if isinstance(metadata, dict):
-                        topic = str(metadata.get("topic") or "")
-                except (TypeError, json.JSONDecodeError):
-                    pass
-                self.learn_persona_from_self_share(
-                    content.replace("Sunus 主动分享：", "", 1).strip(),
-                    topic=topic,
-                    evidence_id=str(row["id"]),
-                )
-                continue
             if row["kind"] == "preference":
                 preference_text = content.replace("用户偏好：", "", 1).strip()
                 for statement in self._persona_traits(preference_text):
@@ -719,15 +717,36 @@ class MemoryStore:
     def distill_persona(self, *, max_stable: int = 6) -> dict[str, int]:
         limit = max(1, int(max_stable))
         with self._lock, self._connection:
+            self._connection.execute(
+                """
+                UPDATE persona_traits
+                SET status = 'stable', updated_at = ?
+                WHERE scope = 'global'
+                  AND status = 'candidate'
+                  AND explicit_count > 0
+                  AND trait_key IN ('sunus_name', 'gender_identity')
+                """,
+                (iso(),),
+            )
             rows = self._connection.execute(
                 """
-                SELECT id FROM persona_traits
+                SELECT id, trait_key FROM persona_traits
                 WHERE scope = 'global' AND status = 'stable'
                 ORDER BY confidence DESC, last_evidence_at DESC
                 """
             ).fetchall()
+            pinned = [
+                row
+                for row in rows
+                if str(row["trait_key"]) in PERSONA_PINNED_TRAIT_KEYS
+            ]
+            ordinary = [
+                row
+                for row in rows
+                if str(row["trait_key"]) not in PERSONA_PINNED_TRAIT_KEYS
+            ]
             demoted = 0
-            for row in rows[limit:]:
+            for row in ordinary[limit:]:
                 self._connection.execute(
                     """
                     UPDATE persona_traits
@@ -738,7 +757,8 @@ class MemoryStore:
                 )
                 demoted += 1
         return {
-            "stable": min(len(rows), limit),
+            "stable": len(pinned) + min(len(ordinary), limit),
+            "pinned": len(pinned),
             "demoted": demoted,
         }
 
@@ -782,6 +802,31 @@ class MemoryStore:
         self.distill_persona()
         return learned
 
+    def learn_explicit_persona(
+        self,
+        statement: str,
+        *,
+        evidence_id: str,
+    ) -> list[dict[str, Any]]:
+        clean = str(statement or "").strip()
+        if not clean:
+            return []
+        traits = self._persona_traits(clean) or [clean]
+        learned: list[dict[str, Any]] = []
+        for trait in traits:
+            trait_key, category = self._persona_trait_metadata(trait)
+            learned.append(
+                self._record_persona_evidence(
+                    trait_key=trait_key,
+                    statement=trait,
+                    category=category,
+                    evidence_id=evidence_id,
+                    explicit=True,
+                )
+            )
+        self.distill_persona()
+        return learned
+
     def search(
         self,
         query: str,
@@ -808,7 +853,7 @@ class MemoryStore:
                         ORDER BY rank, m.created_at DESC
                         LIMIT ?
                         """,
-                        (expression, scope, limit),
+                        (expression, scope, max(limit * 3, limit)),
                     ).fetchall()
             except sqlite3.OperationalError:
                 rows = []
@@ -825,9 +870,20 @@ class MemoryStore:
                     ORDER BY created_at DESC
                     LIMIT ?
                     """,
-                    (*values, scope, limit),
+                    (*values, scope, max(limit * 3, limit)),
                 ).fetchall()
-        return [dict(row) for row in rows]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            if (
+                item.get("kind") == "preference"
+                and not self._looks_like_preference_statement(
+                    str(item.get("content") or "").removeprefix("用户偏好：")
+                )
+            ):
+                continue
+            result.append(item)
+        return result[:limit]
 
     def record_use(self, memory_id: str, *, turn_id: str) -> None:
         now = iso()
@@ -910,23 +966,7 @@ class MemoryStore:
                 )
             )
 
-        preference_patterns = (
-            "我喜欢",
-            "我不喜欢",
-            "我偏好",
-            "我更喜欢",
-            "最近喜欢",
-            "最近偏好",
-            "以后",
-            "今后",
-            "请记住",
-            "不要",
-            "别",
-            "每次",
-            "总是",
-            "称呼我",
-        )
-        if any(pattern in user_input for pattern in preference_patterns):
+        if self._looks_like_preference_statement(user_input):
             persistent = self._is_persistent_preference(user_input)
             tags = ["preference", "communication"]
             if persistent:
@@ -981,6 +1021,104 @@ class MemoryStore:
             self.distill_persona()
         return created
 
+    def record_session_summary(
+        self,
+        *,
+        summary: str,
+        scope: str,
+        session_id: str,
+    ) -> str | None:
+        """会话收尾时落一条会话级摘要，避免进程退出后轨迹彻底消失。"""
+        text = _safe_text(summary, limit=3000)
+        if not text:
+            return None
+        return self.add(
+            content=f"会话摘要[{session_id}]：{text}",
+            scope=scope,
+            kind="episode",
+            status="supported",
+            tags=("conversation", "session_summary", "recent"),
+            source="session_close",
+            evidence_kind="session_summary",
+            metadata={"session_id": session_id},
+        )
+
+    @staticmethod
+    def _looks_like_preference_statement(user_input: str) -> bool:
+        text = str(user_input or "").strip()
+        if not text:
+            return False
+        explicit_patterns = (
+            "我喜欢",
+            "我不喜欢",
+            "我偏好",
+            "我更喜欢",
+            "最近喜欢",
+            "最近偏好",
+            "喜欢",
+            "以后",
+            "今后",
+            "长期",
+            "请记住",
+            "每次",
+            "总是",
+            "称呼我",
+            "先给结论",
+            "结论先行",
+            "默认中文",
+            "收藏",
+            "爱好",
+            "癖好",
+            "习惯",
+            "设定你的",
+        )
+        communication_markers = (
+            "回答",
+            "说话",
+            "语气",
+            "称呼",
+            "表达",
+            "沟通",
+            "简洁",
+            "啰嗦",
+            "温柔",
+            "甜",
+            "卖萌",
+            "撒娇",
+            "主动",
+            "黏人",
+            "有主见",
+            "独立",
+        )
+        question = bool(
+            re.search(r"(?:多少|怎么|如何|为什么|为何|是否|能否|什么|哪)"
+                      r".*[？?]?\s*$", text)
+            or re.search(r"[？?]\s*$", text)
+            or text.endswith(("吗", "么"))
+        )
+        if question and not any(
+            marker in text
+            for marker in ("以后", "今后", "请记住", "设定你的", "称呼我")
+        ):
+            return False
+        if any(marker in text for marker in explicit_patterns):
+            return True
+        if any(marker in text for marker in communication_markers):
+            return any(
+                marker in text
+                for marker in (
+                    "别",
+                    "不要",
+                    "希望",
+                    "喜欢",
+                    "一点",
+                    "更",
+                    "少",
+                    "多",
+                )
+            )
+        return False
+
     @staticmethod
     def _is_persistent_preference(user_input: str) -> bool:
         stable_markers = (
@@ -997,6 +1135,12 @@ class MemoryStore:
             "不要主动扩展",
             "只执行明确",
             "默认中文",
+            "更甜",
+            "别太甜",
+            "卖萌",
+            "撒娇",
+            "更有主见",
+            "别太主动",
             "癖好",
             "爱好",
             "收藏",
@@ -1049,6 +1193,38 @@ class MemoryStore:
         match = re.search(r"称呼我(?:为|叫)?([^\s，。,.！!？?]{1,12})", user_input)
         if match:
             traits.append(f"称呼用户为“{match.group(1)}”")
+        style_rules = (
+            (
+                "甜度",
+                ("更甜", "再甜一点", "甜一点", "甜度调高", "提高甜度", "多甜"),
+                ("别太甜", "不要太甜", "甜度调低", "降低甜度", "少甜"),
+            ),
+            (
+                "卖萌度",
+                ("多卖萌", "卖萌一点", "可爱一点", "多撒娇", "撒娇一点"),
+                ("别卖萌", "不要卖萌", "少卖萌", "别撒娇", "不要撒娇"),
+            ),
+            (
+                "温暖度",
+                ("更温柔", "温柔一点", "更暖", "暖心一点"),
+                ("别太温柔", "冷淡一点"),
+            ),
+            (
+                "独立性",
+                ("更有主见", "独立一点", "别太顺着"),
+                (),
+            ),
+            (
+                "主动性",
+                ("主动一点", "多找我", "黏人一点", "小黏人"),
+                ("别太主动", "别黏", "少找我"),
+            ),
+        )
+        for label, stronger, softer in style_rules:
+            if any(marker in user_input for marker in softer):
+                traits.append(f"Sunus 明确降低{label}表达")
+            elif any(marker in user_input for marker in stronger):
+                traits.append(f"Sunus 明确提高{label}表达")
         self_setting = any(
             marker in user_input
             for marker in (
@@ -1105,6 +1281,11 @@ class MemoryStore:
             ("性格可爱", ("playful", "identity:temperament")),
             ("体贴", ("attentive", "identity:care")),
             ("分享知识", ("knowledgeable", "identity:knowledge")),
+            ("甜度", ("style_sweetness", "style:sweetness")),
+            ("卖萌度", ("style_playfulness", "style:playfulness")),
+            ("温暖度", ("style_warmth", "style:warmth")),
+            ("独立性", ("style_independence", "style:independence")),
+            ("主动性", ("style_initiative", "style:initiative")),
         )
         for marker, metadata in mapping:
             if marker in statement:

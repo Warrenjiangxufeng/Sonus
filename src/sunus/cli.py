@@ -29,11 +29,13 @@ from sunus.config import (
     resolve_config,
     save_user_config,
 )
+from sunus.environment import discover_environment
 from sunus.events import EventBus
 from sunus.memory import MemoryStore
 from sunus.model import ModelClient, ModelError, create_model_client
 from sunus.policy import ApprovalManager, PathGuard
 from sunus.proactive import (
+    PresenceContext,
     ProactiveScheduler,
     ProactiveService,
     format_interval_demo,
@@ -48,7 +50,7 @@ from sunus.storage import (
     load_session,
     resolve_session_path,
 )
-from sunus.tools import ToolExecutor, find_ripgrep, tool_schemas
+from sunus.tools import ToolExecutor, find_ripgrep
 
 
 RESET = "\033[0m"
@@ -130,6 +132,8 @@ class RuntimeEventRenderer:
         self._line_active = False
         self._analysis_count = 0
         self._tool_counts: dict[str, int] = {}
+        self.streamed_text = ""
+        self._turn_active = False
 
     def _status(self, text: str, code: str = "") -> None:
         if not self.is_tty:
@@ -165,8 +169,22 @@ class RuntimeEventRenderer:
         if event_type.startswith("task_grant") or event_type.startswith("proactive_"):
             return
         if event_type == "model_request":
+            if not self._turn_active:
+                self.streamed_text = ""
+                self._turn_active = True
             self._analysis_count += 1
             self._status("  ◇ 思考中…（Tab/Esc 打断）", DIM)
+            return
+        if event_type == "assistant_delta":
+            text = str(event.get("text") or "")
+            if not text:
+                return
+            if self.is_tty and self._line_active:
+                sys.stdout.write("\r\x1b[2K")
+            sys.stdout.write(color(text, "", self.color_enabled))
+            sys.stdout.flush()
+            self._line_active = False
+            self.streamed_text += text
             return
         if event_type == "assistant_progress":
             summary = str(event.get("summary") or "").strip()
@@ -211,6 +229,8 @@ class RuntimeEventRenderer:
             )
             return
         if event_type == "turn_end":
+            if self.streamed_text:
+                print()
             reason = str(event.get("reason") or "completed")
             if reason == "completed":
                 self._finish(self._summary(), GREEN)
@@ -234,6 +254,7 @@ class RuntimeEventRenderer:
                 )
             self._analysis_count = 0
             self._tool_counts.clear()
+            self._turn_active = False
             return
         if event_type.endswith("_error"):
             summary = str(event.get("summary") or event_type)
@@ -348,7 +369,21 @@ class Components:
         try:
             self.scheduler.close()
         finally:
-            self.memory.close()
+            try:
+                self.tools.close()
+            finally:
+                self.finalize_session_memory()
+                self.memory.close()
+
+    def finalize_session_memory(self) -> None:
+        """退出前把会话摘要落进记忆库，失败不阻断关闭流程。"""
+        agent = self.agent
+        if agent is None:
+            return
+        try:
+            agent.finalize_session_memory()
+        except Exception:
+            pass
 
 
 def build_components(
@@ -385,6 +420,8 @@ def build_components(
         events=events,
         secret=config.api_key,
         memory=memory,
+        mcp_servers=config.mcp_servers,
+        max_parallel_tools=config.max_parallel_tools,
     )
     session = SessionLogger(
         session_name,
@@ -417,6 +454,7 @@ def build_components(
             memory=memory,
             scope=str(config.workspace),
             config=config.proactive,
+            persona=config.persona,
         )
         agent = Agent(
             config=config,
@@ -487,11 +525,22 @@ def due_message(components: Components) -> None:
     status = components.scheduler.status()
     if status.paused or components.scheduler.seconds_until_due() > 0:
         return
+    allowed, idle_seconds = components.scheduler.presence_gate()
+    if not allowed:
+        delay = components.scheduler.defer(30)
+        components.events.emit(
+            "proactive_presence_deferred",
+            delay_sec=delay,
+            idle_seconds=idle_seconds,
+            summary="主动发言时机不合适，已延后",
+        )
+        return
     tty = sys.stdout.isatty()
     try:
         text, meta = components.proactive.generate(
             components.scheduler.recent_message_texts(5),
             sequence_index=components.scheduler.current_topic_index(),
+            presence=PresenceContext(idle_seconds=idle_seconds),
         )
         message_id = components.scheduler.record_message(text)
         memory_id = _remember_proactive_delivery(
@@ -509,6 +558,7 @@ def due_message(components: Components) -> None:
             delay_sec=delay,
             topic=meta.get("topic"),
             topic_weight=meta.get("topic_weight"),
+            generation_mode=meta.get("generation_mode"),
             summary=f"主动消息已送达 · {meta.get('topic_label', '主动陪伴')}",
         )
         print("\n" + color("Sunus 主动消息", GREEN, tty) + "\n" + text + "\n")
@@ -870,7 +920,7 @@ def handle_slash(command: str, components: Components) -> bool:
         print(
             "\n".join(
                 f"{item['function']['name']}: {item['function']['description']}"
-                for item in tool_schemas()
+                for item in components.tools.schemas()
             )
         )
     elif name == "/approve":
@@ -949,9 +999,19 @@ def handle_slash(command: str, components: Components) -> bool:
             if components.proactive is None:
                 print("模型未初始化。")
             else:
-                text, meta = components.proactive.generate(
-                    sequence_index=components.scheduler.current_topic_index(),
-                )
+                try:
+                    text, meta = components.proactive.generate(
+                        sequence_index=components.scheduler.current_topic_index(),
+                    )
+                except Exception as error:
+                    components.scheduler.mark_failed()
+                    components.events.emit(
+                        "proactive_message_failed",
+                        trigger="slash_trigger",
+                        summary=f"主动消息生成失败，本次未发送: {error}",
+                    )
+                    print("主动消息生成失败，本次未发送。")
+                    return True
                 message_id = components.scheduler.record_message(text)
                 memory_id = _remember_proactive_delivery(
                     components,
@@ -1070,6 +1130,26 @@ def run_turn_with_interrupt(
     return result
 
 
+def residual_text(result_text: str, streamed_text: str) -> str:
+    """返回仍需补打到终端的正文片段，避免同一段话显示两遍。
+
+    流式阶段已经把 streamed_text 逐字写到终端了，终态文本只补差量：
+    - 终态文本以流式文本开头：只补尾部（render_result 追加 details/risks 的情形）
+    - 终态文本已被流式文本包含（含完全相等）：不补
+    - 其余情况（终态文本确实是新内容）：整段补打
+
+    只做前缀与子串判断，不做相似度估算：措辞被改写过时判不准，
+    而误判的代价（吞掉真实结论）比多打一遍更高。
+    """
+    if not streamed_text:
+        return result_text
+    if result_text.startswith(streamed_text):
+        return result_text[len(streamed_text) :]
+    if result_text and result_text in streamed_text:
+        return ""
+    return result_text
+
+
 def run_repl(
     config: RuntimeConfig,
     *,
@@ -1152,7 +1232,13 @@ def run_repl(
             except KeyboardInterrupt:
                 print("\n操作已中断。")
                 continue
-            print(result.text)
+            if renderer is not None and renderer.streamed_text:
+                remainder = residual_text(result.text, renderer.streamed_text)
+                if remainder:
+                    print(remainder)
+                renderer.streamed_text = ""
+            else:
+                print(result.text)
             if result.reason not in {"completed"}:
                 print(
                     color(
@@ -1309,9 +1395,19 @@ def proactive_command(
         elif action == "trigger":
             if components.proactive is None:
                 raise ModelError("模型未初始化")
-            text, meta = components.proactive.generate(
-                sequence_index=components.scheduler.current_topic_index(),
-            )
+            try:
+                text, meta = components.proactive.generate(
+                    sequence_index=components.scheduler.current_topic_index(),
+                )
+            except Exception as error:
+                components.scheduler.mark_failed()
+                components.events.emit(
+                    "proactive_message_failed",
+                    trigger="cli_trigger",
+                    summary=f"主动消息生成失败，本次未发送: {error}",
+                )
+                print(f"主动消息生成失败，本次未发送：{error}", file=sys.stderr)
+                return 1
             message_id = components.scheduler.record_message(text)
             memory_id = _remember_proactive_delivery(
                 components,
@@ -1347,6 +1443,11 @@ def memory_command(config: RuntimeConfig, args: argparse.Namespace) -> int:
                 source="cli",
                 evidence_kind="user_statement",
             )
+            if args.kind == "persona":
+                memory.learn_explicit_persona(
+                    args.content,
+                    evidence_id=memory_id,
+                )
             print(memory_id)
             return 0
         elif args.memory_action == "credit":
@@ -1403,6 +1504,13 @@ def memory_command(config: RuntimeConfig, args: argparse.Namespace) -> int:
         memory.close()
 
 
+def _latest_file(directory: Path, pattern: str) -> Path | None:
+    if not directory.is_dir():
+        return None
+    files = [path for path in directory.glob(pattern) if path.is_file()]
+    return max(files, key=lambda path: path.stat().st_mtime, default=None)
+
+
 def doctor(config: RuntimeConfig, *, network: bool) -> int:
     checks: list[dict[str, Any]] = []
     checks.append({"name": "python", "ok": sys.version_info >= (3, 10), "value": sys.version.split()[0]})
@@ -1411,6 +1519,107 @@ def doctor(config: RuntimeConfig, *, network: bool) -> int:
             "name": "workspace",
             "ok": config.workspace.is_dir(),
             "value": str(config.workspace),
+        }
+    )
+    checks.append(
+        {
+            "name": "data_dir",
+            "ok": config.data_dir.is_dir(),
+            "value": str(config.data_dir),
+        }
+    )
+    memory_path = config.data_dir / "memory.db"
+    memory_status = "missing"
+    memory_ok = False
+    if memory_path.is_file():
+        try:
+            connection = sqlite3.connect(
+                f"file:{memory_path.as_posix()}?mode=ro",
+                uri=True,
+            )
+            try:
+                row = connection.execute("PRAGMA quick_check").fetchone()
+                memory_status = str(row[0] if row else "unknown")
+            finally:
+                connection.close()
+            memory_ok = memory_status == "ok"
+        except sqlite3.Error as error:
+            memory_status = str(error)
+    checks.append(
+        {
+            "name": "memory_db",
+            "ok": memory_ok,
+            "value": f"{memory_path}: {memory_status}",
+        }
+    )
+    latest_event = _latest_file(config.data_dir / "events", "*.jsonl")
+    checks.append(
+        {
+            "name": "latest_event",
+            "ok": latest_event is not None,
+            "value": str(latest_event or "missing"),
+        }
+    )
+    latest_session = _latest_file(config.data_dir / "sessions", "s_*.jsonl")
+    checks.append(
+        {
+            "name": "latest_session",
+            "ok": latest_session is not None,
+            "value": str(latest_session or "missing"),
+        }
+    )
+    legacy_dir = Path.home() / ".sonus"
+    checks.append(
+        {
+            "name": "legacy_sonus",
+            "ok": True,
+            "value": (
+                f"{legacy_dir} (deprecated compatibility data; not canonical)"
+                if legacy_dir.exists()
+                else "absent"
+            ),
+        }
+    )
+    environment = discover_environment()
+    path_report = environment["path"]
+    checks.append(
+        {
+            "name": "path_inventory",
+            "ok": path_report["command_count"] > 0,
+            "value": (
+                f"{path_report['command_count']} commands across "
+                f"{len(path_report['path_roots'])} PATH roots"
+            ),
+        }
+    )
+    for category in (
+        "shell",
+        "python",
+        "test_runner",
+        "node",
+        "node_package_manager",
+        "vcs",
+        "search",
+        "database",
+        "http",
+    ):
+        entries = environment["categories"].get(category, [])
+        checks.append(
+            {
+                "name": f"available:{category}",
+                "ok": bool(entries),
+                "value": ", ".join(
+                    f"{item.get('command', '')}"
+                    for item in entries
+                )
+                or "not found on PATH",
+            }
+        )
+    checks.append(
+        {
+            "name": "test_command",
+            "ok": bool(environment["recommended_test_command"]),
+            "value": environment["recommended_test_command"] or "not found",
         }
     )
     checks.append({"name": "api_key", "ok": bool(config.api_key), "value": "loaded" if config.api_key else "missing"})
@@ -1422,7 +1631,6 @@ def doctor(config: RuntimeConfig, *, network: bool) -> int:
             "value": "loaded" if rg_path else "missing (bounded Python fallback available)",
         }
     )
-    checks.append({"name": "zsh", "ok": Path("/bin/zsh").exists(), "value": "/bin/zsh"})
     checks.append(
         {
             "name": "token_metrics",

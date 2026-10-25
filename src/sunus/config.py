@@ -22,6 +22,18 @@ PROACTIVE_TOPIC_WEIGHTS: tuple[tuple[str, int], ...] = (
     ("user_custom", 20),
 )
 MODEL_API_MODES = {"chat_completions", "responses"}
+PERSONA_STYLE_LABELS: dict[str, str] = {
+    "sweetness": "甜度",
+    "playfulness": "卖萌度",
+    "warmth": "温暖度",
+    "independence": "独立性",
+    "initiative": "主动性",
+}
+PERSONA_CONTEXT_LABELS: dict[str, str] = {
+    "chat": "闲聊",
+    "task": "任务",
+    "risk": "风险提示",
+}
 LOOP_BUDGET_PROFILES: dict[str, dict[str, int]] = {
     "quick": {
         "max_model_calls": 8,
@@ -146,6 +158,39 @@ class ProactiveConfig:
     user_gender: str = ""
     custom_quirks: tuple[str, ...] = ()
     custom_topics: tuple[str, ...] = ()
+    min_idle_sec: int = 8
+    max_idle_sec: int = 600
+    typing_chars_per_second: int = 28
+    bubble_seconds: int = 15
+
+
+@dataclass(frozen=True)
+class PersonaConfig:
+    name: str = ""
+    prompt: str = ""
+    examples: tuple[str, ...] = ()
+    style: tuple[tuple[str, float], ...] = ()
+    context_intensity: tuple[tuple[str, float], ...] = (
+        ("chat", 1.0),
+        ("task", 0.65),
+        ("risk", 0.3),
+    )
+    learn_from_self_share: bool = False
+
+
+@dataclass(frozen=True)
+class MCPServerConfig:
+    name: str
+    command: str
+    args: tuple[str, ...] = ()
+    cwd: str = ""
+    env: tuple[tuple[str, str], ...] = ()
+    enabled: bool = True
+    enabled_tools: tuple[str, ...] = ()
+    disabled_tools: tuple[str, ...] = ()
+    approval_modes: tuple[tuple[str, str], ...] = ()
+    startup_timeout_sec: int = 10
+    tool_timeout_sec: int = 60
 
 
 @dataclass(frozen=True)
@@ -163,6 +208,10 @@ class RuntimeConfig:
     model_settings: ModelSettings = field(default_factory=ModelSettings)
     loop_budget: LoopBudgetConfig = field(default_factory=LoopBudgetConfig)
     proactive: ProactiveConfig = field(default_factory=ProactiveConfig)
+    persona: PersonaConfig = field(default_factory=PersonaConfig)
+    mcp_servers: tuple[MCPServerConfig, ...] = ()
+    max_parallel_tools: int = 4
+    streaming: bool = True
 
     @property
     def has_api_key(self) -> bool:
@@ -173,6 +222,23 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
     "max_tokens": 16_384,
     "request_timeout_sec": 120,
     "budget": {"profile": "standard"},
+    "runtime": {
+        "max_parallel_tools": 4,
+        "streaming": True,
+    },
+    "mcp_servers": {},
+    "persona": {
+        "name": "",
+        "prompt": "",
+        "examples": [],
+        "style": {},
+        "context_intensity": {
+            "chat": 1.0,
+            "task": 0.65,
+            "risk": 0.3,
+        },
+        "learn_from_self_share": False,
+    },
     "proactive": {
         "enabled": True,
         "base_interval_sec": DEFAULT_PROACTIVE_BASE_INTERVAL_SEC,
@@ -185,6 +251,10 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
         "user_gender": "",
         "custom_quirks": [],
         "custom_topics": [],
+        "min_idle_sec": 8,
+        "max_idle_sec": 600,
+        "typing_chars_per_second": 28,
+        "bubble_seconds": 15,
     },
 }
 
@@ -494,7 +564,162 @@ def resolve_config(
         ).strip(),
         custom_quirks=custom_topics,
         custom_topics=custom_topics,
+        min_idle_sec=max(0, int(proactive_payload.get("min_idle_sec", 8))),
+        max_idle_sec=max(
+            max(0, int(proactive_payload.get("min_idle_sec", 8))),
+            int(proactive_payload.get("max_idle_sec", 600)),
+        ),
+        typing_chars_per_second=max(
+            1,
+            int(proactive_payload.get("typing_chars_per_second", 28)),
+        ),
+        bubble_seconds=max(1, int(proactive_payload.get("bubble_seconds", 15))),
     )
+    persona_payload = user.get("persona", {})
+    if not isinstance(persona_payload, dict):
+        raise ConfigError("persona 必须是 JSON object")
+    raw_style = persona_payload.get("style", {})
+    if not isinstance(raw_style, dict):
+        raise ConfigError("persona.style 必须是 JSON object")
+    unknown_style = sorted(set(raw_style) - set(PERSONA_STYLE_LABELS))
+    if unknown_style:
+        raise ConfigError(
+            "未知人物表达参数: " + ", ".join(unknown_style)
+        )
+    style_values: list[tuple[str, float]] = []
+    for key in PERSONA_STYLE_LABELS:
+        if key not in raw_style:
+            continue
+        try:
+            value = float(raw_style[key])
+        except (TypeError, ValueError) as error:
+            raise ConfigError(f"persona.style.{key} 必须是数字") from error
+        if not 0 <= value <= 1:
+            raise ConfigError(f"persona.style.{key} 必须在 0 到 1 之间")
+        style_values.append((key, value))
+    raw_context = persona_payload.get(
+        "context_intensity",
+        {"chat": 1.0, "task": 0.65, "risk": 0.3},
+    )
+    if not isinstance(raw_context, dict):
+        raise ConfigError("persona.context_intensity 必须是 JSON object")
+    unknown_context = sorted(
+        set(raw_context) - set(PERSONA_CONTEXT_LABELS)
+    )
+    if unknown_context:
+        raise ConfigError(
+            "未知人物场景强度: " + ", ".join(unknown_context)
+        )
+    default_context_intensity = {
+        "chat": 1.0,
+        "task": 0.65,
+        "risk": 0.3,
+    }
+    context_intensity: list[tuple[str, float]] = []
+    for key in PERSONA_CONTEXT_LABELS:
+        raw_value = raw_context.get(
+            key,
+            default_context_intensity[key],
+        )
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as error:
+            raise ConfigError(
+                f"persona.context_intensity.{key} 必须是数字"
+            ) from error
+        if not 0 <= value <= 1:
+            raise ConfigError(
+                f"persona.context_intensity.{key} 必须在 0 到 1 之间"
+            )
+        context_intensity.append((key, value))
+    raw_learn_from_self_share = persona_payload.get(
+        "learn_from_self_share",
+        False,
+    )
+    if not isinstance(raw_learn_from_self_share, bool):
+        raise ConfigError("persona.learn_from_self_share 必须是布尔值")
+    raw_examples = persona_payload.get("examples", [])
+    if not isinstance(raw_examples, list):
+        raise ConfigError("persona.examples 必须是字符串数组")
+    persona_examples = tuple(
+        str(item).strip()[:240]
+        for item in raw_examples
+        if str(item).strip()
+    )[:20]
+    persona = PersonaConfig(
+        name=(
+            os.environ.get("SUNUS_PERSONA_NAME")
+            or str(persona_payload.get("name") or "")
+        ).strip()[:40],
+        prompt=str(persona_payload.get("prompt") or "").strip()[:16_000],
+        examples=persona_examples,
+        style=tuple(style_values),
+        context_intensity=tuple(context_intensity),
+        learn_from_self_share=raw_learn_from_self_share,
+    )
+    runtime_payload = user.get("runtime", {})
+    if not isinstance(runtime_payload, dict):
+        raise ConfigError("runtime 必须是 JSON object")
+    raw_mcp_servers = user.get("mcp_servers", {})
+    if not isinstance(raw_mcp_servers, dict):
+        raise ConfigError("mcp_servers 必须是 JSON object")
+    mcp_servers: list[MCPServerConfig] = []
+    for server_name, raw_server in raw_mcp_servers.items():
+        if not isinstance(raw_server, dict):
+            raise ConfigError(f"mcp_servers.{server_name} 必须是 JSON object")
+        command = str(raw_server.get("command") or "").strip()
+        if not command:
+            raise ConfigError(f"mcp_servers.{server_name}.command 不能为空")
+        raw_args = raw_server.get("args", [])
+        if not isinstance(raw_args, list):
+            raise ConfigError(f"mcp_servers.{server_name}.args 必须是数组")
+        raw_env = raw_server.get("env", {})
+        if not isinstance(raw_env, dict):
+            raise ConfigError(f"mcp_servers.{server_name}.env 必须是 JSON object")
+        raw_tool_approvals = raw_server.get("tool_approval_modes", {})
+        if not isinstance(raw_tool_approvals, dict):
+            raise ConfigError(
+                f"mcp_servers.{server_name}.tool_approval_modes 必须是 JSON object"
+            )
+        approval_modes: list[tuple[str, str]] = []
+        for tool_name, mode in raw_tool_approvals.items():
+            normalized_mode = str(mode).strip().lower()
+            if normalized_mode not in {"ask", "approve", "deny"}:
+                raise ConfigError(
+                    f"mcp_servers.{server_name}.tool_approval_modes."
+                    f"{tool_name} 必须是 ask/approve/deny"
+                )
+            approval_modes.append((str(tool_name), normalized_mode))
+        mcp_servers.append(
+            MCPServerConfig(
+                name=str(server_name),
+                command=command,
+                args=tuple(str(item) for item in raw_args),
+                cwd=str(raw_server.get("cwd") or ""),
+                env=tuple(
+                    (str(key), str(value))
+                    for key, value in raw_env.items()
+                ),
+                enabled=bool(raw_server.get("enabled", True)),
+                enabled_tools=tuple(
+                    str(item)
+                    for item in raw_server.get("enabled_tools", [])
+                ),
+                disabled_tools=tuple(
+                    str(item)
+                    for item in raw_server.get("disabled_tools", [])
+                ),
+                approval_modes=tuple(approval_modes),
+                startup_timeout_sec=max(
+                    1,
+                    int(raw_server.get("startup_timeout_sec", 10)),
+                ),
+                tool_timeout_sec=max(
+                    1,
+                    int(raw_server.get("tool_timeout_sec", 60)),
+                ),
+            )
+        )
     budget_payload = user.get("budget", {})
     if not isinstance(budget_payload, dict):
         raise ConfigError("budget 必须是 JSON object")
@@ -601,6 +826,13 @@ def resolve_config(
         model_settings=model_settings,
         loop_budget=loop_budget,
         proactive=proactive,
+        persona=persona,
+        mcp_servers=tuple(mcp_servers),
+        max_parallel_tools=max(
+            1,
+            min(16, int(runtime_payload.get("max_parallel_tools", 4))),
+        ),
+        streaming=bool(runtime_payload.get("streaming", True)),
     )
 
 
@@ -681,6 +913,30 @@ def config_summary(config: RuntimeConfig) -> dict[str, Any]:
         "api_key_loaded": config.has_api_key,
         "max_steps": config.max_steps,
         "max_tokens": config.max_tokens,
+        "runtime": {
+            "streaming": config.streaming,
+            "max_parallel_tools": config.max_parallel_tools,
+        },
+        "mcp_servers": [
+            {
+                "name": server.name,
+                "command": redact_text(server.command, config.api_key),
+                "enabled": server.enabled,
+                "enabled_tools": list(server.enabled_tools),
+                "disabled_tools": list(server.disabled_tools),
+                "startup_timeout_sec": server.startup_timeout_sec,
+                "tool_timeout_sec": server.tool_timeout_sec,
+            }
+            for server in config.mcp_servers
+        ],
+        "persona": {
+            "name": config.persona.name,
+            "configured": bool(config.persona.prompt),
+            "example_count": len(config.persona.examples),
+            "style": dict(config.persona.style),
+            "context_intensity": dict(config.persona.context_intensity),
+            "learn_from_self_share": config.persona.learn_from_self_share,
+        },
         "budget": {
             "profile": config.loop_budget.profile,
             "max_model_calls": config.loop_budget.max_model_calls,
@@ -707,6 +963,12 @@ def config_summary(config: RuntimeConfig) -> dict[str, Any]:
                 config.proactive.custom_quirks or config.proactive.custom_topics
             ),
             "custom_topics": list(config.proactive.custom_topics),
+            "min_idle_sec": config.proactive.min_idle_sec,
+            "max_idle_sec": config.proactive.max_idle_sec,
+            "typing_chars_per_second": (
+                config.proactive.typing_chars_per_second
+            ),
+            "bubble_seconds": config.proactive.bubble_seconds,
         },
     }
 

@@ -19,6 +19,54 @@ from sunus.config import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_reads_mcp_and_runtime_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / "data"
+            data.mkdir()
+            (data / "config.json").write_text(
+                json.dumps(
+                    {
+                        "runtime": {
+                            "max_parallel_tools": 3,
+                            "streaming": False,
+                        },
+                        "mcp_servers": {
+                            "docs": {
+                                "command": "python3",
+                                "args": ["server.py"],
+                                "cwd": "/tmp/docs",
+                                "env": {"DOCS_TOKEN": "test"},
+                                "enabled_tools": ["search"],
+                                "disabled_tools": ["delete"],
+                                "tool_approval_modes": {"search": "ask"},
+                                "startup_timeout_sec": 7,
+                                "tool_timeout_sec": 11,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = {
+                "SUNUS_DATA_DIR": str(data),
+                "SUNUS_API_KEY": "sk-test-env",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                config = resolve_config(root / "workspace")
+            self.assertEqual(config.max_parallel_tools, 3)
+            self.assertFalse(config.streaming)
+            self.assertEqual(len(config.mcp_servers), 1)
+            server = config.mcp_servers[0]
+            self.assertEqual(server.name, "docs")
+            self.assertEqual(server.args, ("server.py",))
+            self.assertEqual(dict(server.env)["DOCS_TOKEN"], "test")
+            self.assertEqual(server.enabled_tools, ("search",))
+            self.assertEqual(server.disabled_tools, ("delete",))
+            self.assertEqual(dict(server.approval_modes), {"search": "ask"})
+            self.assertEqual(server.startup_timeout_sec, 7)
+            self.assertEqual(server.tool_timeout_sec, 11)
+
     def test_reads_sunus_deepseek_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.toml"
@@ -70,6 +118,10 @@ experimental_bearer_token ="sk-test-secret-value"
             self.assertEqual(config.proactive.sunus_gender, "")
             self.assertEqual(config.proactive.custom_topics, ())
             self.assertEqual(config.proactive.custom_quirks, ())
+            self.assertEqual(config.proactive.min_idle_sec, 8)
+            self.assertEqual(config.proactive.max_idle_sec, 600)
+            self.assertEqual(config.proactive.typing_chars_per_second, 28)
+            self.assertEqual(config.proactive.bubble_seconds, 15)
             self.assertEqual(config.loop_budget.profile, "standard")
             self.assertEqual(config.loop_budget.max_model_calls, 60)
             self.assertEqual(config.loop_budget.max_response_tokens, 8192)
@@ -87,6 +139,56 @@ experimental_bearer_token ="sk-test-secret-value"
         self.assertNotIn("abcdefghijklmnop", redacted)
         self.assertNotIn("very-secret", redacted)
         self.assertNotIn("123456789", redacted)
+
+    def test_reads_modifiable_persona_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / "data"
+            data.mkdir()
+            (data / "config.json").write_text(
+                json.dumps(
+                    {
+                        "persona": {
+                            "name": "苏诺",
+                            "prompt": "你是苏诺，语气甜美软萌，但不影响专业判断。",
+                            "examples": ["慢慢来嘛，不催你。"],
+                            "style": {
+                                "sweetness": 0.9,
+                                "playfulness": 0.8,
+                            },
+                            "context_intensity": {
+                                "chat": 1,
+                                "task": 0.6,
+                            },
+                            "learn_from_self_share": False,
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "SUNUS_DATA_DIR": str(data),
+                    "SUNUS_API_KEY": "sk-test",
+                },
+                clear=True,
+            ):
+                config = resolve_config(root / "workspace")
+
+            self.assertEqual(config.persona.name, "苏诺")
+            self.assertIn("甜美软萌", config.persona.prompt)
+            self.assertEqual(config.persona.examples, ("慢慢来嘛，不催你。",))
+            self.assertEqual(
+                dict(config.persona.style),
+                {"sweetness": 0.9, "playfulness": 0.8},
+            )
+            context_intensity = dict(config.persona.context_intensity)
+            self.assertEqual(context_intensity["chat"], 1.0)
+            self.assertEqual(context_intensity["task"], 0.6)
+            self.assertEqual(context_intensity["risk"], 0.3)
+            self.assertFalse(config.persona.learn_from_self_share)
 
     def test_redaction_preserves_numeric_token_metrics(self) -> None:
         value = redact_value(

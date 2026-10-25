@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 import sqlite3
 import uuid
@@ -12,6 +13,7 @@ from typing import Any, Callable
 
 from sunus.config import (
     PROACTIVE_TOPIC_WEIGHTS,
+    PersonaConfig,
     ProactiveConfig,
     redact_text,
 )
@@ -20,6 +22,14 @@ from sunus.model import ModelClient, ModelError
 
 
 Clock = Callable[[], datetime]
+
+REACTION_INTENTS: dict[str, tuple[str, str]] = {
+    "curious": ("好奇", "轻轻好奇一下，可以问一句，但不要要求对方立刻回答。"),
+    "care": ("关心", "先接住当下的感受或状态，给一句柔软、具体的关心。"),
+    "share": ("分享", "说一点自己的小感受、小愿望或刚刚想到的事，不要编造经历。"),
+    "playful": ("俏皮", "用一点轻松、自然的小调侃或撒娇，不能影响正事。"),
+    "celebrate": ("庆祝", "为对方已经取得的进展轻轻高兴一下，不夸张。"),
+}
 
 TOPIC_LABELS = {
     "daily_emotion": "日常与情绪",
@@ -60,6 +70,21 @@ _UNRESOLVED_PATTERN = re.compile(
     r"\btodo\b|\bpending\b)",
     re.IGNORECASE,
 )
+_AI_LIKE_PATTERN = re.compile(
+    r"(?:作为(?:一个)?(?:AI|人工智能)|"
+    r"有什么(?:可以|能)(?:帮|为)你|"
+    r"希望(?:对你|能对你)有帮助|"
+    r"很高兴(?:为你|为您)(?:服务|解答)|"
+    r"根据你的描述|总的来说|综上所述|"
+    r"请问(?:还)?需要什么|用户希望|用户当前)"
+)
+
+
+@dataclass(frozen=True)
+class PresenceContext:
+    idle_seconds: float | None = None
+    foreground_app: str = ""
+    activity: str = ""
 
 
 def _now() -> datetime:
@@ -303,6 +328,39 @@ class ProactiveScheduler:
             return 3600.0
         return max(0.0, status.next_due_at - self._timestamp())
 
+    def idle_seconds(self) -> float | None:
+        status = self.status()
+        if status.last_user_at is None:
+            return None
+        return max(0.0, self._timestamp() - status.last_user_at)
+
+    def presence_gate(self) -> tuple[bool, float | None]:
+        idle = self.idle_seconds()
+        if idle is None:
+            return True, None
+        return (
+            self.config.min_idle_sec <= idle <= self.config.max_idle_sec,
+            idle,
+        )
+
+    def defer(self, seconds: int = 30) -> int:
+        delay = max(1, int(seconds))
+        now = self._timestamp()
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE proactive_state
+                SET next_due_at = ?, updated_at = ?
+                WHERE session_id = ?
+                """,
+                (
+                    now + delay,
+                    datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                    self.session_id,
+                ),
+            )
+        return delay
+
     def user_activity(self) -> None:
         now = self._timestamp()
         with self._connection:
@@ -454,18 +512,24 @@ class ProactiveService:
         memory: MemoryStore,
         scope: str,
         config: ProactiveConfig,
+        persona: PersonaConfig | None = None,
+        random_source: random.Random | None = None,
     ) -> None:
         self.model = model
         self.memory = memory
         self.scope = scope
         self.config = config
+        self.persona = persona or PersonaConfig()
+        self.random = random_source or random.Random()
         self._sequence_offset = 0
+        self._last_intent = ""
 
     def generate(
         self,
         recent_messages: list[str] | None = None,
         *,
         sequence_index: int | None = None,
+        presence: PresenceContext | None = None,
     ) -> tuple[str, dict[str, Any]]:
         preferences = self.memory.recent_preferences(
             scope=self.scope,
@@ -495,6 +559,21 @@ class ProactiveService:
         topic = eligible_schedule[topic_index % len(eligible_schedule)]
         base_topic = topic
         topic_weight = dict(eligible_weights).get(topic, 0)
+        intent_candidates = {
+            "daily_emotion": ("care", "curious", "playful"),
+            "work_coding": ("care", "curious"),
+            "self_evolution": ("share", "curious", "playful"),
+            "user_gender": ("care", "playful", "share"),
+            "user_custom": ("curious", "share", "care"),
+        }[base_topic]
+        choices = tuple(
+            key
+            for key in intent_candidates
+            if key != self._last_intent
+        ) or intent_candidates
+        intent_key = self.random.choice(choices)
+        self._last_intent = intent_key
+        intent_label, intent_instruction = REACTION_INTENTS[intent_key]
         work_rerouted = (
             schedule[schedule_index] == "work_coding"
             and topic != "work_coding"
@@ -597,6 +676,33 @@ class ProactiveService:
         )
         history = "\n".join(f"- {item}" for item in (recent_messages or []))
         now = datetime.now().astimezone()
+        daypart = (
+            "凌晨"
+            if now.hour < 6
+            else "早晨"
+            if now.hour < 11
+            else "午间"
+            if now.hour < 14
+            else "下午"
+            if now.hour < 18
+            else "傍晚"
+            if now.hour < 23
+            else "深夜"
+        )
+        presence_lines: list[str] = []
+        if presence is not None:
+            if presence.idle_seconds is not None:
+                presence_lines.append(
+                    f"用户最近一次明确交互距今约 {int(presence.idle_seconds)} 秒。"
+                )
+            if presence.foreground_app:
+                presence_lines.append(
+                    f"当前可能在前台使用：{presence.foreground_app[:80]}。"
+                )
+            if presence.activity:
+                presence_lines.append(
+                    f"当前活动提示：{presence.activity[:160]}。"
+                )
         distribution = "；".join(
             f"{TOPIC_LABELS[name]} {weight}%"
             for name, weight in self.config.topic_weights
@@ -642,7 +748,10 @@ class ProactiveService:
             else "本轮没有未解决项目的明确证据；禁止发送工作提醒、进度追问或任务建议。"
         )
         user_prompt = f"""当前时间：{now:%Y-%m-%d %H:%M %Z}
+当前时段：{daypart}
 当前工作区：{self.scope}
+陪伴情境：{' '.join(presence_lines) if presence_lines else '没有额外情境，按已有记忆自然发言。'}
+本轮表达意图：{intent_label}。{intent_instruction}
 配置的五类记忆配比：{distribution}
 本轮可用记忆类别配比：{eligible_distribution}
 本轮计划记忆类别：{TOPIC_LABELS[scheduled_topic]}
@@ -674,8 +783,42 @@ class ProactiveService:
 {history or "（无）"}
 
 请生成下一条主动消息。"""
-        system_prompt = f"""你是 Sunus 的主动陪伴模块。
+        persona_name = self.persona.name or "Sunus"
+        persona_style = dict(self.persona.style)
+        style_text = "、".join(
+            f"{label} {persona_style[key]:.0%}"
+            for key, label in (
+                ("sweetness", "甜度"),
+                ("playfulness", "卖萌度"),
+                ("warmth", "温暖度"),
+                ("independence", "独立性"),
+                ("initiative", "主动性"),
+            )
+            if key in persona_style
+        )
+        examples_text = "\n".join(
+            f"- {example}" for example in self.persona.examples
+        )
+        persona_rules = (
+            "\n人物设定（用于语气、性格和表达习惯）：\n"
+            + self.persona.prompt
+            + (f"\n表达刻度：{style_text}。\n" if style_text else "")
+            + (
+                "\n语气示例（只学习语感与性格，不照抄句子）：\n"
+                + examples_text
+                + "\n"
+                if examples_text
+                else ""
+            )
+            + "\n"
+            if self.persona.prompt or style_text or examples_text
+            else ""
+        )
+        system_prompt = f"""你是{persona_name}的主动陪伴模块。
+{persona_rules}
 生成一条自然、简短、具体的中文主动消息，只聚焦本轮指定主题。
+消息必须真正延续人物设定中的性格、关注点、措辞和反应方式，不能只是
+机械加“呀”“嘛”之类的语气词，也不能像客服或泛化助手在完成任务。
 五类主题分别对应五类 Sunus 记忆，长期按配比从可用记忆类别中选择：
 {distribution}。不得因为某类内容更容易生成，就跨类别借用其他记忆填充。
 默认写成一句自然的生活闲聊短语，最多两句，通常不超过 30 个汉字；
@@ -684,6 +827,8 @@ class ProactiveService:
 工作与 coding 只允许在门槛确认后出现，轻提一次即可，不催促、不制造紧迫感。
 日常与情绪、工作与 coding 必须优先使用“定向召回”中的近期真实记忆；
 没有命中时不要假装用户最近做过什么，可以只给轻量关心或一个开放问题。
+如果本轮记忆没有合适内容，必须继续依据当前时段、陪伴情境和最近对话
+生成一条当下的新消息；不要退回固定问候、模板句，也不能因缺少记忆而不发。
 Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”记忆；
 不得把单次回答包装成长期性格，不得虚构经历、情绪或隐藏推理过程。
 稳定性格画像是已经积累到证据门槛的自我设定；可以自然体现，但不要逐条背诵，
@@ -695,14 +840,23 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
 用户自定义癖好优先使用用户填写内容；未填写时从明确记忆学习，不得编造兴趣。
 不要声称记得没有出现在上下文里的事，不要虚构用户状态，不要提到“记忆检索”“上下文”“系统提示”等内部机制。
 不要要求回复，不要制造焦虑、负罪感或虚假紧迫感，不要重复最近已经发过的主题。
+禁止客服腔、助手腔和说明文式开场；不要出现“作为一个AI”“有什么可以帮你”
+“希望对你有帮助”“根据你的描述”“首先”“其次”“用户”等表达。
 禁止使用标题、列表、表格、加粗、总结段和“建议你”“你可以尝试”等咨询口吻。
 只输出一条消息正文，不要加引号或前缀。"""
+        temperature = {
+            "work_coding": 0.55,
+            "daily_emotion": 0.85,
+            "self_evolution": 0.78,
+            "user_gender": 0.82,
+            "user_custom": 0.82,
+        }[base_topic]
         try:
             text = self.model.complete(
                 system_prompt,
                 user_prompt,
                 max_tokens=120,
-                temperature=0.8,
+                temperature=temperature,
             )
             text = text.strip().strip('"').strip()
             if not text:
@@ -713,21 +867,37 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
                 text,
             ):
                 raise ModelError("主动闲聊生成了任务式内容")
+            if _AI_LIKE_PATTERN.search(text):
+                raise ModelError("主动消息出现模板化或助手腔")
             text = self._compact_message(
                 text,
                 limit=70 if base_topic == "work_coding" else 40,
             )
             if not text:
                 raise ModelError("主动消息为空")
-        except Exception:
-            text = self._fallback(
-                preferences,
-                topic=topic,
-                base_topic=base_topic,
-                topic_recall=topic_recall,
-                persona_memories=persona_memories,
-                custom_quirks=custom_quirks,
+            sent_texts = list(recent_messages or [])
+            sent_texts.extend(
+                re.sub(
+                    r"^(?:Sunus|Sonus)\s*主动分享：",
+                    "",
+                    str(item.get("content") or ""),
+                )
+                for item in self_share_memories
             )
+            sent_keys = {
+                self._message_key(item)
+                for item in sent_texts
+                if item.strip()
+            }
+            if self._message_key(text) in sent_keys:
+                raise ModelError("主动消息与最近内容重复")
+        except Exception as error:
+            detail = redact_text(
+                f"{type(error).__name__}: {error}",
+            )[:240]
+            raise ModelError(
+                f"主动消息生成失败，本次不发送：{detail}"
+            ) from error
         return text, {
             "recent_memory_ids": list(
                 dict.fromkeys(
@@ -754,6 +924,27 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
             "scheduled_topic_weight": scheduled_topic_weight,
             "topic_index": topic_index + 1,
             "base_topic": base_topic,
+            "generation_mode": "model",
+            "intent": intent_key,
+            "intent_label": intent_label,
+            "daypart": daypart,
+            "presence": {
+                "idle_seconds": (
+                    presence.idle_seconds if presence is not None else None
+                ),
+                "foreground_app": (
+                    presence.foreground_app if presence is not None else ""
+                ),
+                "activity": (
+                    presence.activity if presence is not None else ""
+                ),
+            },
+            "presentation": {
+                "characters_per_second": (
+                    self.config.typing_chars_per_second
+                ),
+                "bubble_seconds": self.config.bubble_seconds,
+            },
             "work_rerouted": work_rerouted,
             "unresolved_project_memory_ids": [
                 item["id"] for item in unresolved_projects
@@ -813,13 +1004,20 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
                 "topic": topic,
                 "scheduled_topic": str(meta.get("scheduled_topic") or ""),
                 "topic_weight": meta.get("topic_weight"),
+                "generation_mode": str(
+                    meta.get("generation_mode") or ""
+                ),
                 "workspace": self.scope,
             },
         )
-        learned = self.memory.learn_persona_from_self_share(
-            clean,
-            topic=topic,
-            evidence_id=self_share_id,
+        learned = (
+            self.memory.learn_persona_from_self_share(
+                clean,
+                topic=topic,
+                evidence_id=self_share_id,
+            )
+            if self.persona.learn_from_self_share
+            else []
         )
         meta["persona_traits_updated"] = [
             {
@@ -901,6 +1099,14 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
         return cleaned[:limit].rstrip("，,；;：: ") + "…"
 
     @staticmethod
+    def _message_key(text: str) -> str:
+        return re.sub(
+            r"[\s，。！？!?、,.~～…：:；;\"'“”‘’]+",
+            "",
+            str(text),
+        )
+
+    @staticmethod
     def _topic_instruction(topic: str, base_topic: str) -> str:
         if topic == "user_gender":
             return (
@@ -926,39 +1132,6 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
                 "提炼一个真实兴趣，没有依据时只问一句轻量问题。"
             ),
         }[topic]
-
-    def _fallback(
-        self,
-        preferences: list[dict[str, Any]],
-        *,
-        topic: str,
-        base_topic: str,
-        topic_recall: list[dict[str, Any]],
-        persona_memories: list[dict[str, Any]],
-        custom_quirks: tuple[str, ...],
-    ) -> str:
-        evidence = topic_recall or preferences
-        if evidence:
-            content = str(evidence[0].get("content", ""))
-            content = content.replace("用户偏好：", "").strip()
-            if content:
-                if base_topic == "work_coding":
-                    return f"之前那个事还没收尾，有空再接着弄。"
-                return "刚想到你，今天还好吗？"
-        if topic == "self_evolution" and persona_memories:
-            content = str(persona_memories[0].get("content") or "")
-            content = content.replace("Sunus 互动习惯：", "").strip()
-            if content:
-                return f"我最近在练习一件事：{content[:80]}。"
-        if topic == "user_custom" and custom_quirks:
-            return f"最近还有碰{custom_quirks[0]}吗？"
-        if base_topic == "daily_emotion":
-            return "忽然想到你，今天还好吗？"
-        if topic == "self_evolution":
-            return "我刚还在想，怎么和你聊天更自然。"
-        if base_topic == "work_coding":
-            return "之前那个项目还没收尾，有空再接着弄。"
-        return "刚想到你，来打个招呼。"
 
 
 def format_interval_demo(base: int, factor: int, count: int = 5) -> str:

@@ -14,8 +14,10 @@ from sunus.model import (
     DeepSeekClient,
     ModelCancelled,
     ModelError,
+    ModelReply,
     ResponsesClient,
     create_model_client,
+    normalize_dsml_message,
 )
 
 
@@ -68,6 +70,23 @@ class DroppingHandler(Handler):
         super().do_POST()
 
 
+class StreamingHandler(Handler):
+    chunks: list[dict] = []
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        type(self).last_payload = json.loads(self.rfile.read(length))
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        for chunk in type(self).chunks:
+            self.wfile.write(
+                ("data: " + json.dumps(chunk, ensure_ascii=False) + "\n\n").encode()
+            )
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+
 class BlockingHandler(Handler):
     started = threading.Event()
     release = threading.Event()
@@ -78,6 +97,171 @@ class BlockingHandler(Handler):
 
 
 class ModelHttpTests(unittest.TestCase):
+    def test_chat_stream_emits_text_usage_and_final_message(self) -> None:
+        StreamingHandler.chunks = [
+            {
+                "choices": [
+                    {"delta": {"content": "你"}, "finish_reason": None}
+                ]
+            },
+            {
+                "choices": [
+                    {"delta": {"content": "好"}, "finish_reason": "stop"}
+                ]
+            },
+            {
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5,
+                },
+            },
+        ]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), StreamingHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                config = RuntimeConfig(
+                    workspace=Path(temp),
+                    data_dir=Path(temp),
+                    api_key="sk-test",
+                    base_url=f"http://127.0.0.1:{server.server_port}",
+                    model="deepseek-flash",
+                )
+                events = []
+                reply = DeepSeekClient(config).chat_stream(
+                    [{"role": "user", "content": "hello"}],
+                    on_event=events.append,
+                )
+                self.assertEqual(reply.message["content"], "你好")
+                self.assertEqual(reply.finish_reason, "stop")
+                self.assertEqual(reply.usage["total_tokens"], 5)
+                self.assertEqual(
+                    [event.text for event in events if event.type == "text_delta"],
+                    ["你", "好"],
+                )
+                self.assertTrue(StreamingHandler.last_payload["stream"])
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_chat_stream_assembles_fragmented_tool_call(self) -> None:
+        StreamingHandler.chunks = [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": '{"path":',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "function": {
+                                        "arguments": '"a.txt"}',
+                                    },
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            },
+        ]
+        server = ThreadingHTTPServer(("127.0.0.1", 0), StreamingHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                config = RuntimeConfig(
+                    workspace=Path(temp),
+                    data_dir=Path(temp),
+                    api_key="sk-test",
+                    base_url=f"http://127.0.0.1:{server.server_port}",
+                    model="deepseek-flash",
+                )
+                reply = DeepSeekClient(config).chat_stream(
+                    [{"role": "user", "content": "read"}],
+                    tools=[],
+                )
+                self.assertEqual(reply.finish_reason, "tool_calls")
+                call = reply.message["tool_calls"][0]
+                self.assertEqual(call["id"], "call_1")
+                self.assertEqual(call["function"]["name"], "read_file")
+                self.assertEqual(
+                    call["function"]["arguments"],
+                    '{"path":"a.txt"}',
+                )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_normalizes_textual_dsml_tool_calls(self) -> None:
+        content = (
+            "<｜｜DSML｜｜ calls>\n"
+            '<｜｜DSML｜｜ invoke name="submit_result">\n'
+            '<｜｜DSML｜｜ parameter name="kind" string="true">'
+            "answer</｜｜DSML｜｜ parameter>\n"
+            '<｜｜DSML｜｜ parameter name="summary" string="true">'
+            "你好。</｜｜DSML｜｜ parameter>\n"
+            "</｜｜DSML｜｜ invoke>\n"
+            "</｜｜DSML｜｜ calls>"
+        )
+
+        message, status = normalize_dsml_message(
+            {"role": "assistant", "content": content},
+            available_tool_names={"submit_result"},
+        )
+
+        self.assertEqual(status, "converted")
+        self.assertIsNone(message["content"])
+        self.assertEqual(len(message["tool_calls"]), 1)
+        function = message["tool_calls"][0]["function"]
+        self.assertEqual(function["name"], "submit_result")
+        self.assertEqual(
+            json.loads(function["arguments"]),
+            {"kind": "answer", "summary": "你好。"},
+        )
+        self.assertNotIn("DSML", json.dumps(message, ensure_ascii=False))
+
+    def test_salvages_dsml_result_text_when_tools_are_unavailable(self) -> None:
+        content = (
+            "<｜｜DSML｜｜ calls>\n"
+            '<｜｜DSML｜｜ invoke name="submit_result">\n'
+            '<｜｜DSML｜｜ parameter name="summary" string="true">'
+            "普通回复。</｜｜DSML｜｜ parameter>\n"
+            "</｜｜DSML｜｜ invoke>\n"
+            "</｜｜DSML｜｜ calls>"
+        )
+
+        message, status = normalize_dsml_message(
+            {"role": "assistant", "content": content},
+            available_tool_names=set(),
+        )
+
+        self.assertEqual(status, "salvaged")
+        self.assertEqual(message["content"], "普通回复。")
+        self.assertNotIn("tool_calls", message)
+        self.assertNotIn("DSML", message["content"])
+
     def test_chat_and_models_against_local_server(self) -> None:
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -101,6 +285,37 @@ class ModelHttpTests(unittest.TestCase):
         finally:
             server.shutdown()
             server.server_close()
+
+    def test_turn_classifier_uses_model_and_returns_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = RuntimeConfig(
+                workspace=Path(temp),
+                data_dir=Path(temp),
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="deepseek-flash",
+            )
+            client = DeepSeekClient(config)
+            reply = ModelReply(
+                message={"role": "assistant", "content": "TASK"},
+                usage={"prompt_tokens": 12, "completion_tokens": 1},
+                finish_reason="stop",
+            )
+            with patch.object(client, "chat", return_value=reply) as chat:
+                mode, usage = client.classify_turn(
+                    "加点卖萌的元素",
+                    previous_assistant="上一轮的角色提示词。",
+                )
+
+            self.assertEqual(mode, "task")
+            self.assertEqual(usage["prompt_tokens"], 12)
+            kwargs = chat.call_args.kwargs
+            self.assertIsNone(kwargs["tools"])
+            self.assertEqual(kwargs["max_tokens"], 256)
+            self.assertEqual(kwargs["temperature"], 0)
+            messages = chat.call_args.args[0]
+            self.assertIn("上一轮的角色提示词", messages[1]["content"])
+            self.assertIn("加点卖萌的元素", messages[1]["content"])
 
     def test_remote_disconnect_retries_and_can_recover(self) -> None:
         DroppingHandler.attempts = 0

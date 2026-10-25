@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ class ToolTests(unittest.TestCase):
         self.assertIn("submit_result", names)
         self.assertIn("write_document", names)
         self.assertIn("memory_context_metrics", names)
+        self.assertIn("inspect_environment", names)
 
     def make_executor(
         self,
@@ -64,6 +66,18 @@ class ToolTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertIn("exit_code=0", result.content)
             self.assertIn("ok", result.content)
+
+    def test_environment_tool_queries_path_without_inventory_dump(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            executor = self.make_executor(Path(temp))
+            result = executor.execute(
+                "inspect_environment",
+                {"commands": ["git"], "refresh": True},
+            )
+            self.assertTrue(result.ok)
+            payload = json.loads(result.content)
+            self.assertNotIn("inventory", payload["path"])
+            self.assertIn("requested_commands", payload)
 
     def test_pipeline_masked_python_error_is_marked_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

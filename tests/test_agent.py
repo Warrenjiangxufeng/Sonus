@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from sunus.agent import Agent
-from sunus.config import LoopBudgetConfig, RuntimeConfig
+from sunus.config import LoopBudgetConfig, PersonaConfig, RuntimeConfig
 from sunus.events import EventBus
 from sunus.memory import MemoryStore
+from sunus.model_events import ModelEvent
 from sunus.model import ModelCancelled, ModelReply
 from sunus.policy import ApprovalManager, PathGuard
 from sunus.storage import ArtifactStore, SessionLogger
@@ -109,6 +113,74 @@ class CapturingReplyModel:
             usage={"prompt_tokens": 10, "completion_tokens": 5},
             finish_reason="stop",
         )
+
+
+class TextualProtocolRecoveryModel:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.last_messages: list[dict] = []
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.calls += 1
+        self.last_messages = messages
+        if self.calls == 1:
+            return ModelReply(
+                message={
+                    "role": "assistant",
+                    "content": (
+                        "<｜｜DSML｜｜ calls>\n"
+                        '<｜｜DSML｜｜ invoke name="list_files">\n'
+                        '<｜｜DSML｜｜ parameter name="path" string="true">'
+                        ".</｜｜DSML｜｜ parameter>\n"
+                        "</｜｜DSML｜｜ invoke>\n"
+                        "</｜｜DSML｜｜ calls>"
+                    ),
+                },
+                usage={"prompt_tokens": 10, "completion_tokens": 5},
+                finish_reason="stop",
+            )
+        return ModelReply(
+            message={"role": "assistant", "content": "这次正常回复。"},
+            usage={"prompt_tokens": 10, "completion_tokens": 5},
+            finish_reason="stop",
+        )
+
+    def chat_stream(
+        self,
+        messages,
+        *,
+        tools=None,
+        max_tokens=None,
+        temperature=0.2,
+        on_event=None,
+    ):
+        reply = self.chat(
+            messages,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        if on_event and reply.message.get("content"):
+            on_event(
+                ModelEvent(
+                    "text_delta",
+                    text=str(reply.message["content"]),
+                )
+            )
+        return reply
+
+
+class ClassifyingReplyModel(CapturingReplyModel):
+    def __init__(self, text: str, mode: str) -> None:
+        super().__init__(text)
+        self.mode = mode
+        self.classification_calls = 0
+        self.classification_previous = ""
+
+    def classify_turn(self, user_input, *, previous_assistant=""):
+        self.classification_calls += 1
+        self.classification_previous = previous_assistant
+        return self.mode, {"prompt_tokens": 20, "completion_tokens": 1}
 
 
 class CancelledAfterWriteModel:
@@ -391,6 +463,62 @@ class StructuredResultModel:
         )
 
 
+class TextualDSMLResultModel:
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        return ModelReply(
+            message={
+                "role": "assistant",
+                "content": (
+                    "<｜｜DSML｜｜ calls>\n"
+                    '<｜｜DSML｜｜ invoke name="submit_result">\n'
+                    '<｜｜DSML｜｜ parameter name="kind" string="true">'
+                    "answer</｜｜DSML｜｜ parameter>\n"
+                    '<｜｜DSML｜｜ parameter name="status" string="true">'
+                    "completed</｜｜DSML｜｜ parameter>\n"
+                    '<｜｜DSML｜｜ parameter name="summary" string="true">'
+                    "DSML 已转换。</｜｜DSML｜｜ parameter>\n"
+                    "</｜｜DSML｜｜ invoke>\n"
+                    "</｜｜DSML｜｜ calls>"
+                ),
+            },
+            usage={"total_tokens": 5},
+            finish_reason="stop",
+        )
+
+
+class ParallelReadModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.calls += 1
+        if self.calls == 1:
+            return ModelReply(
+                message={
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"call_{index}",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": f'{{"path":"file_{index}.txt"}}',
+                            },
+                        }
+                        for index in range(3)
+                    ],
+                },
+                usage={"total_tokens": 5},
+                finish_reason="tool_calls",
+            )
+        return ModelReply(
+            message={"role": "assistant", "content": "三个文件已读取。"},
+            usage={"total_tokens": 2},
+            finish_reason="stop",
+        )
+
+
 class UnrequestedWriteModel:
     def __init__(self) -> None:
         self.calls = 0
@@ -541,6 +669,131 @@ class AgentTests(unittest.TestCase):
             )
             memory.close()
 
+    def test_textual_dsml_result_is_converted_and_executed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_dsml_result", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            agent = Agent(
+                config=config,
+                model=TextualDSMLResultModel(),  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("检查并分析当前项目结构")
+
+            self.assertEqual(result.reason, "completed")
+            self.assertEqual(result.text, "DSML 已转换。")
+            self.assertEqual(result.tool_traces[0]["name"], "submit_result")
+            self.assertNotIn(
+                "<｜｜DSML｜｜",
+                session.path.read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "model_protocol_normalized",
+                events.path.read_text(encoding="utf-8"),
+            )
+            memory.close()
+
+    def test_parallel_safe_tools_run_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            for index in range(3):
+                (root / f"file_{index}.txt").write_text(
+                    f"content {index}",
+                    encoding="utf-8",
+                )
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_parallel", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            original_execute = tools.execute
+            lock = threading.Lock()
+            active = 0
+            maximum = 0
+
+            def tracked_execute(name, arguments):
+                nonlocal active, maximum
+                with lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                try:
+                    time.sleep(0.05)
+                    return original_execute(name, arguments)
+                finally:
+                    with lock:
+                        active -= 1
+
+            agent = Agent(
+                config=config,
+                model=ParallelReadModel(),  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+            with patch.object(
+                tools,
+                "execute",
+                side_effect=tracked_execute,
+            ):
+                result = agent.run_turn("读取这三个文件")
+
+            self.assertEqual(result.text, "三个文件已读取。")
+            self.assertGreaterEqual(maximum, 2)
+            self.assertIn(
+                "parallel_tool_batch",
+                events.path.read_text(encoding="utf-8"),
+            )
+            memory.close()
+
     def test_casual_chat_uses_short_no_tool_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "workspace"
@@ -591,10 +844,204 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(model.last_max_tokens, 512)
             self.assertEqual(model.tool_names, set())
             self.assertIn("本轮回应模式：日常对话", model.last_messages[0]["content"])
-            self.assertIn("Sunus 稳定性格画像", model.last_messages[0]["content"])
+            self.assertIn("不要调用任何工具", model.last_messages[0]["content"])
+            self.assertNotIn(
+                "必须调用 submit_result",
+                model.last_messages[0]["content"],
+            )
+            self.assertIn("可演化互动习惯", model.last_messages[0]["content"])
             self.assertIn("性格温柔", model.last_messages[0]["content"])
             self.assertEqual(result.tool_traces, [])
             memory.close()
+
+    def test_dsml_protocol_output_is_intercepted_and_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_dsml", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = TextualProtocolRecoveryModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("哈喽在干嘛")
+
+            self.assertEqual(result.text, "这次正常回复。")
+            self.assertEqual(model.calls, 2)
+            self.assertNotIn("DSML", result.text)
+            self.assertNotIn("DSML", session.path.read_text(encoding="utf-8"))
+            self.assertIn(
+                "本轮不要输出任何 DSML",
+                model.last_messages[0]["content"],
+            )
+            events_text = events.path.read_text(encoding="utf-8")
+            self.assertIn("model_protocol_normalized", events_text)
+            self.assertIn("model_protocol_retry", events_text)
+            self.assertNotIn("<｜｜DSML｜｜", events_text)
+            memory.close()
+
+    def test_configured_persona_is_injected_into_system_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+                persona=PersonaConfig(
+                    name="苏诺",
+                    prompt="苏诺语气甜软，会自然地撒娇，也会认真解决问题。",
+                    examples=("这句夸我收下啦，正事也会认真做。",),
+                    style=(("sweetness", 0.9), ("playfulness", 0.8)),
+                    context_intensity=(("chat", 1.0), ("task", 0.6)),
+                ),
+            )
+            memory = MemoryStore(data / "memory.db")
+            memory.record_turn(
+                user_input="我现在设定你的性别为男性，性格冷淡",
+                assistant_text="旧设定。",
+                scope=str(root.resolve()),
+                receipt_id="r_old_identity",
+            )
+            events = EventBus(data)
+            session = SessionLogger("s_persona_config", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = CapturingReplyModel("我在呀，今天想聊点什么？")
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("哈喽在干嘛")
+
+            system_prompt = model.last_messages[0]["content"]
+            self.assertEqual(result.reason, "completed")
+            self.assertIn("你是苏诺", system_prompt)
+            self.assertIn("语气甜软", system_prompt)
+            self.assertIn("正事也会认真做", system_prompt)
+            self.assertIn("甜度: 90%", system_prompt)
+            self.assertIn("闲聊场景", system_prompt)
+            self.assertNotIn("Sunus 核心性别设定为男性", system_prompt)
+            self.assertGreater(result.metrics["context"]["persona_config"]["characters"], 0)
+            memory.close()
+
+    def test_model_classifies_ambiguous_short_followup(self) -> None:
+        cases = (
+            ("task", "加点卖萌的元素", 8192),
+            ("casual", "你在想我吗", 512),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            for mode, user_input, expected_limit in cases:
+                with self.subTest(mode=mode):
+                    root = Path(temp) / f"workspace_{mode}"
+                    root.mkdir()
+                    data = Path(temp) / f"data_{mode}"
+                    config = RuntimeConfig(
+                        workspace=root,
+                        data_dir=data,
+                        api_key="sk-test",
+                        base_url="https://example.invalid",
+                        model="fake",
+                        max_steps=4,
+                    )
+                    memory = MemoryStore(data / "memory.db")
+                    events = EventBus(data)
+                    session = SessionLogger(f"s_classify_{mode}", root, data)
+                    tools = ToolExecutor(
+                        workspace=root,
+                        path_guard=PathGuard(root),
+                        approvals=ApprovalManager(
+                            auto_approve=False,
+                            interactive=False,
+                            workspace=root,
+                        ),
+                        artifacts=ArtifactStore(root, data),
+                        events=events,
+                        memory=memory,
+                    )
+                    model = ClassifyingReplyModel("本轮已处理。", mode)
+                    agent = Agent(
+                        config=config,
+                        model=model,  # type: ignore[arg-type]
+                        memory=memory,
+                        tools=tools,
+                        events=events,
+                        session=session,
+                    )
+                    if mode == "task":
+                        agent.messages.append(
+                            {
+                                "role": "assistant",
+                                "content": "上一轮生成的角色提示词正文。",
+                            }
+                        )
+
+                    result = agent.run_turn(user_input)
+
+                    self.assertEqual(result.reason, "completed")
+                    self.assertEqual(model.classification_calls, 1)
+                    self.assertEqual(model.last_max_tokens, expected_limit)
+                    self.assertEqual(
+                        "本轮回应模式：日常对话"
+                        in model.last_messages[0]["content"],
+                        mode == "casual",
+                    )
+                    if mode == "task":
+                        self.assertEqual(
+                            model.classification_previous,
+                            "上一轮生成的角色提示词正文。",
+                        )
+                    events_text = events.path.read_text(encoding="utf-8")
+                    self.assertIn("response_mode_classified", events_text)
+                    self.assertIn('"source":"model"', events_text)
+                    memory.close()
 
     def test_consultation_filters_unauthorized_command_tool(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -641,6 +1088,106 @@ class AgentTests(unittest.TestCase):
             self.assertIn("submit_result", model.tool_names)
             self.assertNotIn("run_command", model.tool_names)
             self.assertNotIn("write_file", model.tool_names)
+            system_prompt = model.last_messages[0]["content"]
+            self.assertIn(f"权威运行数据目录：{data.resolve()}", system_prompt)
+            self.assertIn("本轮未注入某项工具", system_prompt)
+            self.assertIn("不代表 Sunus 永久没有该能力", system_prompt)
+            self.assertIn("未开放: fetch_url, patch_file, run_command", system_prompt)
+            memory.close()
+
+    def test_mutation_exposes_command_tool_for_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_verify", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = CapturingReplyModel("修改完成，并已运行验证。")
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            agent.run_turn("修复记忆系统的写入逻辑")
+
+            self.assertIn("patch_file", model.tool_names)
+            self.assertIn("run_command", model.tool_names)
+            self.assertIn(
+                "本轮允许修改，因此已开放本地命令用于必要验证",
+                model.last_messages[0]["content"],
+            )
+            memory.close()
+
+    def test_diagnostic_turn_injects_evidence_gated_reasoning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_diagnose", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = CapturingReplyModel("先核对实际环境。")
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            agent.run_turn("为什么它说没有 shell 工具？")
+
+            system_prompt = model.last_messages[0]["content"]
+            self.assertIn("至少形成两个竞争假设", system_prompt)
+            self.assertIn("单个失败入口不能证明", system_prompt)
+            self.assertIn("inspect_environment", model.tool_names)
+            self.assertIn("本地执行环境", system_prompt)
             memory.close()
 
     def test_short_confirmation_inherits_previous_network_offer(self) -> None:

@@ -17,6 +17,7 @@ from sunus.cli import (
     _thinking_interrupt_pressed,
     make_parser,
     print_banner,
+    residual_text,
 )
 
 
@@ -220,6 +221,19 @@ class CliTests(unittest.TestCase):
         self.assertIn("✓ 完成 · 1 次分析 · 1 个动作 · 读取 1", text)
         self.assertNotIn("sunus test", text)
 
+    def test_runtime_renderer_tracks_assistant_delta(self) -> None:
+        output = io.StringIO()
+        renderer = RuntimeEventRenderer(color_enabled=False, is_tty=False)
+        with redirect_stdout(output):
+            renderer({"type": "model_request", "step": 1})
+            renderer({"type": "assistant_delta", "text": "你好"})
+            renderer({"type": "assistant_delta", "text": "，世界。"})
+            renderer({"type": "turn_end", "reason": "completed"})
+        text = output.getvalue()
+        self.assertEqual(renderer.streamed_text, "你好，世界。")
+        self.assertIn("你好，世界。", text)
+        self.assertIn("✓ 完成", text)
+
     def test_runtime_renderer_streams_lines_without_tty(self) -> None:
         output = io.StringIO()
         renderer = RuntimeEventRenderer(color_enabled=False, is_tty=False)
@@ -275,6 +289,37 @@ class CliTests(unittest.TestCase):
             patch("sunus.cli.select.select", return_value=([0], [], [])),
         ):
             self.assertFalse(_thinking_interrupt_pressed(0))
+
+    def test_residual_text_does_not_reprint_streamed_text(self) -> None:
+        # 完全相等：流式已经打完，不能再打一遍
+        self.assertEqual(residual_text("你好，世界。", "你好，世界。"), "")
+        # 终态是流式内容的前缀子集：同样不重复
+        self.assertEqual(residual_text("你好，世界。", "你好，世界。以上是结论。"), "")
+        # 终态以流式内容开头：只补尾部差量
+        self.assertEqual(residual_text("你好，世界。还有补充", "你好，世界。"), "还有补充")
+        # 终态是全新内容：整段输出
+        self.assertEqual(residual_text("另一段结论", "你好，世界。"), "另一段结论")
+        # 没有流式输出：照常输出
+        self.assertEqual(residual_text("你好", ""), "你好")
+
+    def test_residual_text_appends_render_result_extras(self) -> None:
+        # 真实场景：正文流式打完，render_result 在其后追加 details / risks
+        streamed = "备份完成，副本里改了补打逻辑。"
+        rendered = (
+            "备份完成，副本里改了补打逻辑。\n\n"
+            "- 186 passed\n\n**限制**：主仓尚未改动"
+        )
+        self.assertEqual(
+            residual_text(rendered, streamed),
+            "\n\n- 186 passed\n\n**限制**：主仓尚未改动",
+        )
+
+    def test_residual_text_keeps_new_conclusion(self) -> None:
+        # 终态是全新结论时不能被吞掉
+        self.assertEqual(
+            residual_text("另一段结论", "你好，世界。"),
+            "另一段结论",
+        )
 
 
 if __name__ == "__main__":

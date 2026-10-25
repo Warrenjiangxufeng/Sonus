@@ -5,6 +5,7 @@ import unittest
 from sunus.scope import (
     classify_request,
     classify_request_with_context,
+    conversation_hint,
     is_casual_conversation,
 )
 
@@ -15,6 +16,16 @@ class RequestScopeTests(unittest.TestCase):
         self.assertTrue(scope.allows_mutation)
         self.assertTrue(scope.allows_commands)
         self.assertFalse(scope.allows_network)
+
+    def test_mutation_implicitly_allows_local_verification_commands(self) -> None:
+        scope = classify_request("修复记忆系统的写入逻辑")
+        self.assertTrue(scope.allows_mutation)
+        self.assertTrue(scope.allows_commands)
+        self.assertFalse(scope.allows_network)
+
+    def test_colloquial_install_command_is_recognized(self) -> None:
+        scope = classify_request("你怎么可能没有shell工具？没有就装啊！")
+        self.assertTrue(scope.allows_commands)
 
     def test_questions_and_negative_examples_do_not_authorize_actions(self) -> None:
         for text in (
@@ -60,6 +71,11 @@ class RequestScopeTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertFalse(is_casual_conversation(text))
+
+    def test_short_followup_is_marked_ambiguous_for_model_review(self) -> None:
+        self.assertEqual(conversation_hint("哈喽在干嘛"), "casual")
+        self.assertEqual(conversation_hint("加点卖萌的元素"), "ambiguous")
+        self.assertEqual(conversation_hint("分析当前项目架构"), "task")
 
     def test_referential_followup_inherits_only_proposed_capability(self) -> None:
         previous = (

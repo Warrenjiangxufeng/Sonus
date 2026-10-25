@@ -84,6 +84,141 @@ class MemoryTests(unittest.TestCase):
             self.assertTrue(any("先看摘要" in item["content"] for item in prefs))
             memory.close()
 
+    def test_questions_and_task_constraints_are_not_saved_as_preferences(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            for index, text in enumerate(
+                (
+                    "你的本地记忆系统每次送入上下文的 token 大概有多少？",
+                    "试一下，特别是江浙沪ip的",
+                    "不要修改文件，只分析原因",
+                )
+            ):
+                memory.record_turn(
+                    user_input=text,
+                    assistant_text="已处理。",
+                    scope="/project/example",
+                    receipt_id=f"r_non_preference_{index}",
+                )
+
+            self.assertEqual(
+                memory.recent_preferences(
+                    scope="/project/example",
+                    limit=20,
+                ),
+                [],
+            )
+            memory.add(
+                content="用户偏好：紫色河马大概有多少只？",
+                scope="global",
+                kind="preference",
+                status="supported",
+                tags=("preference", "recent"),
+            )
+            self.assertEqual(
+                memory.search(
+                    "河马",
+                    scope="/project/example",
+                    limit=10,
+                ),
+                [],
+            )
+            memory.close()
+
+    def test_explicit_style_feedback_overrides_previous_direction(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            memory.record_turn(
+                user_input="以后别太甜，少卖萌",
+                assistant_text="好，我收一点。",
+                scope="/project/example",
+                receipt_id="r_style_softer",
+            )
+            memory.record_turn(
+                user_input="以后再甜一点",
+                assistant_text="好呀。",
+                scope="/project/example",
+                receipt_id="r_style_sweeter",
+            )
+
+            profile = memory.persona_profile(scope="/project/example")
+            by_key = {item["trait_key"]: item for item in profile}
+            self.assertIn("提高甜度", by_key["style_sweetness"]["statement"])
+            self.assertIn(
+                "降低卖萌度",
+                by_key["style_playfulness"]["statement"],
+            )
+            memory.close()
+
+    def test_core_identity_is_not_demoted_by_persona_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            memory._record_persona_evidence(
+                trait_key="sunus_name",
+                statement="Sunus 的名字是“苏诺”",
+                category="identity:name",
+                evidence_id="identity_name",
+                explicit=True,
+            )
+            memory._record_persona_evidence(
+                trait_key="gender_identity",
+                statement="Sunus 核心性别设定为女性",
+                category="identity:gender",
+                evidence_id="identity_gender",
+                explicit=True,
+            )
+            for index in range(6):
+                memory._record_persona_evidence(
+                    trait_key=f"style_{index}",
+                    statement=f"style {index}",
+                    category="style:test",
+                    evidence_id=f"style_{index}",
+                    explicit=True,
+                )
+
+            result = memory.distill_persona(max_stable=2)
+            profile = memory.persona_profile(
+                scope="/project/example",
+                include_candidates=True,
+                limit=20,
+            )
+            stable_keys = {
+                item["trait_key"]
+                for item in profile
+                if item["status"] == "stable"
+            }
+
+            self.assertEqual(result["pinned"], 2)
+            self.assertEqual(result["demoted"], 4)
+            self.assertIn("sunus_name", stable_keys)
+            self.assertIn("gender_identity", stable_keys)
+            self.assertEqual(len(stable_keys), 4)
+            memory.close()
+
+    def test_self_share_backfill_does_not_create_persona_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "memory.db"
+            memory = MemoryStore(path)
+            memory.add(
+                content="Sunus 主动分享：记得慢慢来呀。",
+                scope="global",
+                kind="self_share",
+                status="supported",
+                tags=("proactive", "self_share", "daily_emotion"),
+                metadata={"topic": "daily_emotion"},
+            )
+            memory.close()
+
+            reopened = MemoryStore(path)
+            self.assertEqual(
+                reopened.persona_profile(
+                    scope="/project/example",
+                    include_candidates=True,
+                ),
+                [],
+            )
+            reopened.close()
+
     def test_context_metrics_match_injected_memory_blocks(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             memory = MemoryStore(Path(temp) / "memory.db")
@@ -343,8 +478,7 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(by_key["conclusion_first"]["status"], "stable")
             self.assertEqual(by_key["gender_identity"]["status"], "stable")
             self.assertIn("warm", by_key)
-            self.assertEqual(by_key["attentive"]["status"], "stable")
-            self.assertEqual(by_key["attentive"]["evidence_count"], 3)
+            self.assertNotIn("attentive", by_key)
             reopened.close()
 
             reopened_again = MemoryStore(path)
@@ -356,10 +490,10 @@ class MemoryTests(unittest.TestCase):
                     limit=20,
                 )
             }
-            self.assertEqual(again["attentive"]["evidence_count"], 3)
+            self.assertEqual(set(again), set(by_key))
             self.assertEqual(
-                again["attentive"]["version"],
-                by_key["attentive"]["version"],
+                again["warm"]["version"],
+                by_key["warm"]["version"],
             )
             reopened_again.close()
 

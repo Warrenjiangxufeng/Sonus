@@ -29,7 +29,9 @@ _MUTATION_PATTERN = re.compile(
 )
 _COMMAND_PATTERN = re.compile(
     r"(?:运行|执行|测试|构建|编译|启动|安装|检查|扫描|查找|搜索|"
-    r"跑一下|跑一遍|验证|git|pytest|run|test|build|install|scan|check)",
+    r"跑一下|跑一遍|验证|git|pytest|run|test|build|install|scan|check|"
+    r"(?:^|[，,。.!！？?\s]|就|快|给我)装(?:一下|上|好|个|吧|啊)?"
+    r"(?=$|[，,。.!！？?\s]))",
     re.IGNORECASE,
 )
 _NETWORK_PATTERN = re.compile(
@@ -90,16 +92,17 @@ def classify_request(text: str) -> RequestScope:
     question = bool(_QUESTION_PREFIX.search(stripped))
     request = bool(_REQUEST_MARKER.search(stripped))
     side_effect_allowed = confirm_only or not (question and not request)
+    allows_mutation = (
+        side_effect_allowed and _positive_action(_MUTATION_PATTERN, stripped)
+    ) or confirm_only
+    allows_commands = (
+        side_effect_allowed and _positive_action(_COMMAND_PATTERN, stripped)
+    ) or confirm_only
     return RequestScope(
         text=stripped,
-        allows_mutation=(
-            side_effect_allowed and _positive_action(_MUTATION_PATTERN, stripped)
-        )
-        or confirm_only,
-        allows_commands=(
-            side_effect_allowed and _positive_action(_COMMAND_PATTERN, stripped)
-        )
-        or confirm_only,
+        allows_mutation=allows_mutation,
+        # 代码修改必须能够运行对应测试，否则 Agent 只能盲改。
+        allows_commands=allows_commands or allows_mutation,
         allows_network=(
             side_effect_allowed and _positive_action(_NETWORK_PATTERN, stripped)
         )
@@ -137,17 +140,31 @@ def is_casual_conversation(
     *,
     previous_assistant: str = "",
 ) -> bool:
-    """Return whether a turn is clearly social chat rather than project work."""
+    """Return whether a turn may be social chat rather than project work."""
+    return conversation_hint(
+        text,
+        previous_assistant=previous_assistant,
+    ) in {"casual", "ambiguous"}
+
+
+def conversation_hint(
+    text: str,
+    *,
+    previous_assistant: str = "",
+) -> str:
+    """Classify unambiguous turns and mark short follow-ups for model review."""
     stripped = text.strip()
     if not stripped or len(stripped) > 160:
-        return False
+        return "task"
     if _TECHNICAL_PATTERN.search(stripped) or _PATH_PATTERN.search(stripped):
-        return False
+        return "task"
     scope = classify_request(stripped)
     if previous_assistant.strip() and _REFERENTIAL_FOLLOWUP.search(stripped):
-        return False
+        return "task"
     if scope.allows_mutation or scope.allows_commands or scope.allows_network:
-        return False
+        return "task"
     if _CASUAL_PATTERN.search(stripped):
-        return True
-    return len(stripped) <= 24 and not _MUTATION_PATTERN.search(stripped)
+        return "casual"
+    if len(stripped) <= 24 and not _MUTATION_PATTERN.search(stripped):
+        return "ambiguous"
+    return "task"

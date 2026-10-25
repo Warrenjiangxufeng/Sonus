@@ -18,6 +18,7 @@ from typing import Any
 
 from sunus.config import redact_text, make_ssl_context
 from sunus.documents import DOCUMENT_PROFILES, render_document
+from sunus.environment import discover_environment, login_shell, shell_invocation
 from sunus.events import EventBus
 from sunus.memory import MemoryStore
 from sunus.policy import ApprovalManager, PathGuard, PolicyError, command_denial_reason
@@ -25,6 +26,7 @@ from sunus.scope import RequestScope, classify_request_with_context
 from sunus.skills import SKILLS_DIRNAME, SkillLibrary
 from sunus.storage import ArtifactStore
 from sunus.result import result_tool_schema
+from sunus.tool_registry import ToolRegistry, ToolSpec
 
 
 MAX_FILE_BYTES = 2 * 1024 * 1024
@@ -256,6 +258,28 @@ def tool_schemas() -> list[dict[str, Any]]:
             [],
         ),
         fn(
+            "inspect_environment",
+            "Inspect the current Python, shell, pytest executable and matching "
+            "interpreter. Use this before claiming a local tool is missing.",
+            {
+                "commands": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "default": [],
+                    "description": "Additional command names to locate on PATH.",
+                },
+                "refresh": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Rescan PATH immediately, for example after installing "
+                        "or uninstalling a command."
+                    ),
+                },
+            },
+            [],
+        ),
+        fn(
             "write_file",
             "Create or fully overwrite a text file inside the workspace. "
             "Routine writes are task-authorized.",
@@ -360,6 +384,8 @@ class ToolExecutor:
         events: EventBus,
         secret: str = "",
         memory: MemoryStore | None = None,
+        mcp_servers: tuple[Any, ...] = (),
+        max_parallel_tools: int = 4,
     ) -> None:
         self.workspace = workspace
         self.path_guard = path_guard
@@ -370,6 +396,89 @@ class ToolExecutor:
         self.memory = memory
         self.skills = SkillLibrary(workspace)
         self.request_scope: RequestScope | None = None
+        self.max_parallel_tools = max(1, int(max_parallel_tools))
+        self.registry = ToolRegistry()
+        self.mcp_manager: Any | None = None
+        self._initialize_registry(mcp_servers)
+
+    def _initialize_registry(self, mcp_servers: tuple[Any, ...]) -> None:
+        handlers = {
+            "read_file": self._read_file,
+            "list_files": self._list_files,
+            "search_text": self._search_text,
+            "memory_context_metrics": self._memory_context_metrics,
+            "inspect_environment": self._inspect_environment,
+            "write_file": self._write_file,
+            "write_document": self._write_document,
+            "patch_file": self._patch_file,
+            "run_command": self._run_command,
+            "fetch_url": self._fetch_url,
+            "list_skills": self._list_skills,
+            "read_skill": self._read_skill,
+        }
+        read_only = {
+            "read_file",
+            "list_files",
+            "search_text",
+            "memory_context_metrics",
+            "inspect_environment",
+            "list_skills",
+            "read_skill",
+            "submit_result",
+        }
+        parallel_safe = set(read_only) - {"submit_result"}
+        risks = {
+            "fetch_url": "R2",
+            "write_file": "R1",
+            "write_document": "R1",
+            "patch_file": "R1",
+            "run_command": "R1",
+        }
+        for schema in tool_schemas():
+            name = str(schema.get("function", {}).get("name") or "")
+            handler = handlers.get(
+                name,
+                lambda _arguments, tool_name=name: ToolResult(
+                    False,
+                    f"{tool_name} 由 Agent 运行时处理，不能直接执行",
+                ),
+            )
+            self.registry.register_schema(
+                schema,
+                handler,
+                risk=risks.get(name, "R0"),
+                read_only=name in read_only,
+                parallel_safe=name in parallel_safe,
+                approval_mode="approve" if name == "submit_result" else "ask",
+            )
+        if mcp_servers:
+            from sunus.mcp import MCPManager
+
+            self.mcp_manager = MCPManager(
+                mcp_servers,
+                events=self.events,
+                secret=self.secret,
+            )
+            for spec in self.mcp_manager.discover_specs():
+                try:
+                    self.registry.register(spec)
+                except ValueError as error:
+                    self.events.emit(
+                        "mcp_tool_conflict",
+                        name=spec.name,
+                        summary=f"忽略冲突 MCP 工具 · {spec.name}: {error}",
+                    )
+
+    def schemas(self) -> list[dict[str, Any]]:
+        return self.registry.schemas()
+
+    def specs(self) -> list[ToolSpec]:
+        return self.registry.specs()
+
+    def close(self) -> None:
+        if self.mcp_manager is not None:
+            self.mcp_manager.close()
+            self.mcp_manager = None
 
     def begin_request(
         self,
@@ -406,24 +515,31 @@ class ToolExecutor:
         denial = self._scope_denial(name)
         if denial:
             return ToolResult(False, denial)
-        handlers = {
-            "read_file": self._read_file,
-            "list_files": self._list_files,
-            "search_text": self._search_text,
-            "memory_context_metrics": self._memory_context_metrics,
-            "write_file": self._write_file,
-            "write_document": self._write_document,
-            "patch_file": self._patch_file,
-            "run_command": self._run_command,
-            "fetch_url": self._fetch_url,
-            "list_skills": self._list_skills,
-            "read_skill": self._read_skill,
-        }
-        handler = handlers.get(name)
-        if handler is None:
+        spec = self.registry.get(name)
+        if spec is None:
             return ToolResult(False, f"未知工具: {name}")
+        if spec.source == "mcp":
+            if spec.approval_mode == "deny":
+                return ToolResult(False, f"用户配置拒绝 MCP 工具: {name}")
+            if spec.approval_mode == "ask" and not self.approvals.require(
+                "调用 MCP 工具",
+                f"{name}\n{json.dumps(arguments, ensure_ascii=False)[:2000]}",
+                risk=spec.risk,
+            ):
+                return ToolResult(False, f"用户拒绝 MCP 工具: {name}")
+        if spec.source == "mcp" and spec.timeout_sec > 0:
+            try:
+                timeout_sec = int(
+                    arguments.get("timeout_sec", spec.timeout_sec)
+                )
+            except (TypeError, ValueError):
+                timeout_sec = spec.timeout_sec
+            arguments = dict(arguments)
+            arguments.setdefault("timeout_sec", timeout_sec)
         try:
-            result = handler(arguments)
+            result = spec.handler(arguments)
+            if not isinstance(result, ToolResult):
+                result = ToolResult(True, str(result))
             if len(result.content) > MAX_CONTEXT_TOOL_OUTPUT:
                 artifact = result.artifact
                 if artifact is None:
@@ -795,6 +911,26 @@ class ToolExecutor:
             ),
         )
 
+    def _inspect_environment(self, args: dict[str, Any]) -> ToolResult:
+        requested = args.get("commands", [])
+        if not isinstance(requested, list):
+            requested = []
+        return ToolResult(
+            True,
+            json.dumps(
+                discover_environment(
+                    (
+                        str(item)
+                        for item in requested
+                        if str(item).strip()
+                    ),
+                    refresh=bool(args.get("refresh", False)),
+                ),
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+
     def _write_file(self, args: dict[str, Any]) -> ToolResult:
         path = self.path_guard.resolve(str(args["path"]))
         self.path_guard.assert_writable(path)
@@ -887,8 +1023,9 @@ class ToolExecutor:
             return ToolResult(False, "用户拒绝执行命令")
         timeout = min(1800, max(1, int(args.get("timeout_sec", 120))))
         try:
+            shell = login_shell()
             completed = subprocess.run(
-                ["/bin/zsh", "-lc", command],
+                shell_invocation(shell, command),
                 cwd=cwd,
                 text=True,
                 capture_output=True,
@@ -909,6 +1046,8 @@ class ToolExecutor:
                 content,
                 artifact=artifact,
             )
+        except FileNotFoundError as error:
+            return ToolResult(False, str(error))
         except subprocess.TimeoutExpired as error:
             partial = ""
             if error.stdout:

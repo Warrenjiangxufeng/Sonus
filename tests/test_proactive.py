@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import tempfile
 import unittest
 import sqlite3
@@ -7,9 +8,11 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sunus.config import ProactiveConfig
+from sunus.config import PersonaConfig, ProactiveConfig
 from sunus.memory import MemoryStore
+from sunus.model import ModelError
 from sunus.proactive import (
+    PresenceContext,
     ProactiveScheduler,
     ProactiveService,
     format_interval_demo,
@@ -22,13 +25,26 @@ class FakeModel:
     def __init__(self) -> None:
         self.last_user_prompt = ""
         self.last_system_prompt = ""
+        self.last_temperature = None
+        self.calls = 0
 
     def complete(self, system: str, user: str, **kwargs) -> str:
+        self.calls += 1
         self.last_system_prompt = system
         self.last_user_prompt = user
+        self.last_temperature = kwargs.get("temperature")
         if "咖啡" in user:
             return "刚想到咖啡，今天喝了吗？"
-        return "刚想到你，今天还好吗？"
+        return (
+            "今天想和你聊点轻松的。",
+            "刚才那点小事，后来怎么样了？",
+        )[(self.calls - 1) % 2]
+
+
+class FailingModel(FakeModel):
+    def complete(self, system: str, user: str, **kwargs) -> str:
+        super().complete(system, user, **kwargs)
+        raise ModelError("test model unavailable")
 
 
 class VerboseModel(FakeModel):
@@ -39,6 +55,12 @@ class VerboseModel(FakeModel):
             "- 建议你先停下来分析一下今天的整体状态和任务安排。\n"
             "- 你可以尝试把每件事情拆成更小的步骤再逐项完成。"
         )
+
+
+class AssistantToneModel(FakeModel):
+    def complete(self, system: str, user: str, **kwargs) -> str:
+        super().complete(system, user, **kwargs)
+        return "作为一个AI，希望能帮到你，还有什么可以帮你？"
 
 
 class ProactiveTests(unittest.TestCase):
@@ -66,6 +88,33 @@ class ProactiveTests(unittest.TestCase):
             scheduler.user_activity()
             self.assertEqual(scheduler.status().unanswered_streak, 0)
             self.assertEqual(scheduler.status().next_delay_sec, 300)
+            scheduler.close()
+
+    def test_presence_gate_requires_idle_window_and_can_defer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            current = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+            scheduler = ProactiveScheduler(
+                Path(temp) / "state.db",
+                ProactiveConfig(
+                    base_interval_sec=10,
+                    min_idle_sec=8,
+                    max_idle_sec=600,
+                ),
+                "s_presence",
+                clock=lambda: current[0],
+            )
+            self.assertEqual(scheduler.presence_gate(), (True, None))
+            scheduler.user_activity()
+            current[0] += timedelta(seconds=5)
+            self.assertEqual(scheduler.presence_gate(), (False, 5.0))
+            current[0] += timedelta(seconds=5)
+            allowed, idle = scheduler.presence_gate()
+            self.assertTrue(allowed)
+            self.assertEqual(idle, 10.0)
+            current[0] += timedelta(seconds=700)
+            self.assertFalse(scheduler.presence_gate()[0])
+            self.assertEqual(scheduler.defer(30), 30)
+            self.assertAlmostEqual(scheduler.seconds_until_due(), 30)
             scheduler.close()
 
         self.assertEqual(
@@ -181,6 +230,106 @@ class ProactiveTests(unittest.TestCase):
             self.assertIn("咖啡", text)
             self.assertIn("咖啡", model.last_user_prompt)
             self.assertEqual(meta["preference_count"], 1)
+            self.assertEqual(meta["generation_mode"], "model")
+            memory.close()
+
+    def test_model_failure_does_not_send_template(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            model = FailingModel()
+            service = ProactiveService(
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                scope="/project/example",
+                config=ProactiveConfig(),
+            )
+
+            with self.assertRaises(ModelError) as raised:
+                service.generate(sequence_index=0)
+
+            self.assertIn("本次不发送", str(raised.exception))
+            self.assertIn("test model unavailable", str(raised.exception))
+            memory.close()
+
+    def test_message_generation_uses_configured_persona(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            model = FakeModel()
+            service = ProactiveService(
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                scope="/project/example",
+                config=ProactiveConfig(),
+                persona=PersonaConfig(
+                    name="苏诺",
+                    prompt="苏诺声音软软的，会自然撒娇，也很暖心。",
+                    examples=("这句夸我收下啦，正事也会认真做。",),
+                ),
+            )
+
+            service.generate()
+
+            self.assertIn("你是苏诺的主动陪伴模块", model.last_system_prompt)
+            self.assertIn("声音软软的", model.last_system_prompt)
+            self.assertIn("语气示例", model.last_system_prompt)
+            self.assertIn("陪伴情境和最近对话", model.last_system_prompt)
+            self.assertIn("不要退回固定问候", model.last_system_prompt)
+            self.assertIn("延续人物设定", model.last_system_prompt)
+            self.assertIn("禁止客服腔", model.last_system_prompt)
+            memory.close()
+
+    def test_repeated_model_output_is_not_sent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            model = FakeModel()
+            service = ProactiveService(
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                scope="/project/example",
+                config=ProactiveConfig(),
+            )
+
+            with self.assertRaises(ModelError) as raised:
+                service.generate(
+                    recent_messages=["今天想和你聊点轻松的。"],
+                    sequence_index=0,
+                )
+
+            self.assertIn("与最近内容重复", str(raised.exception))
+            memory.close()
+
+    def test_generation_uses_presence_intent_presentation_and_temperature(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            model = FakeModel()
+            service = ProactiveService(
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                scope="/project/example",
+                config=ProactiveConfig(),
+                random_source=random.Random(7),
+            )
+
+            text, meta = service.generate(
+                sequence_index=0,
+                presence=PresenceContext(
+                    idle_seconds=42,
+                    foreground_app="Terminal",
+                    activity="刚结束一段任务",
+                ),
+            )
+
+            self.assertLessEqual(len(text), 40)
+            self.assertIn(meta["intent"], {"care", "curious", "playful"})
+            self.assertIn("本轮表达意图", model.last_user_prompt)
+            self.assertIn("Terminal", model.last_user_prompt)
+            self.assertIn("刚结束一段任务", model.last_user_prompt)
+            self.assertEqual(meta["presence"]["idle_seconds"], 42)
+            self.assertEqual(
+                meta["presentation"],
+                {"characters_per_second": 28, "bubble_seconds": 15},
+            )
+            self.assertEqual(model.last_temperature, 0.85)
             memory.close()
 
     def test_default_topic_schedule_matches_requested_weights(self) -> None:
@@ -444,7 +593,7 @@ class ProactiveTests(unittest.TestCase):
             self.assertIn("已确认一条最近的项目记忆仍未完成", model.last_user_prompt)
             memory.close()
 
-    def test_non_work_message_is_compact_casual_phrase(self) -> None:
+    def test_task_like_casual_output_is_not_sent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             memory = MemoryStore(Path(temp) / "memory.db")
             model = VerboseModel()
@@ -456,17 +605,29 @@ class ProactiveTests(unittest.TestCase):
             )
             schedule = proactive_topic_schedule()
 
-            text, meta = service.generate(
-                sequence_index=schedule.index("daily_emotion")
-            )
+            with self.assertRaises(ModelError) as raised:
+                service.generate(sequence_index=schedule.index("daily_emotion"))
 
-            self.assertEqual(meta["topic"], "daily_emotion")
-            self.assertLessEqual(len(text), 40)
-            self.assertNotIn("\n", text)
-            self.assertNotIn("##", text)
-            self.assertNotIn("建议", text)
+            self.assertIn("任务式内容", str(raised.exception))
             self.assertIn("除工作门槛", model.last_system_prompt)
             self.assertIn("最多两句", model.last_system_prompt)
+            memory.close()
+
+    def test_assistant_tone_is_not_sent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            service = ProactiveService(
+                model=AssistantToneModel(),  # type: ignore[arg-type]
+                memory=memory,
+                scope="/project/example",
+                config=ProactiveConfig(),
+            )
+            schedule = proactive_topic_schedule()
+
+            with self.assertRaises(ModelError) as raised:
+                service.generate(sequence_index=schedule.index("daily_emotion"))
+
+            self.assertIn("助手腔", str(raised.exception))
             memory.close()
 
     def test_delivered_message_becomes_self_share_memory(self) -> None:
@@ -507,7 +668,7 @@ class ProactiveTests(unittest.TestCase):
             self.assertIn(meta["topic"], rows[0]["tags"].split(","))
             self.assertIn('"message_id": "p_msg_1"', rows[0]["metadata"])
             self.assertIn('"workspace": "/project/example"', rows[0]["metadata"])
-            self.assertTrue(meta["persona_traits_updated"])
+            self.assertEqual(meta["persona_traits_updated"], [])
 
             service.record_delivery(
                 "记得慢慢来呀。",
@@ -523,7 +684,26 @@ class ProactiveTests(unittest.TestCase):
             )
             service.generate(sequence_index=1)
             self.assertIn("Sunus 最近主动分享", model.last_user_prompt)
-            self.assertIn("会留意并关心对方的日常与情绪", model.last_user_prompt)
+            self.assertIn("记得慢慢来呀", model.last_user_prompt)
+            self.assertNotIn(
+                "会留意并关心对方的日常与情绪",
+                model.last_user_prompt,
+            )
+
+            opted_in = ProactiveService(
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                scope="/project/example",
+                config=ProactiveConfig(),
+                persona=PersonaConfig(learn_from_self_share=True),
+            )
+            opted_in.record_delivery(
+                "记得慢慢来呀。",
+                meta,
+                message_id="p_msg_opt_in",
+                trigger="test_opt_in",
+            )
+            self.assertTrue(meta["persona_traits_updated"])
             memory.close()
 
     def test_five_memory_categories_follow_eligible_weighted_schedule(self) -> None:
