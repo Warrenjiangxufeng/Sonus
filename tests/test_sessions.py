@@ -124,5 +124,85 @@ class SessionTests(unittest.TestCase):
             self.assertIn('"type": "fork"', forked.path.read_text(encoding="utf-8"))
 
 
+    def test_receipt_omits_text_already_stored_as_message(self) -> None:
+        # 同一回合同样的正文既写成 assistant 消息又写进回执时，回执不再存一份，
+        # 否则渲染端把两条记录各显示一遍，看上去就是回复了两条。
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            session = SessionLogger("s_test", root, root / ".data")
+            session.append("user", {"turn_id": "t1", "text": "问题"})
+            session.append(
+                "message",
+                {
+                    "turn_id": "t1",
+                    "message": {"role": "assistant", "content": "同一段正文"},
+                },
+            )
+            receipt = session.receipt(
+                turn_id="t1",
+                user_input="问题",
+                final_text="同一段正文",
+                tool_traces=[],
+                changed_files=[],
+                reason="completed",
+            )
+
+            self.assertEqual(receipt["final_text"], "")
+            self.assertTrue(receipt["final_text_from_message"])
+            transcript = load_session(session.path)
+            self.assertEqual(
+                [m["content"] for m in transcript.messages if m["role"] == "assistant"],
+                ["同一段正文"],
+            )
+
+    def test_receipt_keeps_text_when_it_differs_from_message(self) -> None:
+        # 回执带有消息没有的补充时照常保存
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            session = SessionLogger("s_test", root, root / ".data")
+            session.append("user", {"turn_id": "t1", "text": "问题"})
+            session.append(
+                "message",
+                {
+                    "turn_id": "t1",
+                    "message": {"role": "assistant", "content": "正文"},
+                },
+            )
+            receipt = session.receipt(
+                turn_id="t1",
+                user_input="问题",
+                final_text="正文\n\n- 补充依据",
+                tool_traces=[],
+                changed_files=[],
+                reason="completed",
+            )
+
+            self.assertEqual(receipt["final_text"], "正文\n\n- 补充依据")
+            self.assertNotIn("final_text_from_message", receipt)
+
+    def test_receipt_text_kept_when_message_from_other_turn(self) -> None:
+        # 跨回合不复用去重判断
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            session = SessionLogger("s_test", root, root / ".data")
+            session.append(
+                "message",
+                {
+                    "turn_id": "t1",
+                    "message": {"role": "assistant", "content": "上一轮正文"},
+                },
+            )
+            receipt = session.receipt(
+                turn_id="t2",
+                user_input="新问题",
+                final_text="上一轮正文",
+                tool_traces=[],
+                changed_files=[],
+                reason="completed",
+            )
+
+            self.assertEqual(receipt["final_text"], "上一轮正文")
+
+
 if __name__ == "__main__":
     unittest.main()

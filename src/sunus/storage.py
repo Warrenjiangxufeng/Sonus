@@ -191,6 +191,9 @@ class SessionLogger:
     ) -> None:
         self.session_id = session_id
         self._secret = secret
+        # 记录本回合最后一条 assistant 正文，用于回执去重
+        self._last_assistant_text = ""
+        self._last_assistant_turn = ""
         if path is not None:
             self.path = path
             self.root = path.parent
@@ -210,6 +213,13 @@ class SessionLogger:
         self.path = self.root / f"{session_id}.jsonl"
 
     def append(self, record_type: str, payload: Any) -> None:
+        if record_type == "message" and isinstance(payload, dict):
+            message = payload.get("message")
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                content = message.get("content")
+                if isinstance(content, str):
+                    self._last_assistant_text = content
+                    self._last_assistant_turn = str(payload.get("turn_id") or "")
         record = {
             "type": record_type,
             "ts": utc_now(),
@@ -234,19 +244,28 @@ class SessionLogger:
         metrics: dict[str, Any] | None = None,
         structured_result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        stored_text = redact_text(final_text, self._secret)[:6000]
+        # 回执正文与同回合的 assistant 消息逐字相同时不再重复落盘，
+        # 否则渲染端把 message 与 receipt 各显示一遍，看起来就是回复了两条。
+        duplicated = bool(stored_text) and (
+            turn_id == self._last_assistant_turn
+            and stored_text == redact_text(self._last_assistant_text, self._secret)[:6000]
+        )
         receipt = {
             "receipt_id": f"r_{uuid.uuid4().hex[:12]}",
             "turn_id": turn_id,
             "session_id": self.session_id,
             "reason": reason,
             "user_input": redact_text(user_input, self._secret)[:2000],
-            "final_text": redact_text(final_text, self._secret)[:6000],
+            "final_text": "" if duplicated else stored_text,
             "tools": redact_value(tool_traces, self._secret),
             "changed_files": changed_files,
             "metrics": redact_value(metrics or {}, self._secret),
             "result": redact_value(structured_result or {}, self._secret),
             "created_at": utc_now(),
         }
+        if duplicated:
+            receipt["final_text_from_message"] = True
         self.append("receipt", receipt)
         return receipt
 
