@@ -992,6 +992,7 @@ class Agent:
         reason = "completed"
         last_finish_reason = ""
         last_reasoning_characters = 0
+        last_request_max_tokens = 0
         output_retry_used = False
         protocol_retry_used = False
         structured_result: dict[str, Any] | None = None
@@ -1034,17 +1035,8 @@ class Agent:
                             else "已注入恢复策略提示"
                         ),
                     )
-                self.events.emit(
-                    "model_request",
-                    turn_id=turn_id,
-                    step=controller.model_calls,
-                    summary=f"调用 {self.config.model}",
-                )
                 response_limit = (
-                    min(
-                        self.config.max_tokens,
-                        self.config.loop_budget.max_response_tokens,
-                    )
+                    self.config.max_tokens
                     if output_retry_used
                     else 512
                     if conversation
@@ -1060,12 +1052,18 @@ class Agent:
                     if controller.finalizing
                     else available_tool_schemas
                 )
+                request_max_tokens = min(self.config.max_tokens, response_limit)
+                last_request_max_tokens = request_max_tokens
+                self.events.emit(
+                    "model_request",
+                    turn_id=turn_id,
+                    step=controller.model_calls,
+                    max_tokens=request_max_tokens,
+                    summary=f"调用 {self.config.model}",
+                )
                 model_kwargs = {
                     "tools": request_tools,
-                    "max_tokens": min(
-                        self.config.max_tokens,
-                        response_limit,
-                    ),
+                    "max_tokens": request_max_tokens,
                 }
                 chat_stream = getattr(self.model, "chat_stream", None)
                 stream_guard: _SafeStreamBuffer | None = None
@@ -1200,11 +1198,20 @@ class Agent:
                         f"{self._runtime_policy_prompt}\n{retry_policy}".strip()
                     )
                     self._apply_system_message()
+                    next_max_tokens = self.config.max_tokens
+                    expanded = next_max_tokens > last_request_max_tokens
                     self.events.emit(
                         "model_output_retry",
                         turn_id=turn_id,
                         reason="visible_output_empty",
-                        summary="正文为空，扩大输出预算后重试",
+                        previous_max_tokens=last_request_max_tokens,
+                        next_max_tokens=next_max_tokens,
+                        expanded=expanded,
+                        summary=(
+                            "正文为空，提高输出上限后重试"
+                            if expanded
+                            else "正文为空，强化终态提示后重试"
+                        ),
                     )
                     continue
                 if (

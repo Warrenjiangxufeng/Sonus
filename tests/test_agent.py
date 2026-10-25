@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import time
@@ -1449,16 +1450,30 @@ class AgentTests(unittest.TestCase):
                 session=session,
             )
 
-            result = agent.run_turn("哈喽在干嘛")
+            result = agent.run_turn("修复测试并提交")
 
             self.assertEqual(result.reason, "completed")
             self.assertEqual(result.text, "直接回答。")
             self.assertEqual(model.calls, 2)
-            self.assertEqual(model.last_max_tokens, [512, 8192])
-            self.assertIn(
-                "model_output_retry",
-                events.path.read_text(encoding="utf-8"),
+            self.assertEqual(model.last_max_tokens, [8192, 16_384])
+            event_rows = [
+                json.loads(line)
+                for line in events.path.read_text(encoding="utf-8").splitlines()
+            ]
+            requests = [
+                row for row in event_rows if row.get("type") == "model_request"
+            ]
+            self.assertEqual(
+                [row["max_tokens"] for row in requests],
+                [8192, 16_384],
             )
+            retries = [
+                row for row in event_rows if row.get("type") == "model_output_retry"
+            ]
+            self.assertEqual(len(retries), 1)
+            self.assertEqual(retries[0]["previous_max_tokens"], 8192)
+            self.assertEqual(retries[0]["next_max_tokens"], 16_384)
+            self.assertTrue(retries[0]["expanded"])
             memory.close()
 
     def test_thinking_interrupt_preserves_prior_file_changes(self) -> None:
