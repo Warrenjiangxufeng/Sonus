@@ -33,14 +33,16 @@ _MUTATION_PATTERN = re.compile(
 )
 _COMMAND_PATTERN = re.compile(
     r"(?:运行|执行|测试|构建|编译|启动|安装|检查|扫描|查找|搜索|"
-    r"跑一下|跑一遍|验证|git|pytest|run|test|build|install|scan|check|"
+    r"跑一下|跑一遍|验证|查看网页|读取网页|浏览器|标签页|"
+    r"网页.{0,8}(?:展示|内容|文本)|"
+    r"git|pytest|run|test|build|install|scan|check|"
     r"(?:^|[，,。.!！？?\s]|就|快|给我)装(?:一下|上|好|个|吧|啊)?"
     r"(?=$|[，,。.!！？?\s]))",
     re.IGNORECASE,
 )
 _NETWORK_PATTERN = re.compile(
-    r"(?:访问|下载|请求|联网|网络|搜索|搜一下|搜搜|查一下|网页|"
-    r"打开网址|抓取|"
+    r"(?:访问|下载|请求|联网|网络|搜索|搜一下|搜搜|查一下|"
+    r"(?<!已)打开网页|访问网页|抓取网页|网页地址|"
     r"download|fetch|request|http)",
     re.IGNORECASE,
 )
@@ -82,6 +84,7 @@ class RequestScope:
     allows_commands: bool
     allows_network: bool
     allows_suggestions: bool
+    required_capabilities: frozenset[str] = frozenset()
 
 
 def _positive_action(pattern: re.Pattern[str], text: str) -> bool:
@@ -104,17 +107,27 @@ def classify_request(text: str) -> RequestScope:
     allows_commands = (
         side_effect_allowed and _positive_action(_COMMAND_PATTERN, stripped)
     ) or confirm_only
+    allows_network = (
+        side_effect_allowed and _positive_action(_NETWORK_PATTERN, stripped)
+    ) or confirm_only
+    required: set[str] = set()
+    if allows_mutation:
+        required.add("write")
+    if allows_commands:
+        required.add("command")
+    if allows_network:
+        required.add("network")
+    if allows_mutation and re.search(r"(?:测试|验证|运行|pytest|unittest)", stripped):
+        required.add("command")
     return RequestScope(
         text=stripped,
         allows_mutation=allows_mutation,
         # 代码修改必须能够运行对应测试，否则 Agent 只能盲改。
         allows_commands=allows_commands or allows_mutation,
-        allows_network=(
-            side_effect_allowed and _positive_action(_NETWORK_PATTERN, stripped)
-        )
-        or confirm_only,
+        allows_network=allows_network,
         allows_suggestions=question
         or bool(_SUGGESTION_PATTERN.search(stripped)),
+        required_capabilities=frozenset(required),
     )
 
 
@@ -144,7 +157,13 @@ def classify_request_with_context(
         allows_mutation=scope.allows_mutation or previous.allows_mutation,
         allows_commands=scope.allows_commands or previous.allows_commands,
         allows_network=scope.allows_network or previous.allows_network,
+        required_capabilities=scope.required_capabilities
+        | previous.required_capabilities,
     )
+
+
+def is_referential_followup(text: str) -> bool:
+    return bool(_REFERENTIAL_FOLLOWUP.search(str(text or "")))
 
 
 def is_casual_conversation(

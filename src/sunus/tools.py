@@ -24,7 +24,13 @@ from sunus.documents import DOCUMENT_PROFILES, render_document
 from sunus.environment import discover_environment, login_shell, shell_invocation
 from sunus.events import EventBus
 from sunus.memory import MemoryStore
-from sunus.policy import ApprovalManager, PathGuard, PolicyError, command_denial_reason
+from sunus.policy import (
+    ApprovalManager,
+    PathGuard,
+    PolicyError,
+    command_denial_reason,
+    normalize_capabilities,
+)
 from sunus.scope import RequestScope, classify_request_with_context
 from sunus.skills import SKILLS_DIRNAME, SkillLibrary
 from sunus.storage import ArtifactStore
@@ -419,9 +425,9 @@ def tool_schemas() -> list[dict[str, Any]]:
                 "capability": {
                     "type": "string",
                     "enum": [
-                        "mutation",
-                        "mutation_and_commands",
-                        "commands",
+                        "write",
+                        "write_and_command",
+                        "command",
                         "network",
                     ],
                 },
@@ -1232,25 +1238,20 @@ class ToolExecutor:
     def _request_authorization(self, args: dict[str, Any]) -> ToolResult:
         capability = str(args.get("capability") or "").strip()
         reason = str(args.get("reason") or "").strip()
-        allowed = {
-            "mutation",
-            "mutation_and_commands",
-            "commands",
-            "network",
-        }
-        if capability not in allowed:
+        if capability in {"mutation_and_commands", "write_and_command"}:
+            requested = {"write", "command"}
+        elif capability in {"mutation", "commands"}:
+            requested = (
+                {"write"} if capability == "mutation" else {"command"}
+            )
+        else:
+            requested = normalize_capabilities([capability])
+        if not requested:
             return ToolResult(False, "未知授权类型")
         if self.request_scope is None:
             return ToolResult(False, "当前没有可扩展的任务范围")
         if not reason:
             return ToolResult(False, "授权请求缺少原因")
-        requested = (
-            {"write", "command"}
-            if capability == "mutation_and_commands"
-            else {"write"}
-            if capability == "mutation"
-            else {capability}
-        )
         states = self.approvals.permission_state()
         denied = sorted(item for item in requested if states.get(item) == "deny")
         if denied:
@@ -1280,14 +1281,14 @@ class ToolExecutor:
         if not approved:
             return ToolResult(False, "用户拒绝扩大任务授权")
 
-        mutation = capability in {"mutation", "mutation_and_commands"}
-        commands = capability in {"commands", "mutation_and_commands"} or mutation
+        mutation = "write" in requested
+        commands = "command" in requested
         self.request_scope = replace(
             self.request_scope,
             allows_mutation=self.request_scope.allows_mutation or mutation,
             allows_commands=self.request_scope.allows_commands or commands,
             allows_network=self.request_scope.allows_network
-            or capability == "network",
+            or "network" in requested,
         )
         return ToolResult(
             True,

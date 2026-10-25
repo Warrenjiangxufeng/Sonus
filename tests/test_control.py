@@ -264,6 +264,27 @@ class TurnControllerTests(unittest.TestCase):
         right = TurnController._error_fingerprint("fetch_url", second)
         self.assertEqual(left, right)
 
+    def test_error_fingerprint_attributes_failure_before_recovery(self) -> None:
+        family, _detail, _label = TurnController._error_fingerprint(
+            "run_command",
+            "当前用户消息没有明确要求该副作用操作",
+        )
+        self.assertEqual(family, "authorization")
+        self.assertEqual(
+            TurnController._error_fingerprint(
+                "read_file",
+                "FileNotFoundError: no such file",
+            )[0],
+            "path",
+        )
+        self.assertEqual(
+            TurnController._error_fingerprint(
+                "run_command",
+                "exit_code=1\nAssertionError: expected 2",
+            )[0],
+            "verification",
+        )
+
     def test_transient_output_noise_does_not_count_as_progress(self) -> None:
         controller = TurnController(LoopBudgetConfig())
         controller.before_model_call()

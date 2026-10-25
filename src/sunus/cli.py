@@ -1521,6 +1521,7 @@ def run_repl(
             components.agent.restore_messages(
                 transcript.messages,
                 summary=transcript.summary,
+                task_state=transcript.task_state,
             )
             if forked_from is not None:
                 copy_transcript_messages(
@@ -1638,6 +1639,7 @@ def run_exec(
             components.agent.restore_messages(
                 transcript.messages,
                 summary=transcript.summary,
+                task_state=transcript.task_state,
             )
             if forked_from is not None:
                 copy_transcript_messages(

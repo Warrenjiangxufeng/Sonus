@@ -167,6 +167,31 @@ class ToolTests(unittest.TestCase):
             self.assertTrue(executor.request_scope.allows_mutation)
             self.assertTrue(executor.request_scope.allows_commands)
 
+    def test_command_authorization_is_not_confused_with_network(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root, interactive=True)
+            executor.begin_request("访问网页")
+            self.assertTrue(executor.request_scope.allows_network)
+            self.assertFalse(executor.request_scope.allows_commands)
+
+            with (
+                patch("sunus.policy._choose_approval_option", return_value=0),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                result = executor.execute(
+                    "request_authorization",
+                    {
+                        "capability": "commands",
+                        "reason": "需要运行浏览器命令",
+                    },
+                )
+
+            self.assertTrue(result.ok)
+            self.assertTrue(executor.request_scope.allows_commands)
+            self.assertTrue(executor.request_scope.allows_network)
+
     def test_command_timeout_terminates_the_process_group(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             executor = self.make_executor(Path(temp))

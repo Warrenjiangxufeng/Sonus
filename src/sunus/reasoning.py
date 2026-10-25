@@ -18,6 +18,11 @@ _STATUS_QUERY_PATTERN = re.compile(
     r"(?:提交|推送|同步).{0,16}(?:没有|没|吗|状态|完成))",
     re.IGNORECASE,
 )
+_COMPLEX_PATTERN = re.compile(
+    r"(?:为什么|根因|排查|诊断|崩溃|熔断|异常|失败|修复|实现|重构|"
+    r"迁移|架构|多步骤|全量测试|浏览器|跨轮|排查机制)",
+    re.IGNORECASE,
+)
 
 
 def is_diagnostic_request(text: str) -> bool:
@@ -29,6 +34,21 @@ def is_status_query_request(text: str) -> bool:
     return bool(_STATUS_QUERY_PATTERN.search(value)) and not is_diagnostic_request(
         value
     )
+
+
+def is_complex_request(text: str) -> bool:
+    value = str(text or "")
+    return bool(_COMPLEX_PATTERN.search(value)) and not is_status_query_request(
+        value
+    )
+
+
+def complex_task_prompt() -> str:
+    return """本轮属于复杂任务。在第一次工具调用前先完成内部规划：
+1. 明确目标、约束、所需能力、成功判据和停止条件。
+2. 按信息增益排序候选路径；优先用一个检查区分多个假设。
+3. 工具失败后先归因（权限、路径、环境、模型、验证失败），再决定换路径；不要重复同一假设。
+4. 已有证据足以回答，或两个以上候选无法区分时立即收束；如果缺少时间、对象或权限，直接询问一次。"""
 
 
 def status_query_prompt() -> str:

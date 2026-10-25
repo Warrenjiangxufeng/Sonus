@@ -336,15 +336,32 @@ class TurnController:
             reverse=True,
         )[:4]
         error_lines = [
-            f"- {item.tool_label}: {item.label[:240]}（{item.count} 次）"
+            f"- [{item.family}] {item.tool_label}: "
+            f"{item.label[:240]}（{item.count} 次）"
             for item in errors
         ]
+        families = {item.family for item in errors}
+        guidance: list[str] = []
+        if "authorization" in families:
+            guidance.append(
+                "权限失败：调用 request_authorization，或一次性说明缺少的具体能力。"
+            )
+        if "path" in families:
+            guidance.append("路径失败：先列父目录或确认候选路径，再读取。")
+        if "timeout" in families:
+            guidance.append("超时：缩小范围或降低单次工作量，不要原样重试。")
+        if "model" in families:
+            guidance.append("模型失败：保留已有证据，收口或等待用户重试。")
+        if "verification" in families:
+            guidance.append("验证失败：读取首个真实错误，区分代码、环境和权限。")
         blocked = sorted(self.blocked_tools.values())[:6]
         return (
             "运行控制恢复检查点："
             f"{reason}。停止重复已经失败的步骤，重新评估假设。\n"
             "最近失败：\n"
             + ("\n".join(error_lines) or "- 无明确错误，但缺少新证据")
+            + "\n失败归因后的候选路径：\n"
+            + ("\n".join(f"- {item}" for item in guidance) or "- 无")
             + "\n禁止重复的工具调用指纹：\n"
             + ("\n".join(f"- {value}" for value in blocked) or "- 无")
             + "\n请给出一个新的、最小可验证动作，并明确成功判据。"
@@ -475,8 +492,18 @@ class TurnController:
             r"\b([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception))\b",
             detail,
         )
-        if exit_code is not None:
+        if re.search(r"没有明确要求|用户拒绝|授权|permission denied|forbidden", detail):
+            family = "authorization"
+        elif re.search(r"not found|no such file|路径不存在", detail, re.IGNORECASE):
+            family = "path"
+        elif re.search(r"timeout|timed out|超时", detail, re.IGNORECASE):
+            family = "timeout"
+        elif re.search(r"modelerror|model error|模型调用失败", detail, re.IGNORECASE):
+            family = "model"
+        elif exit_code is not None:
             family = f"exit:{exit_code}"
+            if exit_code != 0:
+                family = "verification"
         elif exception:
             family = exception.group(1)
         else:

@@ -518,7 +518,7 @@ class AuthorizationThenResultModel:
         if self.calls == 1:
             name = "request_authorization"
             arguments = (
-                '{"capability":"mutation_and_commands",'
+                '{"capability":"write_and_command",'
                 '"reason":"需要修改代码并运行测试"}'
             )
         else:
@@ -526,6 +526,49 @@ class AuthorizationThenResultModel:
             arguments = (
                 '{"kind":"answer","status":"completed",'
                 '"summary":"授权后已完成。"}'
+            )
+        return ModelReply(
+            message={
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": f"call_{self.calls}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            },
+            usage={"total_tokens": 5},
+            finish_reason="tool_calls",
+        )
+
+
+class CommandAuthorizationThenRunModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.calls += 1
+        available = {item["function"]["name"] for item in tools or []}
+        if self.calls == 1:
+            name = "request_authorization"
+            arguments = (
+                '{"capability":"command",'
+                '"reason":"需要运行浏览器检查命令"}'
+            )
+        elif self.calls == 2:
+            self.assert_available = "run_command" in available
+            name = "run_command"
+            arguments = '{"command":"printf command-ok"}'
+        else:
+            name = "submit_result"
+            arguments = (
+                '{"kind":"answer","status":"completed",'
+                '"summary":"命令授权和循环正常。"}'
             )
         return ModelReply(
             message={
@@ -680,7 +723,9 @@ class AgentTests(unittest.TestCase):
             self.assertTrue(memory.recent(scope=str(root.resolve()), limit=5))
             self.assertEqual(result.structured_result["kind"], "answer")
             self.assertEqual(result.structured_result["next_action"], "")
-            self.assertIn('"result"', session.path.read_text(encoding="utf-8"))
+            session_text = session.path.read_text(encoding="utf-8")
+            self.assertIn('"result"', session_text)
+            self.assertIn('"type": "task_state"', session_text)
             events_text = events.path.read_text(encoding="utf-8")
             self.assertIn("task_grant_started", events_text)
             self.assertIn("task_grant_ended", events_text)
@@ -691,6 +736,7 @@ class AgentTests(unittest.TestCase):
             self.assertIn("输出规范", model.last_messages[0]["content"])
             self.assertIn("结论先行", model.last_messages[0]["content"])
             self.assertIn("任务边界", model.last_messages[0]["content"])
+            self.assertIn("持久任务状态", model.last_messages[0]["content"])
             self.assertIn(
                 "多个互相独立的只读检查必须在同一轮 `tool_calls` 中批量发起",
                 model.last_messages[0]["content"],
@@ -869,6 +915,63 @@ class AgentTests(unittest.TestCase):
             self.assertNotIn("patch_file", model.tool_name_sets[0])
             self.assertIn("patch_file", model.tool_name_sets[1])
             self.assertIn("run_command", model.tool_name_sets[1])
+            memory.close()
+
+    def test_command_authorization_does_not_circuit_on_network_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=5,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_command_auth", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=True,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+            )
+            model = CommandAuthorizationThenRunModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            with (
+                patch("sunus.policy._choose_approval_option", return_value=0),
+                patch("sunus.policy.sys.stdin.isatty", return_value=True),
+            ):
+                result = agent.run_turn("查看网页的展示内容")
+
+            self.assertEqual(result.reason, "completed")
+            self.assertTrue(model.assert_available)
+            self.assertTrue(
+                any(
+                    trace["name"] == "run_command" and trace["ok"]
+                    for trace in result.tool_traces
+                )
+            )
+            self.assertNotIn(
+                '"type": "circuit_open"',
+                events.path.read_text(encoding="utf-8"),
+            )
             memory.close()
 
     def test_textual_dsml_result_is_converted_and_executed(self) -> None:

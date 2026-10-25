@@ -99,6 +99,16 @@ class RequestScopeTests(unittest.TestCase):
         self.assertEqual(conversation_hint("加点卖萌的元素"), "ambiguous")
         self.assertEqual(conversation_hint("分析当前项目架构"), "task")
 
+    def test_open_browser_content_requires_command_not_network(self) -> None:
+        scope = classify_request("查看已打开网页的展示内容，不是让你自己算")
+        self.assertTrue(scope.allows_commands)
+        self.assertFalse(scope.allows_network)
+        self.assertEqual(scope.required_capabilities, {"command"})
+
+        online = classify_request("访问网页并抓取内容")
+        self.assertTrue(online.allows_network)
+        self.assertIn("network", online.required_capabilities)
+
     def test_referential_followup_inherits_only_proposed_capability(self) -> None:
         previous = (
             "我手里确实有联网工具，只是默认关着。"

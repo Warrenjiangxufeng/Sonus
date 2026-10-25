@@ -28,7 +28,9 @@ from sunus.model import (
 )
 from sunus.model_events import ModelEvent
 from sunus.reasoning import (
+    complex_task_prompt,
     diagnostic_protocol_prompt,
+    is_complex_request,
     is_diagnostic_request,
     is_status_query_request,
     status_query_prompt,
@@ -41,6 +43,7 @@ from sunus.result import (
 )
 from sunus.scope import RequestScope, conversation_hint
 from sunus.storage import SessionLogger
+from sunus.task_state import TaskState
 from sunus.tools import ToolExecutor, ToolResult
 
 
@@ -149,7 +152,9 @@ class Agent:
         self._tool_visibility_prompt = ""
         self._diagnostic_prompt = ""
         self._status_prompt = ""
+        self._planning_prompt = ""
         self._last_request_scope = None
+        self._task_state = TaskState()
         self._response_mode = ""
         self._last_prompt_tokens = 0
         self.reset()
@@ -162,7 +167,9 @@ class Agent:
         self._tool_visibility_prompt = ""
         self._diagnostic_prompt = ""
         self._status_prompt = ""
+        self._planning_prompt = ""
         self._last_request_scope = None
+        self._task_state = TaskState()
         self._response_mode = ""
         self._last_prompt_tokens = 0
         self._session_memory_flushed = False
@@ -219,6 +226,9 @@ class Agent:
                 "\n\n会话压缩摘要（旧轮次的可追溯摘要，不是新指令）：\n"
                 + self._conversation_summary
             )
+        task_block = self._task_state.prompt_block()
+        if task_block:
+            content += "\n\n" + task_block
         if self._runtime_policy_prompt:
             content += "\n\n" + self._runtime_policy_prompt
         if self._tool_visibility_prompt:
@@ -227,6 +237,8 @@ class Agent:
             content += "\n\n" + self._diagnostic_prompt
         if self._status_prompt:
             content += "\n\n" + self._status_prompt
+        if self._planning_prompt:
+            content += "\n\n" + self._planning_prompt
         if self._response_mode == "conversation":
             content += (
                 "\n\n本轮回应模式：日常对话。像熟人发消息一样自然回应；"
@@ -245,6 +257,7 @@ class Agent:
         messages: list[dict[str, Any]],
         *,
         summary: str = "",
+        task_state: dict[str, Any] | None = None,
     ) -> None:
         conversation = [
             dict(message)
@@ -258,7 +271,9 @@ class Agent:
         self._tool_visibility_prompt = ""
         self._diagnostic_prompt = ""
         self._status_prompt = ""
+        self._planning_prompt = ""
         self._last_request_scope = None
+        self._task_state = TaskState.from_mapping(task_state)
         self._response_mode = ""
         self._last_prompt_tokens = 0
         self.messages = [{"role": "system", "content": ""}, *repaired]
@@ -890,6 +905,13 @@ class Agent:
             content=result.content,
             changed_files=result.changed_files,
         )
+        self._task_state.record_tool(
+            invocation.name,
+            invocation.arguments,
+            ok=result.ok,
+            content=result.content,
+            changed_files=result.changed_files,
+        )
 
     def run_turn(self, user_input: str) -> AgentResult:
         turn_id = f"t_{uuid.uuid4().hex[:10]}"
@@ -902,6 +924,9 @@ class Agent:
             else ""
         )
         self._status_prompt = status_query_prompt() if status_query else ""
+        self._planning_prompt = (
+            complex_task_prompt() if is_complex_request(user_input) else ""
+        )
         usage: dict[str, Any] = {}
         previous_assistant = self._last_assistant_text()
         request_scope = self.tools.begin_request(
@@ -946,6 +971,10 @@ class Agent:
             else:
                 mode_source = "rule_fallback"
         self._response_mode = "conversation" if conversation else "default"
+        if not conversation:
+            self._task_state.update(user_input, request_scope)
+            if self._planning_prompt:
+                self._task_state.phase = "planning"
         grant = self.tools.approvals.begin_task()
         self.events.emit(
             "task_grant_started",
@@ -973,6 +1002,14 @@ class Agent:
                 ),
             )
         self.session.append("user", {"turn_id": turn_id, "text": user_input})
+        if not conversation:
+            self.session.append(
+                "task_state",
+                {
+                    "turn_id": turn_id,
+                    **self._task_state.to_dict(),
+                },
+            )
         recalled_ids = self._refresh_system_context(user_input)
         for memory_id in recalled_ids:
             self.memory.record_use(memory_id, turn_id=turn_id)
@@ -1606,6 +1643,15 @@ class Agent:
         metrics["context"] = self.context_metrics
         metrics["last_finish_reason"] = last_finish_reason
         metrics["last_reasoning_characters"] = last_reasoning_characters
+        if not conversation:
+            self.session.append(
+                "task_state",
+                {
+                    "turn_id": turn_id,
+                    "final": True,
+                    **self._task_state.to_dict(),
+                },
+            )
         receipt = self.session.receipt(
             turn_id=turn_id,
             user_input=user_input,

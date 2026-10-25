@@ -3,7 +3,9 @@ from __future__ import annotations
 import unittest
 
 from sunus.reasoning import (
+    complex_task_prompt,
     diagnostic_protocol_prompt,
+    is_complex_request,
     is_diagnostic_request,
     is_status_query_request,
     status_query_prompt,
@@ -54,6 +56,14 @@ class ReasoningTests(unittest.TestCase):
         self.assertIn("只检查用户明确点名的仓库", prompt)
         self.assertIn("备份目录、worktree 和副本不主动审计", prompt)
         self.assertIn("submit_result.details 留空", prompt)
+
+    def test_complex_tasks_get_a_planning_checkpoint(self) -> None:
+        self.assertTrue(is_complex_request("排查上次为什么崩溃并修复"))
+        self.assertFalse(is_complex_request("检查 Git 状态"))
+        prompt = complex_task_prompt()
+        self.assertIn("第一次工具调用前", prompt)
+        self.assertIn("失败后先归因", prompt)
+        self.assertIn("立即收束", prompt)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +21,7 @@ class SessionTranscript:
     messages: list[dict[str, Any]]
     summary: str
     turns: int
+    task_state: dict[str, Any] = field(default_factory=dict)
 
 
 def _session_roots(workspace: Path, data_dir: Path) -> list[Path]:
@@ -115,6 +116,7 @@ def load_session(path: Path) -> SessionTranscript:
     )
     messages: list[dict[str, Any]] = []
     summary = ""
+    task_state: dict[str, Any] = {}
     turns = 0
     for record in records:
         record_type = record.get("type")
@@ -139,6 +141,23 @@ def load_session(path: Path) -> SessionTranscript:
                     if isinstance(message, dict)
                     and message.get("role") != "system"
                 ]
+        elif record_type == "task_state":
+            task_state = {
+                key: value
+                for key, value in record.items()
+                if key
+                in {
+                    "objective",
+                    "constraints",
+                    "clarifications",
+                    "required_capabilities",
+                    "evidence",
+                    "attempted",
+                    "blocker",
+                    "phase",
+                    "turn_count",
+                }
+            }
         elif record_type == "receipt" and not has_messages:
             final_text = str(record.get("final_text") or "").strip()
             if final_text:
@@ -149,6 +168,7 @@ def load_session(path: Path) -> SessionTranscript:
         messages=messages,
         summary=summary,
         turns=turns,
+        task_state=task_state,
     )
 
 
