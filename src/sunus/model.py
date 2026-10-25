@@ -9,7 +9,7 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from sonus.config import RuntimeConfig, make_ssl_context, redact_text
+from sunus.config import RuntimeConfig, make_ssl_context, redact_text
 
 
 class ModelError(RuntimeError):
@@ -62,7 +62,7 @@ class BaseModelClient:
         if not config.api_key:
             raise ModelError(
                 f"未找到 {self.provider} API key。"
-                "请配置对应的 Provider 凭据，或设置 SONUS_API_KEY。"
+                "请配置对应的 Provider 凭据，或设置 SUNUS_API_KEY。"
             )
         self._context = make_ssl_context()
         self._cancel_event = threading.Event()
@@ -115,7 +115,7 @@ class BaseModelClient:
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
             "Accept": "application/json",
-            "User-Agent": "Sonus/0.1",
+            "User-Agent": "Sunus/0.1",
         }
         if self.provider == "openai":
             organization = self.config.model_settings.options_as_dict().get(

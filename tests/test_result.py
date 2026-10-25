@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from sonus.result import (
+from sunus.result import (
     ResultEnvelope,
     fallback_result,
     normalize_result,
@@ -20,7 +20,7 @@ class ResultEnvelopeTests(unittest.TestCase):
                 "details": ["结果可复现。"],
                 "changes": [
                     {
-                        "path": "src/sonus/model.py",
+                        "path": "src/sunus/model.py",
                         "action": "modified",
                         "purpose": "处理断连",
                     }
@@ -39,7 +39,7 @@ class ResultEnvelopeTests(unittest.TestCase):
         )
         rendered = render_result(envelope)
         self.assertTrue(rendered.startswith("修复完成。"))
-        self.assertIn("`src/sonus/model.py` · modified", rendered)
+        self.assertIn("`src/sunus/model.py` · modified", rendered)
         self.assertIn("✓ `python3 -m unittest` · 66 项通过", rendered)
 
     def test_rejects_unknown_fields_and_blocked_without_next_action(self) -> None:
@@ -77,10 +77,10 @@ class ResultEnvelopeTests(unittest.TestCase):
             "status": "completed",
             "summary": "记忆体系分三层。",
             "details": ["注入层", "存储层", "记录层", "第四条"],
-            "changes": [{"path": ".sonus", "action": "read"}],
+            "changes": [{"path": ".sunus", "action": "read"}],
             "verification": [
                 {
-                    "command": "read_file .sonus/memory.db",
+                    "command": "read_file .sunus/memory.db",
                     "status": "passed",
                 }
             ],

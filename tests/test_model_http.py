@@ -9,8 +9,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-from sonus.config import ModelSettings, RuntimeConfig
-from sonus.model import (
+from sunus.config import ModelSettings, RuntimeConfig
+from sunus.model import (
     DeepSeekClient,
     ModelCancelled,
     ModelError,
@@ -117,7 +117,7 @@ class ModelHttpTests(unittest.TestCase):
                     base_url=f"http://127.0.0.1:{server.server_port}",
                     model="deepseek-flash",
                 )
-                with patch("sonus.model.time.sleep") as sleep:
+                with patch("sunus.model.time.sleep") as sleep:
                     reply = DeepSeekClient(config).chat(
                         [{"role": "user", "content": "hello"}],
                     )
@@ -144,7 +144,7 @@ class ModelHttpTests(unittest.TestCase):
                     model="deepseek-flash",
                 )
                 with (
-                    patch("sonus.model.time.sleep"),
+                    patch("sunus.model.time.sleep"),
                     self.assertRaises(ModelError) as raised,
                 ):
                     DeepSeekClient(config).chat(
@@ -172,10 +172,10 @@ class ModelHttpTests(unittest.TestCase):
             client = DeepSeekClient(config)
             with (
                 patch(
-                    "sonus.model.DeepSeekClient._open_connection",
+                    "sunus.model.DeepSeekClient._open_connection",
                     side_effect=http.client.RemoteDisconnected("closed"),
                 ) as connection,
-                patch("sonus.model.time.sleep"),
+                patch("sunus.model.time.sleep"),
                 self.assertRaises(ModelError) as raised,
             ):
                 client._request("GET", "/models")
@@ -253,7 +253,7 @@ class ModelHttpTests(unittest.TestCase):
                 self.assertEqual(reply.message["content"], "OK")
                 payload = Handler.last_payload
                 self.assertIsNotNone(payload)
-                self.assertEqual(payload["max_completion_tokens"], 4096)
+                self.assertEqual(payload["max_completion_tokens"], 16_384)
                 self.assertNotIn("max_tokens", payload)
                 self.assertNotIn("temperature", payload)
                 self.assertTrue(payload["reasoning_split"])
@@ -289,7 +289,7 @@ class ModelHttpTests(unittest.TestCase):
                 self.assertEqual(reply.message["content"], "OK")
                 payload = Handler.last_payload
                 self.assertIsNotNone(payload)
-                self.assertEqual(payload["max_completion_tokens"], 4096)
+                self.assertEqual(payload["max_completion_tokens"], 16_384)
                 self.assertNotIn("max_tokens", payload)
                 self.assertNotIn("temperature", payload)
         finally:
@@ -371,7 +371,7 @@ class ModelHttpTests(unittest.TestCase):
             self.assertEqual(method, "POST")
             self.assertEqual(path, "/responses")
             self.assertEqual(payload["instructions"], "系统规则")
-            self.assertEqual(payload["max_output_tokens"], 4096)
+            self.assertEqual(payload["max_output_tokens"], 16_384)
             self.assertEqual(payload["tools"][0]["name"], "read_file")
             self.assertNotIn("function", payload["tools"][0])
             item_types = [item.get("type") for item in payload["input"]]

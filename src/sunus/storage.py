@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sonus.config import redact_text, redact_value
+from sunus.config import redact_text, redact_value
 
 
 def utc_now() -> str:
@@ -25,7 +25,7 @@ class SessionTranscript:
 
 def _session_roots(workspace: Path, data_dir: Path) -> list[Path]:
     roots: list[Path] = []
-    for root in (workspace / ".sonus" / "sessions", data_dir / "sessions"):
+    for root in (workspace / ".sunus" / "sessions", data_dir / "sessions"):
         resolved = root.resolve()
         if resolved not in roots:
             roots.append(resolved)
@@ -155,7 +155,7 @@ def load_session(path: Path) -> SessionTranscript:
 class ArtifactStore:
     def __init__(self, workspace: Path, data_dir: Path, secret: str = "") -> None:
         self._secret = secret
-        preferred = workspace / ".sonus" / "artifacts"
+        preferred = workspace / ".sunus" / "artifacts"
         try:
             preferred.mkdir(parents=True, exist_ok=True)
             preferred.chmod(0o700)
@@ -195,7 +195,7 @@ class SessionLogger:
             self.path = path
             self.root = path.parent
             return
-        preferred = workspace / ".sonus" / "sessions"
+        preferred = workspace / ".sunus" / "sessions"
         try:
             preferred.mkdir(parents=True, exist_ok=True)
             preferred.chmod(0o700)

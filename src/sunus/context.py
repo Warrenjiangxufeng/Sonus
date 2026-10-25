@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from sonus.memory import estimate_tokens
+from sunus.memory import estimate_tokens
 
 
 @dataclass(frozen=True)

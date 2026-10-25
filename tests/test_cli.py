@@ -6,9 +6,14 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from sonus.cli import (
+from sunus.cli import (
+    PendingTerminalInput,
     RuntimeEventRenderer,
     ThinkingStateObserver,
+    _enable_utf8_input,
+    _input_with_initial,
+    _remove_last_grapheme,
+    _read_thinking_key,
     _thinking_interrupt_pressed,
     make_parser,
     print_banner,
@@ -16,6 +21,78 @@ from sonus.cli import (
 
 
 class CliTests(unittest.TestCase):
+    def test_enable_utf8_input_sets_terminal_flag(self) -> None:
+        attributes = [0, 0, 0, 0, 0, 0, []]
+        with (
+            patch("sunus.cli.termios.tcgetattr", return_value=attributes),
+            patch("sunus.cli.termios.tcsetattr") as set_attributes,
+        ):
+            self.assertTrue(_enable_utf8_input(0))
+        self.assertTrue(attributes[0] & 0x4000)
+        set_attributes.assert_called_once()
+
+    def test_pending_terminal_input_edits_utf8_by_character(self) -> None:
+        pending = PendingTerminalInput()
+        pending.feed("你".encode("utf-8"))
+        pending.feed("好".encode("utf-8"))
+        pending.feed(b"\x7f")
+        self.assertEqual(pending.text(), "你")
+        pending.feed("呀".encode("utf-8"))
+        pending.feed(b"\r")
+        self.assertEqual(pending.text(), "你呀")
+
+    def test_remove_last_grapheme_handles_unicode_clusters(self) -> None:
+        self.assertEqual(_remove_last_grapheme("你好"), "你")
+        self.assertEqual(_remove_last_grapheme("e\u0301"), "")
+        self.assertEqual(_remove_last_grapheme("👨‍👩‍👧"), "")
+        self.assertEqual(_remove_last_grapheme("🇨🇳"), "")
+
+    def test_prefilled_input_falls_back_for_non_tty(self) -> None:
+        with (
+            patch("builtins.input", return_value="继续") as read_input,
+            patch("sunus.cli.sys.stdin.isatty", return_value=False),
+        ):
+            result = _input_with_initial("你 › ", "前面的话")
+
+        self.assertEqual(result, "前面的话继续")
+        read_input.assert_called_once_with("你 › ")
+
+    def test_bracketed_paste_is_read_as_one_multiline_buffer(self) -> None:
+        payload = (
+            b"\x1b[200~"
+            + "第一段\n第二段".encode("utf-8")
+            + b"\x1b[201~\n"
+        )
+        output = io.StringIO()
+        with (
+            patch("sunus.cli.sys.stdin.isatty", return_value=True),
+            patch("sunus.cli.sys.stdin.fileno", return_value=0),
+            patch("sunus.cli.termios.tcgetattr", return_value=[0, 0, 0, 0, 0, 0, []]),
+            patch("sunus.cli.termios.tcsetattr"),
+            patch("sunus.cli.tty.setcbreak"),
+            patch("sunus.cli.select.select", return_value=([0], [], [])),
+            patch("sunus.cli.os.read", side_effect=[bytes([byte]) for byte in payload]),
+            redirect_stdout(output),
+        ):
+            result = _input_with_initial("你 › ", "前缀")
+
+        self.assertEqual(result, "前缀第一段\n第二段")
+        self.assertNotIn("[200~", result)
+        self.assertNotIn("[201~", result)
+
+    def test_bracketed_paste_marker_is_not_queued_as_text(self) -> None:
+        marker = b"\x1b[200~"
+        with (
+            patch("sunus.cli.select.select", return_value=([0], [], [])),
+            patch(
+                "sunus.cli.os.read",
+                side_effect=[bytes([byte]) for byte in marker],
+            ),
+        ):
+            action, content = _read_thinking_key(0)
+        self.assertEqual(action, "ignore")
+        self.assertEqual(content, b"")
+
     def test_parses_core_commands(self) -> None:
         parser = make_parser()
         self.assertEqual(parser.parse_args([]).command, None)
@@ -49,6 +126,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(context_metrics.recall_limit, 3)
         proactive = parser.parse_args(["proactive", "status"])
         self.assertEqual(proactive.action, "status")
+        persona = parser.parse_args(["memory", "persona", "--distill"])
+        self.assertEqual(persona.memory_action, "persona")
+        self.assertTrue(persona.persona_distill)
         ratios = parser.parse_args(
             [
                 "proactive",
@@ -138,7 +218,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("读取文件 · note.txt", text)
         self.assertIn("✓ 已读取 12 行", text)
         self.assertIn("✓ 完成 · 1 次分析 · 1 个动作 · 读取 1", text)
-        self.assertNotIn("sonus test", text)
+        self.assertNotIn("sunus test", text)
 
     def test_runtime_renderer_streams_lines_without_tty(self) -> None:
         output = io.StringIO()
@@ -180,19 +260,19 @@ class CliTests(unittest.TestCase):
         self.assertFalse(event.is_set())
 
     def test_tab_and_escape_interrupts_but_arrow_does_not(self) -> None:
-        with patch("sonus.cli.os.read", return_value=b"\t"):
+        with patch("sunus.cli.os.read", return_value=b"\t"):
             self.assertTrue(_thinking_interrupt_pressed(0))
         with (
-            patch("sonus.cli.os.read", return_value=b"\x1b"),
-            patch("sonus.cli.select.select", return_value=([], [], [])),
+            patch("sunus.cli.os.read", return_value=b"\x1b"),
+            patch("sunus.cli.select.select", return_value=([], [], [])),
         ):
             self.assertTrue(_thinking_interrupt_pressed(0))
         with (
             patch(
-                "sonus.cli.os.read",
+                "sunus.cli.os.read",
                 side_effect=[b"\x1b", b"[", b"A"],
             ),
-            patch("sonus.cli.select.select", return_value=([0], [], [])),
+            patch("sunus.cli.select.select", return_value=([0], [], [])),
         ):
             self.assertFalse(_thinking_interrupt_pressed(0))
 

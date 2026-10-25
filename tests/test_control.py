@@ -3,8 +3,8 @@ from __future__ import annotations
 import unittest
 from dataclasses import replace
 
-from sonus.config import LoopBudgetConfig
-from sonus.control import CircuitOpen, TurnController
+from sunus.config import LoopBudgetConfig
+from sunus.control import CircuitOpen, TurnController
 
 
 class RecordingEvents:
@@ -161,6 +161,15 @@ class TurnControllerTests(unittest.TestCase):
         self.assertIsNotNone(
             controller.before_tool("run_command", {"command": "pytest"})
         )
+        controller.record_tool_result(
+            "read_file",
+            {"path": "README.md"},
+            ok=True,
+            content="project readme",
+            changed_files=[],
+        )
+        self.assertIsNone(controller.before_model_call())
+        self.assertEqual(controller.recovery_count, 1)
 
     def test_repeated_tool_failure_is_blocked(self) -> None:
         controller = TurnController(

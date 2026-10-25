@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 _QUESTION_PREFIX = re.compile(
@@ -33,12 +33,36 @@ _COMMAND_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _NETWORK_PATTERN = re.compile(
-    r"(?:访问|下载|请求|联网|打开网址|抓取|"
+    r"(?:访问|下载|请求|联网|网络|搜索|搜一下|搜搜|查一下|网页|"
+    r"打开网址|抓取|"
     r"download|fetch|request|http)",
     re.IGNORECASE,
 )
 _SUGGESTION_PATTERN = re.compile(
     r"(?:建议|方案|优化|怎么|如何|是否|能否|可选|下一步|设计)",
+    re.IGNORECASE,
+)
+_TECHNICAL_PATTERN = re.compile(
+    r"(?:代码|项目|文件|目录|仓库|命令|终端|脚本|测试|用例|接口|"
+    r"读取|查看|打开|列出|搜索|查找|"
+    r"数据库|配置|部署|安装|运行|构建|编译|调试|修复|修改|实现|"
+    r"重构|架构|模型|提示词|上下文|记忆|进程|线程|窗口|"
+    r"\b(?:api|cli|git|python|shell|pytest|codex|agent|sunus|token|"
+    r"prompt|http|url|github|bug)\b)",
+    re.IGNORECASE,
+)
+_CASUAL_PATTERN = re.compile(
+    r"(?:哈喽|你好|嗨|早安|午安|晚安|在吗|在干嘛|干嘛呢|"
+    r"聊天|聊聊|陪我|无聊|心情|开心|难过|烦恼|好累|压力|"
+    r"喜欢|想念|相亲|对象|感情|冷淡|女孩|男孩|"
+    r"谢谢|多谢|哈哈|嘿嘿|抱抱|再见|拜拜|"
+    r"\b(?:hi|hello|thanks|good\s+night)\b)",
+    re.IGNORECASE,
+)
+_PATH_PATTERN = re.compile(r"(?:^|[\s`'\"])[~./][\w./-]+")
+_REFERENTIAL_FOLLOWUP = re.compile(
+    r"^\s*(?:就|那)?(?:试一下|试试|继续|接着来|按你说的|照这个做|"
+    r"就这么办|来吧|开始吧)(?:[，,。.!！\s]|$)",
     re.IGNORECASE,
 )
 
@@ -83,3 +107,47 @@ def classify_request(text: str) -> RequestScope:
         allows_suggestions=question
         or bool(_SUGGESTION_PATTERN.search(stripped)),
     )
+
+
+def classify_request_with_context(
+    text: str,
+    *,
+    previous_assistant: str = "",
+) -> RequestScope:
+    scope = classify_request(text)
+    if not previous_assistant.strip() or not _REFERENTIAL_FOLLOWUP.search(text):
+        return scope
+    previous = classify_request(previous_assistant)
+    if not (
+        previous.allows_mutation
+        or previous.allows_commands
+        or previous.allows_network
+    ):
+        return scope
+    return replace(
+        scope,
+        allows_mutation=scope.allows_mutation or previous.allows_mutation,
+        allows_commands=scope.allows_commands or previous.allows_commands,
+        allows_network=scope.allows_network or previous.allows_network,
+    )
+
+
+def is_casual_conversation(
+    text: str,
+    *,
+    previous_assistant: str = "",
+) -> bool:
+    """Return whether a turn is clearly social chat rather than project work."""
+    stripped = text.strip()
+    if not stripped or len(stripped) > 160:
+        return False
+    if _TECHNICAL_PATTERN.search(stripped) or _PATH_PATTERN.search(stripped):
+        return False
+    scope = classify_request(stripped)
+    if previous_assistant.strip() and _REFERENTIAL_FOLLOWUP.search(stripped):
+        return False
+    if scope.allows_mutation or scope.allows_commands or scope.allows_network:
+        return False
+    if _CASUAL_PATTERN.search(stripped):
+        return True
+    return len(stripped) <= 24 and not _MUTATION_PATTERN.search(stripped)

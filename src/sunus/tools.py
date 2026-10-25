@@ -16,19 +16,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from sonus.config import redact_text, make_ssl_context
-from sonus.documents import DOCUMENT_PROFILES, render_document
-from sonus.events import EventBus
-from sonus.memory import MemoryStore
-from sonus.policy import ApprovalManager, PathGuard, PolicyError, command_denial_reason
-from sonus.scope import RequestScope, classify_request
-from sonus.skills import SKILLS_DIRNAME, SkillLibrary
-from sonus.storage import ArtifactStore
-from sonus.result import result_tool_schema
+from sunus.config import redact_text, make_ssl_context
+from sunus.documents import DOCUMENT_PROFILES, render_document
+from sunus.events import EventBus
+from sunus.memory import MemoryStore
+from sunus.policy import ApprovalManager, PathGuard, PolicyError, command_denial_reason
+from sunus.scope import RequestScope, classify_request_with_context
+from sunus.skills import SKILLS_DIRNAME, SkillLibrary
+from sunus.storage import ArtifactStore
+from sunus.result import result_tool_schema
 
 
 MAX_FILE_BYTES = 2 * 1024 * 1024
 MAX_TOOL_OUTPUT = 60_000
+MAX_CONTEXT_TOOL_OUTPUT = 16_000
+MAX_SEARCH_LINE_CHARS = 500
 SEARCH_TIMEOUT_SEC = 15
 SEARCH_MAX_FILES = 20_000
 SEARCH_MAX_LINE_BYTES = 1024 * 1024
@@ -60,7 +62,7 @@ def _semantic_command_failure(output: str) -> str:
 
 _IGNORED_NAMES = {
     ".git",
-    ".sonus",
+    ".sunus",
     ".venv",
     "venv",
     "node_modules",
@@ -112,7 +114,7 @@ def _search_ignored(name: str, *, is_dir: bool = False) -> bool:
 
 def find_ripgrep() -> str | None:
     """Find ripgrep without relying only on the launcher's inherited PATH."""
-    configured = os.environ.get("SONUS_RG_PATH", "").strip()
+    configured = os.environ.get("SUNUS_RG_PATH", "").strip()
     candidates = []
     if configured:
         candidates.append(Path(configured).expanduser())
@@ -129,14 +131,14 @@ def find_ripgrep() -> str | None:
             "~/.local/bin/rg",
         )
     )
-    sonus_runtime_home = Path(
-        os.environ.get("SONUS_PROVIDER_HOME")
+    sunus_runtime_home = Path(
+        os.environ.get("SUNUS_PROVIDER_HOME")
         or os.environ.get("CODEX_HOME")
         or Path.home() / ".codex"
     )
-    sonus_releases = sonus_runtime_home / "packages" / "app-server-daemon" / "releases"
-    if sonus_releases.is_dir():
-        bundled = list(sonus_releases.glob("*/codex-path/rg"))
+    sunus_releases = sunus_runtime_home / "packages" / "app-server-daemon" / "releases"
+    if sunus_releases.is_dir():
+        bundled = list(sunus_releases.glob("*/codex-path/rg"))
         bundled.sort(
             key=lambda path: path.stat().st_mtime
             if path.exists()
@@ -369,8 +371,16 @@ class ToolExecutor:
         self.skills = SkillLibrary(workspace)
         self.request_scope: RequestScope | None = None
 
-    def begin_request(self, text: str) -> RequestScope:
-        self.request_scope = classify_request(text)
+    def begin_request(
+        self,
+        text: str,
+        *,
+        previous_assistant: str = "",
+    ) -> RequestScope:
+        self.request_scope = classify_request_with_context(
+            text,
+            previous_assistant=previous_assistant,
+        )
         return self.request_scope
 
     def _scope_denial(self, name: str) -> str:
@@ -413,7 +423,23 @@ class ToolExecutor:
         if handler is None:
             return ToolResult(False, f"未知工具: {name}")
         try:
-            return handler(arguments)
+            result = handler(arguments)
+            if len(result.content) > MAX_CONTEXT_TOOL_OUTPUT:
+                artifact = result.artifact
+                if artifact is None:
+                    artifact = str(
+                        self.artifacts.save(
+                            redact_text(result.content, self.secret),
+                            prefix=f"context-{name}",
+                        )
+                    )
+                result.content = (
+                    result.content[:MAX_CONTEXT_TOOL_OUTPUT]
+                    + f"\n... [context cap {MAX_CONTEXT_TOOL_OUTPUT} chars; "
+                    f"full output: {artifact}]"
+                )
+                result.artifact = artifact
+            return result
         except (PolicyError, OSError, ValueError) as error:
             return ToolResult(False, f"{type(error).__name__}: {error}")
         except Exception as error:
@@ -522,6 +548,9 @@ class ToolExecutor:
             "--hidden",
             "--max-filesize",
             str(MAX_FILE_BYTES),
+            "--max-columns",
+            str(MAX_SEARCH_LINE_CHARS),
+            "--max-columns-preview",
         ]
         for name in sorted(_SEARCH_IGNORED_NAMES):
             command.extend(["--glob", f"!**/{name}/**"])
@@ -564,7 +593,9 @@ class ToolExecutor:
                     if not chunk:
                         if buffer and len(lines) < limit:
                             lines.append(
-                                bytes(buffer).decode("utf-8", errors="replace").rstrip("\r")
+                                bytes(buffer)
+                                .decode("utf-8", errors="replace")
+                                .rstrip("\r")[:MAX_SEARCH_LINE_CHARS]
                             )
                         break
                     buffer.extend(chunk)
@@ -572,7 +603,9 @@ class ToolExecutor:
                         raw_line, _, remainder = buffer.partition(b"\n")
                         buffer = bytearray(remainder)
                         lines.append(
-                            raw_line.decode("utf-8", errors="replace").rstrip("\r")
+                            raw_line.decode("utf-8", errors="replace").rstrip("\r")[
+                                :MAX_SEARCH_LINE_CHARS
+                            ]
                         )
                     if len(buffer) > SEARCH_MAX_LINE_BYTES:
                         failure = "搜索输出包含超长单行，已停止"
@@ -668,9 +701,11 @@ class ToolExecutor:
                                     timed_out = True
                                     break
                                 if query in line:
+                                    line_text = line.rstrip(
+                                        chr(10) + chr(13)
+                                    )[:MAX_SEARCH_LINE_CHARS]
                                     lines.append(
-                                        f"{relative.as_posix()}:{number}:"
-                                        f"{line.rstrip(chr(10) + chr(13))}"
+                                        f"{relative.as_posix()}:{number}:{line_text}"
                                     )
                                     if len(lines) >= limit:
                                         break
@@ -896,7 +931,7 @@ class ToolExecutor:
         max_chars = min(100000, max(1000, int(args.get("max_chars", 30000))))
         request = urllib.request.Request(
             url,
-            headers={"User-Agent": "Sonus/0.1"},
+            headers={"User-Agent": "Sunus/0.1"},
         )
         with urllib.request.urlopen(
             request,

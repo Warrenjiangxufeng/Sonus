@@ -62,11 +62,11 @@ def render_document(
     source_values = [str(item).strip() for item in (sources or []) if str(item).strip()]
     lines = [
         "---",
-        f"sonus_document: {profile}",
-        f"sonus_generated_at: {json.dumps(stamp, ensure_ascii=False)}",
+        f"sunus_document: {profile}",
+        f"sunus_generated_at: {json.dumps(stamp, ensure_ascii=False)}",
     ]
     if source_values:
-        lines.append("sonus_sources:")
+        lines.append("sunus_sources:")
         lines.extend(
             f"  - {json.dumps(item, ensure_ascii=False)}"
             for item in source_values

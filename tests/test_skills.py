@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sonus.skills import SkillLibrary, parse_frontmatter
+from sunus.skills import SkillLibrary, parse_frontmatter
 
 
 def write_skill(root: Path, folder: str, text: str) -> Path:

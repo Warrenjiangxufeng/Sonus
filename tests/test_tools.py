@@ -6,11 +6,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sonus.events import EventBus
-from sonus.memory import MemoryStore
-from sonus.policy import ApprovalManager, PathGuard
-from sonus.storage import ArtifactStore
-from sonus.tools import ToolExecutor, find_ripgrep, tool_schemas
+from sunus.events import EventBus
+from sunus.memory import MemoryStore
+from sunus.policy import ApprovalManager, PathGuard
+from sunus.storage import ArtifactStore
+from sunus.tools import ToolExecutor, find_ripgrep, tool_schemas
 
 
 class ToolTests(unittest.TestCase):
@@ -47,12 +47,12 @@ class ToolTests(unittest.TestCase):
             self.assertTrue(write.ok)
             patch = executor.execute(
                 "patch_file",
-                {"path": "a.txt", "old_text": "hello", "new_text": "hello sonus"},
+                {"path": "a.txt", "old_text": "hello", "new_text": "hello sunus"},
             )
             self.assertTrue(patch.ok)
             read = executor.execute("read_file", {"path": "a.txt"})
-            self.assertIn("hello sonus", read.content)
-            search = executor.execute("search_text", {"query": "sonus"})
+            self.assertIn("hello sunus", read.content)
+            search = executor.execute("search_text", {"query": "sunus"})
             self.assertIn("a.txt", search.content)
             listing = executor.execute("list_files", {"depth": 2})
             self.assertIn("a.txt", listing.content)
@@ -72,7 +72,7 @@ class ToolTests(unittest.TestCase):
                 "run_command",
                 {
                     "command": (
-                        "python3 -c 'import sonus_missing_tokenizer' "
+                        "python3 -c 'import sunus_missing_tokenizer' "
                         "2>&1 | head -2"
                     )
                 },
@@ -115,13 +115,13 @@ class ToolTests(unittest.TestCase):
             executor = self.make_executor(root)
             (root / "src").mkdir()
             (root / "src" / "visible.txt").write_text("needle\n", encoding="utf-8")
-            for directory in (".git", "node_modules", ".ssh", "Library"):
+            for directory in (".git", ".sunus", "node_modules", ".ssh", "Library"):
                 path = root / directory
-                path.mkdir()
+                path.mkdir(exist_ok=True)
                 (path / "hidden.txt").write_text("needle\n", encoding="utf-8")
             (root / ".env").write_text("needle=secret\n", encoding="utf-8")
 
-            with patch("sonus.tools.find_ripgrep", return_value=None):
+            with patch("sunus.tools.find_ripgrep", return_value=None):
                 result = executor.execute(
                     "search_text",
                     {"query": "needle", "timeout_sec": 2},
@@ -130,10 +130,32 @@ class ToolTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertIn("src/visible.txt", result.content)
             self.assertNotIn(".git", result.content)
+            self.assertNotIn(".sunus", result.content)
             self.assertNotIn("node_modules", result.content)
             self.assertNotIn(".ssh", result.content)
             self.assertNotIn(".env", result.content)
             self.assertIn("bounded-python-fallback", result.content)
+
+    def test_large_search_result_is_capped_and_archived(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root)
+            (root / "large.txt").write_text(
+                ("needle " + ("x" * 450) + "\n") * 50,
+                encoding="utf-8",
+            )
+
+            with patch("sunus.tools.find_ripgrep", return_value=None):
+                result = executor.execute(
+                    "search_text",
+                    {"query": "needle", "timeout_sec": 2},
+                )
+
+            self.assertTrue(result.ok)
+            self.assertLess(len(result.content), 17_000)
+            self.assertIn("context cap", result.content)
+            self.assertIsNotNone(result.artifact)
+            self.assertTrue(Path(str(result.artifact)).is_file())
 
     def test_fallback_timeout_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -142,8 +164,8 @@ class ToolTests(unittest.TestCase):
             (root / "a.txt").write_text("needle\n", encoding="utf-8")
 
             with (
-                patch("sonus.tools.find_ripgrep", return_value=None),
-                patch("sonus.tools.time.monotonic", side_effect=[0.0, 2.0]),
+                patch("sunus.tools.find_ripgrep", return_value=None),
+                patch("sunus.tools.time.monotonic", side_effect=[0.0, 2.0]),
             ):
                 result = executor.execute(
                     "search_text",
@@ -159,7 +181,7 @@ class ToolTests(unittest.TestCase):
             executable = Path(temp) / "rg"
             executable.write_text("#!/bin/sh\n", encoding="utf-8")
             executable.chmod(0o700)
-            with patch.dict(os.environ, {"SONUS_RG_PATH": str(executable)}):
+            with patch.dict(os.environ, {"SUNUS_RG_PATH": str(executable)}):
                 self.assertEqual(find_ripgrep(), str(executable.resolve()))
 
     def test_write_document_uses_profile_and_rejects_missing_sections(self) -> None:
@@ -185,7 +207,7 @@ class ToolTests(unittest.TestCase):
             )
             self.assertTrue(valid.ok)
             content = (root / "docs" / "DESIGN.md").read_text(encoding="utf-8")
-            self.assertIn("sonus_document: design", content)
+            self.assertIn("sunus_document: design", content)
             self.assertIn("## 架构", content)
 
             invalid = executor.execute(

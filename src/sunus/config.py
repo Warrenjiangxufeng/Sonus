@@ -36,28 +36,28 @@ LOOP_BUDGET_PROFILES: dict[str, dict[str, int]] = {
         "context_summary_chars": 8_000,
     },
     "standard": {
-        "max_model_calls": 20,
-        "max_tool_calls": 60,
-        "max_wall_seconds": 600,
-        "max_total_tokens": 150_000,
-        "max_response_tokens": 2048,
+        "max_model_calls": 60,
+        "max_tool_calls": 180,
+        "max_wall_seconds": 3600,
+        "max_total_tokens": 2_000_000,
+        "max_response_tokens": 8192,
         "finalization_reserve": 2,
-        "context_soft_tokens": 24_000,
-        "context_hard_tokens": 40_000,
-        "context_keep_recent": 16,
-        "context_summary_chars": 12_000,
+        "context_soft_tokens": 200_000,
+        "context_hard_tokens": 960_000,
+        "context_keep_recent": 48,
+        "context_summary_chars": 48_000,
     },
     "deep": {
-        "max_model_calls": 40,
-        "max_tool_calls": 120,
-        "max_wall_seconds": 1800,
-        "max_total_tokens": 500_000,
-        "max_response_tokens": 4096,
+        "max_model_calls": 120,
+        "max_tool_calls": 360,
+        "max_wall_seconds": 7200,
+        "max_total_tokens": 4_000_000,
+        "max_response_tokens": 16_384,
         "finalization_reserve": 2,
-        "context_soft_tokens": 48_000,
-        "context_hard_tokens": 80_000,
-        "context_keep_recent": 24,
-        "context_summary_chars": 16_000,
+        "context_soft_tokens": 400_000,
+        "context_hard_tokens": 960_000,
+        "context_keep_recent": 64,
+        "context_summary_chars": 64_000,
     },
 }
 
@@ -114,11 +114,11 @@ class ModelSettings:
 @dataclass(frozen=True)
 class LoopBudgetConfig:
     profile: str = "standard"
-    max_model_calls: int = 20
-    max_tool_calls: int = 60
-    max_wall_seconds: int = 600
-    max_total_tokens: int = 150_000
-    max_response_tokens: int = 2048
+    max_model_calls: int = 60
+    max_tool_calls: int = 180
+    max_wall_seconds: int = 3600
+    max_total_tokens: int = 2_000_000
+    max_response_tokens: int = 8192
     warning_ratio: float = 0.8
     no_progress_soft: int = 2
     no_progress_hard: int = 3
@@ -127,10 +127,10 @@ class LoopBudgetConfig:
     consecutive_failure_hard: int = 4
     max_recoveries: int = 2
     finalization_reserve: int = 2
-    context_soft_tokens: int = 24_000
-    context_hard_tokens: int = 40_000
-    context_keep_recent: int = 16
-    context_summary_chars: int = 12_000
+    context_soft_tokens: int = 200_000
+    context_hard_tokens: int = 960_000
+    context_keep_recent: int = 48
+    context_summary_chars: int = 48_000
 
 
 @dataclass(frozen=True)
@@ -142,7 +142,7 @@ class ProactiveConfig:
     recent_memory_limit: int = 32
     preference_items_in_context: int = 8
     topic_weights: tuple[tuple[str, int], ...] = PROACTIVE_TOPIC_WEIGHTS
-    sonus_gender: str = ""
+    sunus_gender: str = ""
     user_gender: str = ""
     custom_quirks: tuple[str, ...] = ()
     custom_topics: tuple[str, ...] = ()
@@ -156,7 +156,7 @@ class RuntimeConfig:
     base_url: str
     model: str
     max_steps: int = 20
-    max_tokens: int = 4096
+    max_tokens: int = 16_384
     request_timeout_sec: int = 120
     auto_approve: bool = False
     allow_outside: bool = False
@@ -170,7 +170,7 @@ class RuntimeConfig:
 
 
 DEFAULT_USER_CONFIG: dict[str, Any] = {
-    "max_tokens": 4096,
+    "max_tokens": 16_384,
     "request_timeout_sec": 120,
     "budget": {"profile": "standard"},
     "proactive": {
@@ -181,7 +181,7 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
         "recent_memory_limit": 32,
         "preference_items_in_context": 8,
         "topic_weights": dict(PROACTIVE_TOPIC_WEIGHTS),
-        "sonus_gender": "",
+        "sunus_gender": "",
         "user_gender": "",
         "custom_quirks": [],
         "custom_topics": [],
@@ -189,11 +189,11 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
 }
 
 
-def _sonus_provider_config_path() -> Path:
-    explicit = os.environ.get("SONUS_PROVIDER_CONFIG")
+def _sunus_provider_config_path() -> Path:
+    explicit = os.environ.get("SUNUS_PROVIDER_CONFIG")
     if explicit:
         return Path(explicit).expanduser()
-    provider_home = os.environ.get("SONUS_PROVIDER_HOME") or os.environ.get("CODEX_HOME")
+    provider_home = os.environ.get("SUNUS_PROVIDER_HOME") or os.environ.get("CODEX_HOME")
     if provider_home:
         return Path(provider_home).expanduser() / "config.toml"
     return Path.home() / ".codex" / "config.toml"
@@ -211,9 +211,9 @@ def _unquote(value: str) -> str:
     return value.split("#", 1)[0].strip()
 
 
-def load_sonus_deepseek_config(path: Path | None = None) -> tuple[str, str]:
-    """Read the local Sonus provider token without copying or logging it."""
-    path = path or _sonus_provider_config_path()
+def load_sunus_deepseek_config(path: Path | None = None) -> tuple[str, str]:
+    """Read the local Sunus provider token without copying or logging it."""
+    path = path or _sunus_provider_config_path()
     if not path.is_file():
         return "", ""
 
@@ -311,7 +311,7 @@ def resolve_config(
 ) -> RuntimeConfig:
     workspace = workspace.expanduser().resolve()
     data_dir = Path(
-        os.environ.get("SONUS_DATA_DIR", Path.home() / ".sonus")
+        os.environ.get("SUNUS_DATA_DIR", Path.home() / ".sunus")
     ).expanduser().resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -320,10 +320,10 @@ def resolve_config(
         pass
     user = _load_user_config(data_dir)
 
-    sonus_key, sonus_base = load_sonus_deepseek_config()
+    sunus_key, sunus_base = load_sunus_deepseek_config()
     provider_name = str(
         provider
-        or os.environ.get("SONUS_PROVIDER")
+        or os.environ.get("SUNUS_PROVIDER")
         or user.get("provider")
         or "deepseek"
     ).strip().lower()
@@ -341,13 +341,13 @@ def resolve_config(
         ),
         "",
     )
-    api_key = os.environ.get("SONUS_API_KEY") or provider_key
+    api_key = os.environ.get("SUNUS_API_KEY") or provider_key
     if provider_name == "deepseek" and not api_key:
-        api_key = sonus_key
+        api_key = sunus_key
 
     resolved_api_mode = str(
         api_mode
-        or os.environ.get("SONUS_API_MODE")
+        or os.environ.get("SUNUS_API_MODE")
         or user.get("api_mode")
         or provider_defaults["api_mode"]
     ).strip().lower()
@@ -358,26 +358,26 @@ def resolve_config(
         )
     resolved_base = (
         base_url
-        or os.environ.get("SONUS_BASE_URL")
+        or os.environ.get("SUNUS_BASE_URL")
         or user.get("base_url")
-        or (sonus_base if provider_name == "deepseek" else "")
+        or (sunus_base if provider_name == "deepseek" else "")
         or provider_defaults["base_url"]
     ).rstrip("/")
     if not resolved_base:
-        raise ConfigError("openai_compatible 需要显式 base_url 或 SONUS_BASE_URL")
+        raise ConfigError("openai_compatible 需要显式 base_url 或 SUNUS_BASE_URL")
     resolved_model = (
         model
-        or os.environ.get("SONUS_MODEL")
+        or os.environ.get("SUNUS_MODEL")
         or user.get("model")
         or provider_defaults["model"]
     )
     if not resolved_model:
         raise ConfigError(
-            f"{provider_name} 需要显式模型：请使用 --model、SONUS_MODEL "
+            f"{provider_name} 需要显式模型：请使用 --model、SUNUS_MODEL "
             "或用户配置中的 model"
         )
     token_parameter = str(
-        os.environ.get("SONUS_TOKEN_PARAMETER")
+        os.environ.get("SUNUS_TOKEN_PARAMETER")
         or user.get("token_parameter")
         or provider_defaults["token_parameter"]
     ).strip()
@@ -387,7 +387,7 @@ def resolve_config(
         )
     resolved_reasoning_effort = (
         reasoning_effort
-        or os.environ.get("SONUS_REASONING_EFFORT")
+        or os.environ.get("SUNUS_REASONING_EFFORT")
         or user.get("reasoning_effort")
         or None
     )
@@ -440,9 +440,9 @@ def resolve_config(
         raise ConfigError("proactive.topic_weights 权重合计必须为 100")
 
     raw_custom_topics = (
-        os.environ.get("SONUS_PROACTIVE_CUSTOM_QUIRKS")
+        os.environ.get("SUNUS_PROACTIVE_CUSTOM_QUIRKS")
         or proactive_payload.get("custom_quirks")
-        or os.environ.get("SONUS_PROACTIVE_CUSTOM_TOPICS")
+        or os.environ.get("SUNUS_PROACTIVE_CUSTOM_TOPICS")
         or proactive_payload.get("custom_topics", [])
     )
     if isinstance(raw_custom_topics, str):
@@ -484,12 +484,12 @@ def resolve_config(
             1, int(proactive_payload.get("preference_items_in_context", 8))
         ),
         topic_weights=tuple(topic_weights),
-        sonus_gender=(
-            os.environ.get("SONUS_GENDER")
-            or str(proactive_payload.get("sonus_gender") or "")
+        sunus_gender=(
+            os.environ.get("SUNUS_GENDER")
+            or str(proactive_payload.get("sunus_gender") or "")
         ).strip(),
         user_gender=(
-            os.environ.get("SONUS_USER_GENDER")
+            os.environ.get("SUNUS_USER_GENDER")
             or str(proactive_payload.get("user_gender") or "")
         ).strip(),
         custom_quirks=custom_topics,
@@ -500,7 +500,7 @@ def resolve_config(
         raise ConfigError("budget 必须是 JSON object")
     profile = str(
         budget_profile
-        or os.environ.get("SONUS_BUDGET_PROFILE")
+        or os.environ.get("SUNUS_BUDGET_PROFILE")
         or budget_payload.get("profile")
         or "standard"
     ).strip().lower()
@@ -594,7 +594,7 @@ def resolve_config(
                 or loop_budget.max_model_calls
             ),
         ),
-        max_tokens=max(256, int(user.get("max_tokens", 4096))),
+        max_tokens=max(256, int(user.get("max_tokens", 16_384))),
         request_timeout_sec=max(10, int(user.get("request_timeout_sec", 120))),
         auto_approve=auto_approve,
         allow_outside=allow_outside,
@@ -701,7 +701,7 @@ def config_summary(config: RuntimeConfig) -> dict[str, Any]:
             "recent_memory_window_hours": config.proactive.recent_memory_window_hours,
             "recent_memory_limit": config.proactive.recent_memory_limit,
             "topic_weights": dict(config.proactive.topic_weights),
-            "sonus_gender": config.proactive.sonus_gender,
+            "sunus_gender": config.proactive.sunus_gender,
             "user_gender": config.proactive.user_gender,
             "custom_quirks": list(
                 config.proactive.custom_quirks or config.proactive.custom_topics

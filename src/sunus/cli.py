@@ -1,23 +1,27 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import os
+import re
 import select
+import shutil
 import sqlite3
 import sys
 import termios
 import threading
 import tty
+import unicodedata
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from sonus import __version__
-from sonus.agent import Agent, AgentResult
-from sonus.config import (
+from sunus import __version__
+from sunus.agent import Agent, AgentResult
+from sunus.config import (
     ConfigError,
     RuntimeConfig,
     config_summary,
@@ -25,18 +29,18 @@ from sonus.config import (
     resolve_config,
     save_user_config,
 )
-from sonus.events import EventBus
-from sonus.memory import MemoryStore
-from sonus.model import ModelClient, ModelError, create_model_client
-from sonus.policy import ApprovalManager, PathGuard
-from sonus.proactive import (
+from sunus.events import EventBus
+from sunus.memory import MemoryStore
+from sunus.model import ModelClient, ModelError, create_model_client
+from sunus.policy import ApprovalManager, PathGuard
+from sunus.proactive import (
     ProactiveScheduler,
     ProactiveService,
     format_interval_demo,
     parse_topic_ratios,
     proactive_topic_schedule,
 )
-from sonus.storage import (
+from sunus.storage import (
     ArtifactStore,
     SessionLogger,
     SessionTranscript,
@@ -44,7 +48,7 @@ from sonus.storage import (
     load_session,
     resolve_session_path,
 )
-from sonus.tools import ToolExecutor, find_ripgrep, tool_schemas
+from sunus.tools import ToolExecutor, find_ripgrep, tool_schemas
 
 
 RESET = "\033[0m"
@@ -53,10 +57,49 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 DIM = "\033[2m"
+_IUTF8_FLAG = getattr(termios, "IUTF8", 0x4000)
 
 
 def color(text: str, code: str, enabled: bool) -> str:
     return f"{code}{text}{RESET}" if enabled else text
+
+
+def _enable_utf8_input(descriptor: int) -> bool:
+    try:
+        attributes = termios.tcgetattr(descriptor)
+        if attributes[0] & _IUTF8_FLAG:
+            return True
+        attributes[0] |= _IUTF8_FLAG
+        termios.tcsetattr(descriptor, termios.TCSADRAIN, attributes)
+        return True
+    except (OSError, ValueError, termios.error):
+        return False
+
+
+@dataclass
+class PendingTerminalInput:
+    raw: bytearray = field(default_factory=bytearray)
+
+    def feed(self, value: bytes) -> None:
+        if not value:
+            return
+        if value in {b"\x7f", b"\x08"}:
+            while self.raw and self.raw[-1] & 0xC0 == 0x80:
+                self.raw.pop()
+            if self.raw:
+                self.raw.pop()
+            return
+        if value in {b"\r", b"\n"}:
+            return
+        first = value[0]
+        if first >= 0x20 or first >= 0x80:
+            self.raw.extend(value)
+
+    def text(self) -> str:
+        return self.raw.decode("utf-8", errors="ignore")
+
+    def clear(self) -> None:
+        self.raw.clear()
 
 
 class RuntimeEventRenderer:
@@ -399,7 +442,7 @@ def build_components(
 
 def print_banner() -> None:
     tty = sys.stdout.isatty()
-    print(color("Sonus", CYAN, tty))
+    print(color("Sunus", CYAN, tty))
     print("本地记忆增强主动陪伴型 Agent · 她的边界，由你创造！")
     print(
         "A local, memory-enhanced, proactive companion Agent · "
@@ -407,6 +450,32 @@ def print_banner() -> None:
     )
     print(color("输入 /help 查看命令；直接输入任务即可。", DIM, tty))
     print()
+
+
+def _remember_proactive_delivery(
+    components: Components,
+    text: str,
+    meta: dict[str, Any],
+    *,
+    message_id: str,
+    trigger: str,
+) -> str:
+    if components.proactive is None:
+        return ""
+    try:
+        return components.proactive.record_delivery(
+            text,
+            meta,
+            message_id=message_id,
+            trigger=trigger,
+        )
+    except Exception as error:
+        components.events.emit(
+            "proactive_memory_write_failed",
+            message_id=message_id,
+            summary=f"主动分享记忆写入失败: {error}",
+        )
+        return ""
 
 
 def due_message(components: Components) -> None:
@@ -425,16 +494,24 @@ def due_message(components: Components) -> None:
             sequence_index=components.scheduler.current_topic_index(),
         )
         message_id = components.scheduler.record_message(text)
+        memory_id = _remember_proactive_delivery(
+            components,
+            text,
+            meta,
+            message_id=message_id,
+            trigger="scheduled",
+        )
         delay = components.scheduler.mark_sent()
         components.events.emit(
             "proactive_message_delivered",
             message_id=message_id,
+            memory_id=memory_id,
             delay_sec=delay,
             topic=meta.get("topic"),
             topic_weight=meta.get("topic_weight"),
             summary=f"主动消息已送达 · {meta.get('topic_label', '主动陪伴')}",
         )
-        print("\n" + color("Sonus 主动消息", GREEN, tty) + "\n" + text + "\n")
+        print("\n" + color("Sunus 主动消息", GREEN, tty) + "\n" + text + "\n")
     except Exception as error:
         components.scheduler.mark_failed()
         components.events.emit(
@@ -443,24 +520,283 @@ def due_message(components: Components) -> None:
         )
 
 
-def read_with_proactive(components: Components, prompt: str) -> str | None:
-    if not sys.stdin.isatty() or components.proactive is None:
+def _display_width(text: str) -> int:
+    clean = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", text)
+    width = 0
+    for character in clean:
+        if unicodedata.combining(character):
+            continue
+        width += (
+            2
+            if unicodedata.east_asian_width(character) in {"W", "F"}
+            else 1
+        )
+    return width
+
+
+def _visible_input_window(
+    text: str,
+    cursor: int,
+    available_width: int,
+) -> tuple[str, int]:
+    flat = text.replace("\r", "").replace("\n", "↵")
+    cursor = max(0, min(cursor, len(flat)))
+    room = max(8, available_width - 2)
+    start = cursor
+    used = 0
+    while start > 0:
+        width = _display_width(flat[start - 1])
+        if used + width > room // 2:
+            break
+        start -= 1
+        used += width
+    end = cursor
+    while end < len(flat):
+        width = _display_width(flat[end])
+        if used + width > room:
+            break
+        end += 1
+        used += width
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(flat) else ""
+    visible = prefix + flat[start:end] + suffix
+    cursor_column = _display_width(prefix + flat[start:cursor])
+    return visible, cursor_column
+
+
+def _read_escape_sequence(descriptor: int) -> bytes:
+    sequence = bytearray(b"\x1b")
+    while len(sequence) < 16 and select.select([descriptor], [], [], 0.03)[0]:
+        sequence.extend(os.read(descriptor, 1))
+        if sequence[-1:].isalpha() or sequence.endswith(b"~"):
+            break
+    return bytes(sequence)
+
+
+def _input_with_initial(
+    prompt: str,
+    initial: str,
+    *,
+    on_idle: Callable[[], bool] | None = None,
+) -> str:
+    if not sys.stdin.isatty():
+        return initial + input(prompt)
+    descriptor = sys.stdin.fileno()
+    previous = termios.tcgetattr(descriptor)
+    buffer = initial
+    cursor = len(buffer)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
+
+    def redraw() -> None:
+        terminal_width = shutil.get_terminal_size((80, 24)).columns
+        visible, cursor_column = _visible_input_window(
+            buffer,
+            cursor,
+            terminal_width - _display_width(prompt),
+        )
+        sys.stdout.write("\r\x1b[2K" + prompt + visible)
+        trailing = _display_width(visible) - cursor_column
+        if trailing > 0:
+            sys.stdout.write(f"\x1b[{trailing}D")
+        sys.stdout.flush()
+
+    def delete_word() -> None:
+        nonlocal buffer, cursor
+        start = cursor
+        while start > 0 and buffer[start - 1].isspace():
+            start -= 1
+        while start > 0 and not buffer[start - 1].isspace():
+            start -= 1
+        buffer = buffer[:start] + buffer[cursor:]
+        cursor = start
+
+    def remove_character() -> None:
+        nonlocal buffer, cursor
+        if cursor <= 0:
+            return
+        prefix = _remove_last_grapheme(buffer[:cursor])
+        buffer = prefix + buffer[cursor:]
+        cursor = len(prefix)
+
+    try:
+        _enable_utf8_input(descriptor)
+        tty.setcbreak(descriptor)
+        sys.stdout.write("\x1b[?2004h")
+        redraw()
+        in_paste = False
+        while True:
+            if not select.select([descriptor], [], [], 0.25)[0]:
+                if on_idle is not None and on_idle():
+                    redraw()
+                continue
+            raw = os.read(descriptor, 1)
+            if raw == b"":
+                if buffer:
+                    return buffer
+                raise EOFError
+            if raw == b"\x1b":
+                sequence = _read_escape_sequence(descriptor)
+                if sequence == b"\x1b[200~":
+                    in_paste = True
+                elif sequence == b"\x1b[201~":
+                    in_paste = False
+                    redraw()
+                elif not in_paste and sequence == b"\x1b[D":
+                    cursor = max(0, cursor - 1)
+                    redraw()
+                elif not in_paste and sequence == b"\x1b[C":
+                    cursor = min(len(buffer), cursor + 1)
+                    redraw()
+                elif not in_paste and sequence in {
+                    b"\x1b[H",
+                    b"\x1b[1~",
+                    b"\x1b[7~",
+                }:
+                    cursor = 0
+                    redraw()
+                elif not in_paste and sequence in {
+                    b"\x1b[F",
+                    b"\x1b[4~",
+                    b"\x1b[8~",
+                }:
+                    cursor = len(buffer)
+                    redraw()
+                elif not in_paste and sequence == b"\x1b[3~":
+                    if cursor < len(buffer):
+                        buffer = buffer[:cursor] + _remove_first_grapheme(
+                            buffer[cursor:]
+                        )
+                        redraw()
+                continue
+            if raw in {b"\r", b"\n"} and not in_paste:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                decoder.reset()
+                return buffer.rstrip("\r\n")
+            if raw == b"\x03" and not in_paste:
+                raise KeyboardInterrupt
+            if raw == b"\x04" and not in_paste:
+                if not buffer:
+                    raise EOFError
+                continue
+            if raw in {b"\x7f", b"\x08"} and not in_paste:
+                remove_character()
+                redraw()
+                continue
+            if raw == b"\x15" and not in_paste:
+                buffer = ""
+                cursor = 0
+                redraw()
+                continue
+            if raw == b"\x17" and not in_paste:
+                delete_word()
+                redraw()
+                continue
+            if raw == b"\x01" and not in_paste:
+                cursor = 0
+                redraw()
+                continue
+            if raw == b"\x05" and not in_paste:
+                cursor = len(buffer)
+                redraw()
+                continue
+            if raw == b"\x0b" and not in_paste:
+                buffer = buffer[:cursor]
+                redraw()
+                continue
+            if raw == b"\x0c" and not in_paste:
+                redraw()
+                continue
+            if in_paste and raw == b"\r":
+                raw = b"\n"
+            piece = decoder.decode(raw, final=False)
+            if piece and (
+                (in_paste and piece in {"\n", "\t"})
+                or all(character.isprintable() for character in piece)
+            ):
+                buffer = buffer[:cursor] + piece + buffer[cursor:]
+                cursor += len(piece)
+                if not in_paste:
+                    redraw()
+    finally:
+        sys.stdout.write("\x1b[?2004h")
+        sys.stdout.flush()
+        termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
+
+
+def _remove_last_grapheme(text: str) -> str:
+    if not text:
+        return text
+    end = len(text)
+    while end > 0 and (
+        unicodedata.combining(text[end - 1])
+        or text[end - 1] in {"\ufe0e", "\ufe0f"}
+        or 0x1F3FB <= ord(text[end - 1]) <= 0x1F3FF
+    ):
+        end -= 1
+    if (
+        end >= 2
+        and 0x1F1E6 <= ord(text[end - 1]) <= 0x1F1FF
+        and 0x1F1E6 <= ord(text[end - 2]) <= 0x1F1FF
+    ):
+        end -= 2
+    elif end > 0:
+        end -= 1
+    while end > 0 and text[end - 1] == "\u200d":
+        end -= 1
+        if end > 0:
+            end -= 1
+    return text[:end]
+
+
+def _remove_first_grapheme(text: str) -> str:
+    if not text:
+        return text
+    end = 1
+    while end < len(text) and (
+        unicodedata.combining(text[end])
+        or text[end] in {"\ufe0e", "\ufe0f"}
+        or 0x1F3FB <= ord(text[end]) <= 0x1F3FF
+        or text[end - 1] == "\u200d"
+    ):
+        end += 1
+    while end < len(text) and text[end] == "\u200d":
+        end += 2
+    return text[end:]
+
+
+def read_with_proactive(
+    components: Components,
+    prompt: str,
+    *,
+    initial: str = "",
+) -> str | None:
+    if not sys.stdin.isatty():
         try:
-            return input(prompt)
+            return initial + input(prompt)
         except EOFError:
             return None
-    while True:
-        print(prompt, end="", flush=True)
-        timeout = 3600.0
-        if components.config.proactive.enabled:
-            timeout = min(3600.0, components.scheduler.seconds_until_due())
-        ready, _, _ = select.select([sys.stdin], [], [], timeout)
-        if ready:
-            line = sys.stdin.readline()
-            if line == "":
-                return None
-            return line.rstrip("\n")
+    _enable_utf8_input(sys.stdin.fileno())
+
+    def on_idle() -> bool:
+        if (
+            components.proactive is None
+            or not components.config.proactive.enabled
+            or components.scheduler.status().paused
+            or components.scheduler.seconds_until_due() > 0
+        ):
+            return False
         due_message(components)
+        return True
+
+    try:
+        return _input_with_initial(
+            prompt,
+            initial,
+            on_idle=on_idle,
+        )
+    except EOFError:
+        return None
 
 
 def print_help(config: RuntimeConfig) -> None:
@@ -483,10 +819,10 @@ def print_help(config: RuntimeConfig) -> None:
 分析等待中可按 Tab 或单独 Esc 打断，已完成的文件修改不会自动回滚。
 
 命令行模式：
-  sonus exec "任务"
-  sonus memory recent|search|score|distill
-  sonus proactive status|ratios|pause|resume|reset
-  sonus doctor [--network]
+  sunus exec "任务"
+  sunus memory recent|search|score|distill|persona
+  sunus proactive status|ratios|pause|resume|reset
+  sunus doctor [--network]
 """
     )
 
@@ -524,6 +860,7 @@ def handle_slash(command: str, components: Components) -> bool:
                 {
                     "preferences": digest["preferences"],
                     "recent": digest["recent"],
+                    "persona": digest["persona"],
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -615,9 +952,18 @@ def handle_slash(command: str, components: Components) -> bool:
                 text, meta = components.proactive.generate(
                     sequence_index=components.scheduler.current_topic_index(),
                 )
-                components.scheduler.record_message(text)
+                message_id = components.scheduler.record_message(text)
+                memory_id = _remember_proactive_delivery(
+                    components,
+                    text,
+                    meta,
+                    message_id=message_id,
+                    trigger="slash_trigger",
+                )
                 components.events.emit(
                     "proactive_message_generated",
+                    message_id=message_id,
+                    memory_id=memory_id,
                     summary="手动触发主动消息",
                     **meta,
                 )
@@ -634,28 +980,30 @@ def handle_slash(command: str, components: Components) -> bool:
 
 
 def _thinking_interrupt_pressed(descriptor: int) -> bool:
+    action, _ = _read_thinking_key(descriptor)
+    return action == "interrupt"
+
+
+def _read_thinking_key(descriptor: int) -> tuple[str, bytes]:
     try:
         character = os.read(descriptor, 1)
     except OSError:
-        return False
+        return "ignore", b""
     if character == b"\t":
-        return True
+        return "interrupt", character
     if character != b"\x1b":
-        return False
-    if not select.select([descriptor], [], [], 0.03)[0]:
-        return True
-    second = os.read(descriptor, 1)
-    if second != b"[":
-        return True
-    if select.select([descriptor], [], [], 0.03)[0]:
-        os.read(descriptor, 1)
-    return False
+        return "text", character
+    sequence = _read_escape_sequence(descriptor)
+    if sequence == b"\x1b":
+        return "interrupt", character
+    return "ignore", b""
 
 
 def run_turn_with_interrupt(
     components: Components,
     user_input: str,
     thinking_event: threading.Event,
+    pending_input: PendingTerminalInput | None = None,
 ) -> AgentResult:
     agent = components.agent
     if agent is None:
@@ -671,9 +1019,10 @@ def run_turn_with_interrupt(
         except BaseException as error:
             outcome["error"] = error
 
-    thread = threading.Thread(target=worker, name="sonus-turn", daemon=True)
+    thread = threading.Thread(target=worker, name="sunus-turn", daemon=True)
     thread.start()
     descriptor = sys.stdin.fileno()
+    _enable_utf8_input(descriptor)
     previous: list[Any] | None = None
     cancelled = False
     try:
@@ -683,7 +1032,8 @@ def run_turn_with_interrupt(
                     previous = termios.tcgetattr(descriptor)
                     tty.setcbreak(descriptor)
                 if select.select([descriptor], [], [], 0.05)[0]:
-                    if _thinking_interrupt_pressed(descriptor):
+                    action, character = _read_thinking_key(descriptor)
+                    if action == "interrupt":
                         cancelled = True
                         cancel = getattr(components.model, "cancel", None)
                         if callable(cancel):
@@ -695,6 +1045,8 @@ def run_turn_with_interrupt(
                                 previous,
                             )
                             previous = None
+                    elif action == "text" and pending_input is not None:
+                        pending_input.feed(character)
                 continue
             if previous is not None:
                 termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
@@ -727,6 +1079,7 @@ def run_repl(
 ) -> int:
     identifier = transcript.session_id if transcript and forked_from is None else session_id()
     thinking_event = threading.Event()
+    pending_input = PendingTerminalInput()
     renderer = (
         RuntimeEventRenderer()
         if not verbose
@@ -767,8 +1120,11 @@ def run_repl(
                 user_input = read_with_proactive(
                     components,
                     color("你 › ", CYAN, sys.stdout.isatty()),
+                    initial=pending_input.text(),
                 )
+                pending_input.clear()
             except KeyboardInterrupt:
+                pending_input.clear()
                 print("\n已取消当前输入。")
                 continue
             if user_input is None:
@@ -785,12 +1141,13 @@ def run_repl(
             if components.agent is None:
                 print("模型未初始化。")
                 continue
-            print(color("Sonus", GREEN, sys.stdout.isatty()), flush=True)
+            print(color("Sunus", GREEN, sys.stdout.isatty()), flush=True)
             try:
                 result = run_turn_with_interrupt(
                     components,
                     user_input,
                     thinking_event,
+                    pending_input,
                 )
             except KeyboardInterrupt:
                 print("\n操作已中断。")
@@ -955,7 +1312,16 @@ def proactive_command(
             text, meta = components.proactive.generate(
                 sequence_index=components.scheduler.current_topic_index(),
             )
-            components.scheduler.record_message(text)
+            message_id = components.scheduler.record_message(text)
+            memory_id = _remember_proactive_delivery(
+                components,
+                text,
+                meta,
+                message_id=message_id,
+                trigger="cli_trigger",
+            )
+            meta["message_id"] = message_id
+            meta["memory_id"] = memory_id
             print(text)
             print(json.dumps(meta, ensure_ascii=False), file=sys.stderr)
         return 0
@@ -1000,6 +1366,27 @@ def memory_command(config: RuntimeConfig, args: argparse.Namespace) -> int:
             return 0
         elif args.memory_action == "distill":
             print(json.dumps(memory.distill(scope=scope), ensure_ascii=False, indent=2))
+        elif args.memory_action == "persona":
+            distilled = (
+                memory.distill_persona()
+                if args.persona_distill
+                else None
+            )
+            rows = memory.persona_profile(
+                scope=scope,
+                limit=50,
+                include_candidates=True,
+            )
+            print(
+                json.dumps(
+                    {
+                        "profile": rows,
+                        "distill": distilled,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
             return 0
         elif args.memory_action == "forget":
             if not (config.auto_approve or getattr(args, "forget_yes", False)):
@@ -1040,7 +1427,7 @@ def doctor(config: RuntimeConfig, *, network: bool) -> int:
         {
             "name": "token_metrics",
             "ok": True,
-            "value": "estimated only; use `sonus memory context-metrics`",
+            "value": "estimated only; use `sunus memory context-metrics`",
         }
     )
     try:
@@ -1074,10 +1461,10 @@ def doctor(config: RuntimeConfig, *, network: bool) -> int:
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="sonus",
-        description="Sonus local coding agent with memory and proactive companionship.",
+        prog="sunus",
+        description="Sunus local coding agent with memory and proactive companionship.",
     )
-    parser.add_argument("--version", action="version", version=f"sonus {__version__}")
+    parser.add_argument("--version", action="version", version=f"sunus {__version__}")
     parser.add_argument("-C", "--cwd", default=".", help="Workspace directory")
     parser.add_argument("--provider", help="Model provider")
     parser.add_argument(
@@ -1148,7 +1535,7 @@ def make_parser() -> argparse.ArgumentParser:
         help="Ratio updates, e.g. daily_emotion=45 work_coding=20 ...",
     )
 
-    memory = sub.add_parser("memory", help="Manage Sonus memory")
+    memory = sub.add_parser("memory", help="Manage Sunus memory")
     memory_sub = memory.add_subparsers(dest="memory_action", required=True)
     recent = memory_sub.add_parser("recent")
     recent.add_argument("--limit", type=int, default=20)
@@ -1174,6 +1561,16 @@ def make_parser() -> argparse.ArgumentParser:
     context_metrics.add_argument("--recall-limit", type=int, default=5)
     memory_sub.add_parser("score")
     memory_sub.add_parser("distill")
+    persona = memory_sub.add_parser(
+        "persona",
+        help="Inspect Sunus's evolving personality profile",
+    )
+    persona.add_argument(
+        "--distill",
+        action="store_true",
+        dest="persona_distill",
+        help="Keep at most six stable traits",
+    )
     forget = memory_sub.add_parser("forget")
     forget.add_argument("identifier")
     forget.add_argument("--yes", action="store_true", dest="forget_yes")

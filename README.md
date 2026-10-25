@@ -1,10 +1,10 @@
-# Sonus
+# Sunus
 
 > 本地记忆增强主动陪伴型 Agent。她的边界，由你创造。
 
-Sonus 是运行在本机的中文智能体。它把模型判断、受控工具执行、证据化记忆、可审计事件和主动陪伴放在同一条运行时链路上：既能完成代码与文档任务，也能记住长期偏好并在适当时间主动发起交流。
+Sunus 是运行在本机的中文智能体。它把模型判断、受控工具执行、证据化记忆、可审计事件和主动陪伴放在同一条运行时链路上：既能完成代码与文档任务，也能记住长期偏好并在适当时间主动发起交流。
 
-Sonus 的定位是可信本机、可信工作区中的本地 Agent。它使用规则、路径守卫、任务授权和进程管理降低误操作风险，但不提供 OS 或容器级安全隔离。
+Sunus 的定位是可信本机、可信工作区中的本地 Agent。它使用规则、路径守卫、任务授权和进程管理降低误操作风险，但不提供 OS 或容器级安全隔离。
 
 ## 核心能力
 
@@ -22,15 +22,15 @@ Sonus 的定位是可信本机、可信工作区中的本地 Agent。它使用�
 ## 快速开始
 
 ```bash
-cd ~/Documents/Sonus
-./bin/sonus doctor --network
-./bin/sonus
+cd ~/Documents/Sunus
+./bin/sunus doctor --network
+./bin/sunus
 ```
 
 安装全局入口后，可以在任意目录启动：
 
 ```bash
-sonus
+sunus
 ```
 
 启动目录就是当前工作区，包括用户主目录。大范围检索由工具自身的超时、文件数量和敏感路径规则约束。
@@ -38,8 +38,8 @@ sonus
 单次任务：
 
 ```bash
-sonus exec "检查项目，修复测试并运行验证"
-sonus exec --json "总结当前目录结构"
+sunus exec "检查项目，修复测试并运行验证"
+sunus exec --json "总结当前目录结构"
 ```
 
 ## 架构总览
@@ -83,10 +83,10 @@ ProactiveScheduler
 ## 代码结构
 
 ```text
-Sonus/
+Sunus/
 ├── bin/
-│   └── sonus                 # 启动脚本
-├── src/sonus/
+│   └── sunus                 # 启动脚本
+├── src/sunus/
 │   ├── __main__.py           # 模块入口
 │   ├── cli.py                # CLI、REPL、事件渲染、命令分发
 │   ├── agent.py              # Agent 主循环与系统提示
@@ -149,12 +149,12 @@ Sonus/
 | Profile | 模型调用 | 工具调用 | 墙钟时间 | 总 Token | 单次回答 Token | 终态预留 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `quick` | 8 | 24 | 3 分钟 | 50,000 | 1,024 | 1 |
-| `standard` | 20 | 60 | 10 分钟 | 150,000 | 2,048 | 2 |
-| `deep` | 40 | 120 | 30 分钟 | 500,000 | 4,096 | 2 |
+| `standard` | 60 | 180 | 60 分钟 | 2,000,000 | 8,192 | 2 |
+| `deep` | 120 | 360 | 120 分钟 | 4,000,000 | 16,384 | 2 |
 
 ```bash
-sonus --budget quick
-sonus --budget deep
+sunus --budget quick
+sunus --budget deep
 ```
 
 控制器追踪新证据、文件变化、重复动作和连续失败。连续 2 轮无新证据或同类错误重复 2 次时，会注入结构化恢复提示，要求模型换一个最小验证方案；继续无改善则熔断。
@@ -172,8 +172,8 @@ sonus --budget deep
 | Profile | 软阈值 | 硬目标 | 保留近期消息 | 摘要上限 |
 | --- | ---: | ---: | ---: | ---: |
 | `quick` | 12,000 | 24,000 | 10 | 8,000 字符 |
-| `standard` | 24,000 | 40,000 | 16 | 12,000 字符 |
-| `deep` | 48,000 | 80,000 | 24 | 16,000 字符 |
+| `standard` | 200,000 | 960,000 | 48 | 48,000 字符 |
+| `deep` | 400,000 | 960,000 | 64 | 64,000 字符 |
 
 压缩优先从用户消息边界切入；单用户多工具轮次会固定保留原始用户要求，再从安全的 assistant 边界截断，不拆开 tool call 与 tool result。Provider 上一轮返回的 `prompt_tokens` 也参与阈值判断，避免字符估算偏低而错过压缩。旧消息按用户要求、工具错误、文件变更和 Agent 结论生成可追溯摘要；完整原始记录仍保留在 Session JSONL。恢复会话后会使用最后一次 `context_checkpoint`，避免重复加载已摘要的历史。
 
@@ -187,7 +187,7 @@ sonus --budget deep
 
 ### 回答输出规范
 
-Sonus 的最终回答默认遵循：
+Sunus 的最终回答默认遵循：
 
 - 结论先行，只保留关键依据、验证结果和剩余风险。
 - 简单回答 1-3 句；复杂任务最多 3 个主要部分。
@@ -202,6 +202,13 @@ Sonus 的最终回答默认遵循：
 
 单次回答的 token 上限只是硬保险，输出风格仍由系统提示约束。
 
+日常问候、情绪交流、关系话题和简短闲聊会自动进入“对话模式”：本轮不挂载
+工具，回复目标为 1-2 句、约 80 个汉字，单次输出预算收紧到 512 tokens。
+若模型只生成内部推理、正文为空且 `finish_reason=length`，运行时会自动扩大
+到该 Profile 的完整回答预算并重试一次。
+技术问答仍可按需使用只读工具；当前消息没有授权的写文件、shell 和联网工具
+不会出现在模型工具列表中，避免模型反复尝试必然被策略拒绝的动作。
+
 ### 结构化终态
 
 模型完成、部分完成或阻塞时调用 `submit_result`，提交经过运行时校验的 `ResultEnvelope`：
@@ -212,7 +219,7 @@ Sonus 的最终回答默认遵循：
   "status": "completed",
   "summary": "修复完成。",
   "changes": [
-    {"path": "src/sonus/model.py", "action": "modified", "purpose": "处理断连"}
+    {"path": "src/sunus/model.py", "action": "modified", "purpose": "处理断连"}
   ],
   "verification": [
     {"command": "python3 -m unittest", "status": "passed", "summary": "66/66"}
@@ -241,11 +248,11 @@ Sonus 的最终回答默认遵循：
 - `changelog`：变更、验证、兼容性
 - `analysis`：问题、证据、根因、方案、验证
 
-生成文件带 Sonus 元数据和来源列表；缺少必选章节时写入会被拒绝并要求修正。
+生成文件带 Sunus 元数据和来源列表；缺少必选章节时写入会被拒绝并要求修正。
 
 ### 动作边界
 
-Sonus 只执行用户当前消息明确点名的动作：
+Sunus 只执行用户当前消息明确点名的动作：
 
 - 问题、假设、示例、建议和可选优化不会被当作执行指令。
 - 普通咨询可读文件、搜索和列目录，但不能自行写文件、跑命令或访问网络。
@@ -259,7 +266,7 @@ Sonus 只执行用户当前消息明确点名的动作：
 交互终端默认显示可观察执行过程：
 
 ```text
-Sonus
+Sunus
   ◇ 先检查项目说明和目录结构…
   ✓ 完成 · 4 次分析 · 8 个动作 · 读取 4 · 命令 2 · 目录 1 · 技能 1
 ```
@@ -267,10 +274,20 @@ Sonus
 运行中在同一行滚动显示当前思考或动作，结束后只保留一条汇总，不把每个工具结果堆在界面上。不会展示隐藏推理、文件正文、写入正文或凭据。完整事件仍保存在：
 
 ```text
-~/.sonus/events/YYYY-MM-DD.jsonl
+~/.sunus/events/YYYY-MM-DD.jsonl
 ```
 
 模型等待期间可按 `Tab` 或单独按 `Esc` 打断思考，随后直接回到输入框。方向键不会误触发中断。中断只取消当前模型请求，其中尚未执行的工具调用不会执行；同一轮前面已经完成的文件修改会保留并写入 Receipt，不会静默回滚。
+
+交互终端启动时会自动启用 UTF-8 行编辑（`IUTF8`），中文、emoji 和组合字符
+按完整字符退格，不会只删掉一个字节。模型思考期间输入的文字会暂存，等本轮
+结束后自动出现在下一轮输入框；退格、Ctrl-U 清空和 Ctrl-W 删词也会作用于
+暂存内容，Tab/Esc 仍只用于打断。取消下一轮输入会同时清空暂存。
+
+终端粘贴使用 bracketed-paste 事务读取：`ESC[200~` 与 `ESC[201~` 只作为控制
+标记处理，不会进入消息；粘贴块内部的换行不会逐行提前提交，整块内容只写入
+一次。长文本编辑使用单行窗口显示，内部换行显示为 `↵`，避免整行反复重绘留下
+重复残影。方向键、Home/End、Delete、Ctrl-A/E/K 可用于编辑。
 
 ## 工具系统
 
@@ -289,13 +306,16 @@ Sonus
 | `read_skill` | 读取某个技能的完整流程。 |
 | `submit_result` | 提交最终结构化结果；校验通过后结束回合。 |
 
-搜索默认最多 15 秒、20,000 个文件；单次工具输出上限 60,000 字符。超出上限的内容转存 Artifact。常见凭据文件、私钥和敏感目录不会进入文本搜索。
+搜索默认最多 15 秒、20,000 个文件，单条匹配最多返回 500 字符，并跳过
+`.sunus`、`.git`、依赖目录和敏感目录。单次工具输出最多注入模型上下文
+16,000 字符；更大的结果自动转存 Artifact，并保留路径供后续按需读取。
+完整工具输出硬上限仍为 60,000 字符。
 
 上下文统计直接复用本轮真实检索结果，不会为了计算再执行一次不同的查询。字符数是精确值；`estimated_tokens` 使用内置的 CJK/ASCII 启发式估算，并始终标记 `exact=false`。需要 Provider 精确 Token 时，应使用 API 返回的 usage，而不是把估算值当成账单或上下文窗口结论。
 
 ## 模型 Provider
 
-Sonus 通过统一 Provider 接口选择模型服务：
+Sunus 通过统一 Provider 接口选择模型服务：
 
 | Provider | 默认接口 | 说明 |
 | --- | --- | --- |
@@ -307,10 +327,10 @@ Sonus 通过统一 Provider 接口选择模型服务：
 选择 Provider：
 
 ```bash
-MINIMAX_API_KEY="..." sonus --provider minimax
-OPENAI_API_KEY="..." sonus --provider openai \
+MINIMAX_API_KEY="..." sunus --provider minimax
+OPENAI_API_KEY="..." sunus --provider openai \
   --api-mode responses --model <模型 ID>
-sonus --provider openai_compatible \
+sunus --provider openai_compatible \
   --base-url http://127.0.0.1:11434/v1 \
   --model <本地模型>
 ```
@@ -318,11 +338,11 @@ sonus --provider openai_compatible \
 查看当前 Provider 可访问的模型：
 
 ```bash
-sonus --provider minimax models
-sonus --provider openai --model <模型 ID> models
+sunus --provider minimax models
+sunus --provider openai --model <模型 ID> models
 ```
 
-ChatGPT 订阅和 OpenAI API 是不同产品。Sonus 只能使用 OpenAI API Key，不能复用网页版登录态或 Cookie。
+ChatGPT 订阅和 OpenAI API 是不同产品。Sunus 只能使用 OpenAI API Key，不能复用网页版登录态或 Cookie。
 
 MiniMax 使用官方 OpenAI 兼容地址 `https://api.minimax.io/v1`。工具调用属于标准 `tools` 流程；其 `reasoning_content` 会保留在多轮上下文中。详细字段以 [MiniMax 官方 OpenAI SDK 文档](https://platform.minimax.io/docs/api-reference/text-openai-api) 为准。
 
@@ -350,7 +370,7 @@ MiniMax 使用官方 OpenAI 兼容地址 `https://api.minimax.io/v1`。工具调
 ## 路径与执行边界
 
 - 文件工具默认只能访问当前工作区。
-- `.git`、`.sonus` 和运行时缓存目录禁止被文件工具修改。
+- `.git`、`.sunus` 和运行时缓存目录禁止被文件工具修改。
 - 相对路径基于启动目录解析。
 - 搜索不跟随符号链接，不读取过大的文件。
 - 命令通过独立进程组执行，超时后先终止再强制收敛。
@@ -361,7 +381,7 @@ MiniMax 使用官方 OpenAI 兼容地址 `https://api.minimax.io/v1`。工具调
 记忆数据库位于：
 
 ```text
-~/.sonus/memory.db
+~/.sunus/memory.db
 ```
 
 主要数据表：
@@ -371,10 +391,17 @@ MiniMax 使用官方 OpenAI 兼容地址 `https://api.minimax.io/v1`。工具调
 - `memory_usage`：哪一轮使用了哪条记忆。
 - `memory_credit`：有效、无效和未知反馈。
 - `memory_fts`：FTS5 全文检索索引；不可用时回退普通表。
+- `persona_traits`：Sunus 可演化性格画像，记录证据数、置信度、版本与状态。
 - `proactive_state`：主动陪伴状态。
 - `proactive_messages`：已生成主动消息与指纹。
 
-记忆按 `global` 或项目作用域隔离。明确偏好语句形成 `preference`，普通任务形成 `episode`，明确的表达/沟通反馈形成 `persona`。支持检索、信用、蒸馏和显式物理删除。
+记忆按 `global` 或项目作用域隔离。明确偏好语句形成 `preference`，普通任务形成 `episode`，明确的表达/沟通反馈形成 `persona`，实际发出的主动消息形成 `self_share`。支持检索、信用、蒸馏和显式物理删除。
+
+性格设定分为两层：`SUNUS_GENDER`、名字等属于明确身份设定；`persona_traits`
+属于可演化画像。你明确指定的性格或沟通方式会立即成为稳定特质；Sunus 从
+实际 `self_share` 中观察到的倾向先进入候选，累计 3 次独立证据后才稳定。
+画像保留置信度、证据数、版本和最近证据时间，默认最多 6 个稳定特质，避免
+单次表达被固化成性格或画像无限膨胀。
 
 偏好分为两类：
 
@@ -386,13 +413,15 @@ MiniMax 使用官方 OpenAI 兼容地址 `https://api.minimax.io/v1`。工具调
 常用命令：
 
 ```bash
-sonus memory recent
-sonus memory search "主动消息"
-sonus memory context-metrics "本地记忆 token 有多少"
-sonus memory score
-sonus memory distill
-sonus memory add "以后先给结论" --kind preference --global-scope --tags communication,persistent
-sonus memory forget <id> --yes
+sunus memory recent
+sunus memory search "主动消息"
+sunus memory context-metrics "本地记忆 token 有多少"
+sunus memory score
+sunus memory distill
+sunus memory persona
+sunus memory persona --distill
+sunus memory add "以后先给结论" --kind preference --global-scope --tags communication,persistent
+sunus memory forget <id> --yes
 ```
 
 `forget` 会同时清理索引、证据、使用记录和信用记录，属于显式物理删除。
@@ -417,32 +446,45 @@ sonus memory forget <id> --yes
 
 任何真实用户输入都会复位为 5 分钟。消息生成前会读取最近 7 天内的有效记忆，并额外保留所有带 `persistent` 标签的长期设定；结合最近交流生成自然、简短的消息。
 
-主动消息使用持久化的加权主题序列，100 条消息中的目标分布为：
+主动消息的五个主题本质上对应 Sunus 的五类记忆。系统先按持久化权重选择记忆类别，
+再只从该类别召回证据生成消息；不会因为某类内容更容易生成，就跨类别借用其他记忆：
 
-| 主题 | 权重 | 内容 |
+| 记忆类别 | 权重 | 取用内容 |
 | --- | ---: | --- |
 | 日常与情绪 | 20% | 定向召回近期生活、状态和情绪记忆后发起交流 |
 | 工作与 coding | 20% | 定向召回近期项目、代码、测试和目标记忆后轻量提醒 |
-| Sonus 性格与成长 | 20% | 使用逐步积累的 `persona` 互动习惯和性格记忆 |
-| Sonus 性别风格融合 | 20% | 用 Sonus 自身性别设定与用户明确性别证据，为日常或工作内容增加表达风格 |
+| Sunus 性格与成长 | 20% | 使用逐步积累的 `persona` 互动习惯和性格记忆 |
+| Sunus 性别风格融合 | 20% | 使用 Sunus 自身性别设定和用户明确称呼、性别记忆 |
 | 用户自定义癖好 | 20% | 使用用户设定；未设定时从明确兴趣和习惯记忆学习 |
 
 调度器使用平滑加权队列交错主题，默认五类等权轮换。`topic_index` 随主动消息持久化，进程重启不会总是从第一个主题开始；`proactive reset` 会同时重置主题序列。
 
-日常、工作和自定义癖好主题会使用独立的关键词召回，不只读取最近 8 条对话。Sonus 自身性别未设置时使用中性表达；用户性别只从用户明确设置或明确记忆学习，禁止根据姓名、职业或语气猜测。性别槽位不单独聊身份，而是融合进日常或工作内容。
+工作与 coding 记忆类别有单独的证据门槛：只有记忆中最近的项目仍标记为
+`partial_result`、`user_interrupt`，或正文明确包含“还没完成 / 未解决 /
+待修复”等未完成状态时才会进入候选集合。工作类别没有该证据时会从其余可用
+记忆类别中按原权重比例重新分配，不会借用项目记忆催进度，也不会把消息错误
+归到日常类别。其余类别默认写成 1-2 句、约 30 个汉字的自然生活短语；模型
+若返回建议、步骤、总结或待办式内容，会改走短句回退。
 
-明确反馈如“先给结论”“简洁一点”“称呼我阿峰”会沉淀成 `kind=persona`、`scope=global` 的互动习惯记忆，供性格与成长主题逐步使用。用户未填写自定义癖好时，20% 槽位仍然保留，由 Sonus 从真实兴趣记忆补充；没有依据时使用低压力开放问题。
+日常、工作和自定义癖好主题会使用独立的关键词召回，不只读取最近 8 条对话。Sunus 自身性别未设置时使用中性表达；用户性别只从用户明确设置或明确记忆学习，禁止根据姓名、职业或语气猜测。性别槽位不单独聊身份，而是融合进日常或工作内容。
 
-可用 `SONUS_GENDER` 设置 Sonus 自身性别，用 `SONUS_USER_GENDER` 设置用户性别，用 `SONUS_PROACTIVE_CUSTOM_QUIRKS="摄影,散步"` 设置自定义癖好；也可以在 `~/.sonus/config.json` 的 `proactive` 块中配置。
+明确反馈如“先给结论”“简洁一点”“称呼我阿峰”会沉淀成 `kind=persona`、`scope=global` 的互动习惯记忆，供性格与成长主题逐步使用。用户未填写自定义癖好时，20% 槽位仍然保留，由 Sunus 从真实兴趣记忆补充；没有依据时使用低压力开放问题。
+
+可用 `SUNUS_GENDER` 设置 Sunus 自身性别，用 `SUNUS_USER_GENDER` 设置用户性别，用 `SUNUS_PROACTIVE_CUSTOM_QUIRKS="摄影,散步"` 设置自定义癖好；也可以在 `~/.sunus/config.json` 的 `proactive` 块中配置。
 
 主动陪伴状态跨进程持久化；休眠或恢复不会补发消息洪峰。生成失败使用 60 秒短重试，不计入未回复次数。
+
+主动消息本身也是 Sunus 的自我分享记忆。只有实际送达或由用户手动 trigger 后，
+才会以 `kind=self_share`、`scope=global` 写入记忆库，并记录消息 ID、原记忆类别、
+触发方式和工作区；单纯生成、预览或测试不会写入。后续主动消息会读取最近
+`self_share` 维持表达连续性，自我成长类别还会把它与 `persona` 记忆一起使用。
 
 默认比例为五类各 20%；用户明确要求时可以调整，修改会立即应用并持久化：
 
 ```bash
-sonus proactive ratios
-sonus proactive ratios 日常=30 工作=20 成长=20 性别=10 癖好=20
-sonus proactive ratios daily_emotion=20 work_coding=20 self_evolution=20 user_gender=20 user_custom=20
+sunus proactive ratios
+sunus proactive ratios 日常=30 工作=20 成长=20 性别=10 癖好=20
+sunus proactive ratios daily_emotion=20 work_coding=20 self_evolution=20 user_gender=20 user_custom=20
 ```
 
 交互模式：
@@ -452,22 +494,22 @@ sonus proactive ratios daily_emotion=20 work_coding=20 self_evolution=20 user_ge
 /proactive ratios 日常=30 工作=20 成长=20 性别=10 癖好=20
 ```
 
-所有比例必须合计 100，并支持中英文主题别名。修改写入 `~/.sonus/config.json`，不会覆盖其他配置。
+所有比例必须合计 100，并支持中英文主题别名。修改写入 `~/.sunus/config.json`，不会覆盖其他配置。
 
 ```bash
-sonus proactive status
-sonus proactive pause
-sonus proactive resume
-sonus proactive reset
-sonus proactive trigger
+sunus proactive status
+sunus proactive pause
+sunus proactive resume
+sunus proactive reset
+sunus proactive trigger
 ```
 
 ## 会话与审计
 
 运行数据有两处：
 
-- 工作区 `.sonus/`：当前项目的会话和 Artifact，权限 0700。
-- `~/.sonus/`：全局记忆、配置、事件日志和会话回退目录。
+- 工作区 `.sunus/`：当前项目的会话和 Artifact，权限 0700。
+- `~/.sunus/`：全局记忆、配置、事件日志和会话回退目录。
 
 每轮结束生成 Receipt，包含：
 
@@ -485,29 +527,29 @@ sonus proactive trigger
 常用环境变量：
 
 ```bash
-export SONUS_API_KEY="..."
-export SONUS_PROVIDER="deepseek"
-export SONUS_API_MODE="chat_completions"
-export SONUS_MODEL="deepseek-flash"
-export SONUS_BASE_URL="https://api.deepseek.com"
-export SONUS_TOKEN_PARAMETER="max_tokens"
-export SONUS_REASONING_EFFORT=""
-export SONUS_DATA_DIR="$HOME/.sonus"
-export SONUS_PROVIDER_CONFIG="$HOME/.sonus/provider.toml"
-export SONUS_PROVIDER_HOME="$HOME/.sonus/runtime"
-export SONUS_RG_PATH="/path/to/rg"
+export SUNUS_API_KEY="..."
+export SUNUS_PROVIDER="deepseek"
+export SUNUS_API_MODE="chat_completions"
+export SUNUS_MODEL="deepseek-flash"
+export SUNUS_BASE_URL="https://api.deepseek.com"
+export SUNUS_TOKEN_PARAMETER="max_tokens"
+export SUNUS_REASONING_EFFORT=""
+export SUNUS_DATA_DIR="$HOME/.sunus"
+export SUNUS_PROVIDER_CONFIG="$HOME/.sunus/provider.toml"
+export SUNUS_PROVIDER_HOME="$HOME/.sunus/runtime"
+export SUNUS_RG_PATH="/path/to/rg"
 ```
 
 凭据解析顺序：
 
-1. `SONUS_API_KEY`
+1. `SUNUS_API_KEY`
 2. Provider 专用环境变量：`DEEPSEEK_API_KEY`、`OPENAI_API_KEY` 或 `MINIMAX_API_KEY`
-3. `SONUS_PROVIDER_CONFIG` 指向的本地 TOML
+3. `SUNUS_PROVIDER_CONFIG` 指向的本地 TOML
 4. 默认 Provider 为本机已有的 DeepSeek 配置
 
 凭据不会复制进项目，也不会写入日志或诊断输出。
 
-用户配置可写在 `~/.sonus/config.json`：
+用户配置可写在 `~/.sunus/config.json`：
 
 ```json
 {
@@ -526,14 +568,15 @@ export SONUS_RG_PATH="/path/to/rg"
     "consecutive_failure_hard": 4,
     "max_recoveries": 2,
     "finalization_reserve": 2,
-    "context_soft_tokens": 24000,
-    "context_hard_tokens": 40000,
-    "context_keep_recent": 16,
-    "context_summary_chars": 12000,
-    "max_response_tokens": 2048
+    "context_soft_tokens": 200000,
+    "context_hard_tokens": 960000,
+    "context_keep_recent": 48,
+    "context_summary_chars": 48000,
+    "max_response_tokens": 8192,
+    "max_total_tokens": 2000000
   },
-  "max_steps": 20,
-  "max_tokens": 4096,
+  "max_steps": 60,
+  "max_tokens": 16384,
   "request_timeout_sec": 120,
   "proactive": {
     "enabled": true,
@@ -549,7 +592,7 @@ export SONUS_RG_PATH="/path/to/rg"
       "user_gender": 10,
       "user_custom": 20
     },
-    "sonus_gender": "",
+    "sunus_gender": "",
     "user_gender": "",
     "custom_quirks": []
   }
@@ -559,22 +602,22 @@ export SONUS_RG_PATH="/path/to/rg"
 ## 常用命令
 
 ```bash
-sonus
-sonus --no-proactive
-sonus --verbose
-sonus --budget quick
-sonus -C /path/to/project
-sonus exec "任务"
-sonus exec --json "任务"
-sonus exec --resume last "继续上一轮"
-sonus exec --fork <session_id> "换一种方案"
-sonus sessions
-sonus resume --last
-sonus fork <session_id>
-sonus doctor
-sonus doctor --network
-sonus proactive status|ratios|pause|resume|reset|trigger
-sonus memory recent|search|context-metrics|score|distill|add|forget
+sunus
+sunus --no-proactive
+sunus --verbose
+sunus --budget quick
+sunus -C /path/to/project
+sunus exec "任务"
+sunus exec --json "任务"
+sunus exec --resume last "继续上一轮"
+sunus exec --fork <session_id> "换一种方案"
+sunus sessions
+sunus resume --last
+sunus fork <session_id>
+sunus doctor
+sunus doctor --network
+sunus proactive status|ratios|pause|resume|reset|trigger
+sunus memory recent|search|context-metrics|score|distill|add|forget
 ```
 
 交互命令：
@@ -612,9 +655,9 @@ python3 -m unittest discover -s tests -v
 
 - 当前模型调用为非流式请求；执行时间线实时显示模型轮次与工具过程，但模型文本仍是响应生成完成后呈现。
 - 当前支持 Chat Completions 与 Responses 两类协议；不直接支持 Anthropic、Gemini 的原生消息协议。
-- OpenAI 必须使用 API Key；ChatGPT 网页订阅、Cookie 和网页会话不能作为 Sonus 的 API 凭据。
+- OpenAI 必须使用 API Key；ChatGPT 网页订阅、Cookie 和网页会话不能作为 Sunus 的 API 凭据。
 - 不提供操作系统级沙箱，不能安全执行来源不明的恶意代码。
 - 命令的静态风险分级不能替代系统隔离、容器或虚拟机。
 - 网络能力需要显式授权；主动消息不会自行访问第三方系统。
 - 内置上下文 Token 是依赖无关的估算值；Provider 的精确 usage 只能在模型响应返回后获得。
-- 当前语音能力由外部桥负责，Sonus 内核保留文本、事件和中断边界。
+- 当前语音能力由外部桥负责，Sunus 内核保留文本、事件和中断边界。

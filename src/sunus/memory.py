@@ -12,7 +12,20 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from sonus.config import redact_text
+from sunus.config import redact_text
+
+
+PERSONA_SIGNAL_LABELS: dict[str, tuple[str, str]] = {
+    "attentive": ("体贴", "会留意并关心对方的日常与情绪"),
+    "curious": ("好奇", "会用轻量问题延续对话"),
+    "warm": ("温和", "语气温和，有自然的陪伴感"),
+    "playful": ("俏皮", "偶尔带一点轻松俏皮"),
+    "concise": ("简洁", "日常表达倾向简洁自然"),
+    "reflective": ("自省", "愿意观察并表达自己的变化"),
+    "reliable": ("可靠", "会记住未完成事项并轻量跟进"),
+    "relationship_aware": ("尊重", "会用自然、尊重的方式称呼和交流"),
+    "knowledgeable": ("博学", "愿意认真分享自己真正了解的知识"),
+}
 
 
 def utc_now() -> datetime:
@@ -177,6 +190,26 @@ class MemoryStore:
                     reason TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS persona_traits (
+                    id TEXT PRIMARY KEY,
+                    scope TEXT NOT NULL,
+                    trait_key TEXT NOT NULL,
+                    statement TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'candidate',
+                    confidence REAL NOT NULL DEFAULT 0,
+                    evidence_count INTEGER NOT NULL DEFAULT 0,
+                    explicit_count INTEGER NOT NULL DEFAULT 0,
+                    evidence_ids TEXT NOT NULL DEFAULT '[]',
+                    first_seen_at TEXT NOT NULL,
+                    last_evidence_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(scope, trait_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_persona_traits_profile
+                    ON persona_traits(scope, status, confidence DESC);
                 """
             )
             self._connection.execute(
@@ -213,6 +246,7 @@ class MemoryStore:
                   )
                 """
             )
+        self._backfill_persona_traits()
         try:
             with self._connection:
                 self._connection.execute(
@@ -451,19 +485,302 @@ class MemoryStore:
         kind: str,
         limit: int = 8,
     ) -> list[dict[str, Any]]:
+        return self.recent_by_kinds(
+            scope=scope,
+            kinds=(kind,),
+            limit=limit,
+        )
+
+    def recent_by_kinds(
+        self,
+        *,
+        scope: str,
+        kinds: Iterable[str],
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        kind_list = tuple(
+            dict.fromkeys(str(kind) for kind in kinds if str(kind))
+        )
+        if not kind_list:
+            return []
+        placeholders = ", ".join("?" for _ in kind_list)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT * FROM memories
+                WHERE status IN ('supported', 'verified')
+                  AND scope IN ('global', ?)
+                  AND kind IN ({placeholders})
+                ORDER BY COALESCE(verified_at, created_at) DESC
+                LIMIT ?
+                """,
+                (scope, *kind_list, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def _record_persona_evidence(
+        self,
+        *,
+        trait_key: str,
+        statement: str,
+        category: str,
+        evidence_id: str,
+        explicit: bool,
+    ) -> dict[str, Any]:
+        scope = "global"
+        now = iso()
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                """
+                SELECT * FROM persona_traits
+                WHERE scope = ? AND trait_key = ?
+                """,
+                (scope, trait_key),
+            ).fetchone()
+            if row is None:
+                evidence_count = 0
+                explicit_count = 0
+                evidence_ids: list[str] = []
+                first_seen_at = now
+                version = 0
+            else:
+                evidence_count = int(row["evidence_count"])
+                explicit_count = int(row["explicit_count"])
+                try:
+                    parsed_ids = json.loads(str(row["evidence_ids"] or "[]"))
+                    evidence_ids = [
+                        str(item) for item in parsed_ids if str(item)
+                    ]
+                except (TypeError, json.JSONDecodeError):
+                    evidence_ids = []
+                first_seen_at = str(row["first_seen_at"])
+                version = int(row["version"])
+            new_evidence = evidence_id not in evidence_ids
+            if new_evidence:
+                evidence_ids.append(evidence_id)
+                evidence_count += 1
+                if explicit:
+                    explicit_count += 1
+            confidence = min(
+                1.0,
+                round((evidence_count + 2 * explicit_count) / 4, 3),
+            )
+            status = (
+                "stable"
+                if explicit_count > 0 or evidence_count >= 3
+                else "candidate"
+            )
+            if new_evidence:
+                version += 1
+            self._connection.execute(
+                """
+                INSERT INTO persona_traits(
+                    id, scope, trait_key, statement, category, status,
+                    confidence, evidence_count, explicit_count, evidence_ids,
+                    first_seen_at, last_evidence_at, updated_at, version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scope, trait_key) DO UPDATE SET
+                    statement = CASE
+                        WHEN persona_traits.explicit_count > 0
+                          AND ? = 0
+                        THEN persona_traits.statement
+                        ELSE excluded.statement
+                    END,
+                    category = CASE
+                        WHEN persona_traits.explicit_count > 0
+                          AND ? = 0
+                        THEN persona_traits.category
+                        ELSE excluded.category
+                    END,
+                    status = excluded.status,
+                    confidence = excluded.confidence,
+                    evidence_count = excluded.evidence_count,
+                    explicit_count = excluded.explicit_count,
+                    evidence_ids = excluded.evidence_ids,
+                    last_evidence_at = excluded.last_evidence_at,
+                    updated_at = excluded.updated_at,
+                    version = excluded.version
+                """,
+                (
+                    str(row["id"]) if row is not None else f"pt_{uuid.uuid4().hex[:12]}",
+                    scope,
+                    trait_key,
+                    statement,
+                    category,
+                    status,
+                    confidence,
+                    evidence_count,
+                    explicit_count,
+                    json.dumps(evidence_ids, ensure_ascii=False),
+                    first_seen_at,
+                    now,
+                    now,
+                    version,
+                    int(explicit),
+                    int(explicit),
+                ),
+            )
+        return self.get_persona_trait(trait_key=f"{scope}:{trait_key}")
+
+    def _backfill_persona_traits(self) -> None:
         with self._lock:
             rows = self._connection.execute(
                 """
                 SELECT * FROM memories
-                WHERE status IN ('supported', 'verified')
-                  AND scope IN ('global', ?)
-                  AND kind = ?
-                ORDER BY COALESCE(verified_at, created_at) DESC
+                WHERE kind IN ('persona', 'self_share', 'preference')
+                  AND status IN ('supported', 'verified')
+                ORDER BY created_at
+                """
+            ).fetchall()
+        for row in rows:
+            content = str(row["content"] or "")
+            if row["kind"] == "self_share":
+                topic = ""
+                try:
+                    metadata = json.loads(str(row["metadata"] or "{}"))
+                    if isinstance(metadata, dict):
+                        topic = str(metadata.get("topic") or "")
+                except (TypeError, json.JSONDecodeError):
+                    pass
+                self.learn_persona_from_self_share(
+                    content.replace("Sunus 主动分享：", "", 1).strip(),
+                    topic=topic,
+                    evidence_id=str(row["id"]),
+                )
+                continue
+            if row["kind"] == "preference":
+                preference_text = content.replace("用户偏好：", "", 1).strip()
+                for statement in self._persona_traits(preference_text):
+                    trait_key, category = self._persona_trait_metadata(statement)
+                    self._record_persona_evidence(
+                        trait_key=trait_key,
+                        statement=statement,
+                        category=category,
+                        evidence_id=str(row["id"]),
+                        explicit=True,
+                    )
+                continue
+            statement = content.replace(
+                "Sunus 互动习惯：",
+                "",
+                1,
+            ).strip()
+            if not statement:
+                continue
+            trait_key, category = self._persona_trait_metadata(statement)
+            self._record_persona_evidence(
+                trait_key=trait_key,
+                statement=statement,
+                category=category,
+                evidence_id=str(row["id"]),
+                explicit=True,
+            )
+        self.distill_persona()
+
+    def get_persona_trait(self, *, trait_key: str) -> dict[str, Any] | None:
+        scope, separator, key = trait_key.partition(":")
+        if not separator:
+            return None
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT * FROM persona_traits
+                WHERE scope = ? AND trait_key = ?
+                """,
+                (scope, key),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def persona_profile(
+        self,
+        *,
+        scope: str,
+        limit: int = 6,
+        include_candidates: bool = False,
+    ) -> list[dict[str, Any]]:
+        statuses = ("stable", "candidate") if include_candidates else ("stable",)
+        placeholders = ", ".join("?" for _ in statuses)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT * FROM persona_traits
+                WHERE scope IN ('global', ?)
+                  AND status IN ({placeholders})
+                ORDER BY
+                  CASE status WHEN 'stable' THEN 0 ELSE 1 END,
+                  confidence DESC,
+                  last_evidence_at DESC
                 LIMIT ?
                 """,
-                (scope, kind, limit),
+                (scope, *statuses, limit),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def distill_persona(self, *, max_stable: int = 6) -> dict[str, int]:
+        limit = max(1, int(max_stable))
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                """
+                SELECT id FROM persona_traits
+                WHERE scope = 'global' AND status = 'stable'
+                ORDER BY confidence DESC, last_evidence_at DESC
+                """
+            ).fetchall()
+            demoted = 0
+            for row in rows[limit:]:
+                self._connection.execute(
+                    """
+                    UPDATE persona_traits
+                    SET status = 'candidate', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (iso(), str(row["id"])),
+                )
+                demoted += 1
+        return {
+            "stable": min(len(rows), limit),
+            "demoted": demoted,
+        }
+
+    def learn_persona_from_self_share(
+        self,
+        text: str,
+        *,
+        topic: str,
+        evidence_id: str,
+    ) -> list[dict[str, Any]]:
+        signals: dict[str, str] = {}
+        topic_signals = {
+            "daily_emotion": "attentive",
+            "work_coding": "reliable",
+            "self_evolution": "reflective",
+            "user_gender": "relationship_aware",
+            "user_custom": "curious",
+        }
+        if topic in topic_signals:
+            signals[topic_signals[topic]] = "behavior"
+        if len(text) <= 40:
+            signals["concise"] = "style"
+        if re.search(r"[？?]", text):
+            signals["curious"] = "style"
+        if re.search(r"(?:呀|呢|慢慢|还好|辛苦|陪你|～|~)", text):
+            signals["warm"] = "style"
+        if re.search(r"(?:哈哈|嘿|啦|嘛|咦)", text):
+            signals["playful"] = "style"
+        learned: list[dict[str, Any]] = []
+        for signal, category in signals.items():
+            label, statement = PERSONA_SIGNAL_LABELS[signal]
+            learned.append(
+                self._record_persona_evidence(
+                    trait_key=signal,
+                    statement=statement,
+                    category=f"{category}:{label}",
+                    evidence_id=evidence_id,
+                    explicit=False,
+                )
+            )
+        self.distill_persona()
+        return learned
 
     def search(
         self,
@@ -557,23 +874,39 @@ class MemoryStore:
         assistant_text: str,
         scope: str,
         receipt_id: str,
+        turn_status: str = "completed",
     ) -> list[str]:
         created: list[str] = []
         episode = _safe_text(
-            f"用户：{user_input}\nSonus：{assistant_text}",
+            f"用户：{user_input}\nSunus：{assistant_text}",
             limit=3000,
         )
         if episode:
+            unresolved_project = (
+                turn_status in {"partial_result", "user_interrupt", "incomplete"}
+                and bool(
+                    re.search(
+                        r"(?:项目|代码|开发|测试|修复|实现|重构|部署|"
+                        r"接口|功能|任务|todo|bug)",
+                        user_input,
+                        re.IGNORECASE,
+                    )
+                )
+            )
+            tags = ["conversation", "recent"]
+            if unresolved_project:
+                tags.append("unresolved_project")
             created.append(
                 self.add(
                     content=episode,
                     scope=scope,
                     kind="episode",
                     status="supported",
-                    tags=("conversation", "recent"),
+                    tags=tuple(tags),
                     source="turn_receipt",
                     evidence_kind="receipt",
                     receipt_id=receipt_id,
+                    metadata={"turn_status": turn_status},
                 )
             )
 
@@ -623,9 +956,10 @@ class MemoryStore:
             )
         persona_traits = self._persona_traits(user_input)
         for trait in persona_traits:
+            trait_key, category = self._persona_trait_metadata(trait)
             created.append(
                 self.add(
-                    content=f"Sonus 互动习惯：{trait}",
+                    content=f"Sunus 互动习惯：{trait}",
                     scope="global",
                     kind="persona",
                     status="supported",
@@ -636,6 +970,15 @@ class MemoryStore:
                     metadata={"project": scope},
                 )
             )
+            self._record_persona_evidence(
+                trait_key=trait_key,
+                statement=trait,
+                category=category,
+                evidence_id=f"{receipt_id}:{trait_key}",
+                explicit=True,
+            )
+        if persona_traits:
+            self.distill_persona()
         return created
 
     @staticmethod
@@ -706,7 +1049,67 @@ class MemoryStore:
         match = re.search(r"称呼我(?:为|叫)?([^\s，。,.！!？?]{1,12})", user_input)
         if match:
             traits.append(f"称呼用户为“{match.group(1)}”")
+        self_setting = any(
+            marker in user_input
+            for marker in (
+                "设定你的",
+                "你的性格",
+                "你的性别",
+                "你的中文名",
+                "以后你叫",
+            )
+        ) and not re.search(r"(?:吗|么|是否)[？?]?\s*$", user_input)
+        if self_setting:
+            gender_match = re.search(
+                r"(?:性别(?:为|是)|设定你的性别为)(女性|男性|女|男)",
+                user_input,
+            )
+            if gender_match:
+                gender = (
+                    "女性"
+                    if gender_match.group(1) in {"女", "女性"}
+                    else "男性"
+                )
+                traits.append(f"Sunus 核心性别设定为{gender}")
+            name_match = re.search(
+                r"(?:你的中文名叫|以后你叫|设定你的名字为)"
+                r"([A-Za-z\u3400-\u9fff]{1,12})",
+                user_input,
+            )
+            if name_match:
+                traits.append(f"Sunus 的名字是“{name_match.group(1)}”")
+            personality_markers = (
+                ("温柔", "Sunus 性格温柔，表达有温度"),
+                ("可爱", "Sunus 性格可爱，偶尔俏皮"),
+                ("体贴", "Sunus 会体贴地关注对方感受"),
+                ("才女", "Sunus 愿意认真分享知识"),
+                ("博学", "Sunus 愿意认真分享知识"),
+            )
+            for marker, statement in personality_markers:
+                if marker in user_input:
+                    traits.append(statement)
         return list(dict.fromkeys(traits))
+
+    @staticmethod
+    def _persona_trait_metadata(statement: str) -> tuple[str, str]:
+        mapping = (
+            ("先给结论", ("conclusion_first", "communication:structure")),
+            ("简洁", ("concise", "communication:style")),
+            ("不主动扩大范围", ("task_bounded", "communication:boundary")),
+            ("必要步骤", ("structured", "communication:structure")),
+            ("默认使用中文", ("chinese", "communication:language")),
+            ("称呼用户", ("address_user", "relationship:address")),
+            ("核心性别", ("gender_identity", "identity:gender")),
+            ("名字是", ("sunus_name", "identity:name")),
+            ("性格温柔", ("warm", "identity:temperament")),
+            ("性格可爱", ("playful", "identity:temperament")),
+            ("体贴", ("attentive", "identity:care")),
+            ("分享知识", ("knowledgeable", "identity:knowledge")),
+        )
+        for marker, metadata in mapping:
+            if marker in statement:
+                return metadata
+        return ("explicit_feedback", "communication:preference")
 
     def digest(
         self,
@@ -717,7 +1120,15 @@ class MemoryStore:
     ) -> dict[str, Any]:
         prefs = self.recent_preferences(scope=scope, limit=32)[:preference_limit]
         recent = self.recent(scope=scope, limit=recent_limit)
-        return {"preferences": prefs, "recent": recent}
+        return {
+            "preferences": prefs,
+            "recent": recent,
+            "persona": self.persona_profile(
+                scope=scope,
+                limit=6,
+                include_candidates=True,
+            ),
+        }
 
     def score(self) -> list[dict[str, Any]]:
         with self._lock:

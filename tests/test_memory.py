@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sonus.memory import MemoryStore, estimate_tokens, text_metrics
+from sunus.memory import MemoryStore, estimate_tokens, text_metrics
 
 
 class MemoryTests(unittest.TestCase):
@@ -94,7 +94,7 @@ class MemoryTests(unittest.TestCase):
                 status="supported",
             )
             memory.add(
-                content="Sonus 的记忆检索会注入相关情景",
+                content="Sunus 的记忆检索会注入相关情景",
                 scope="/project/example",
                 kind="semantic",
                 status="supported",
@@ -132,11 +132,11 @@ class MemoryTests(unittest.TestCase):
             memory.close()
 
     def test_token_estimate_is_stable_and_dependency_free(self) -> None:
-        metrics = text_metrics("Sonus 读取记忆 token")
-        self.assertEqual(metrics["characters"], len("Sonus 读取记忆 token"))
+        metrics = text_metrics("Sunus 读取记忆 token")
+        self.assertEqual(metrics["characters"], len("Sunus 读取记忆 token"))
         self.assertEqual(
             metrics["estimated_tokens"],
-            estimate_tokens("Sonus 读取记忆 token"),
+            estimate_tokens("Sunus 读取记忆 token"),
         )
         self.assertFalse(metrics["exact"])
         self.assertEqual(metrics["estimator"], "cjk-ascii-v1")
@@ -160,7 +160,208 @@ class MemoryTests(unittest.TestCase):
             self.assertTrue(any("先给结论" in item for item in contents))
             self.assertTrue(any("简洁" in item for item in contents))
             self.assertTrue(any("阿峰" in item for item in contents))
+            profile = memory.persona_profile(scope="/project/example")
+            keys = {item["trait_key"] for item in profile}
+            self.assertIn("conclusion_first", keys)
+            self.assertIn("concise", keys)
+            self.assertIn("address_user", keys)
+            self.assertTrue(all(item["status"] == "stable" for item in profile))
+
+            memory.learn_persona_from_self_share(
+                "今天还好吗？",
+                topic="daily_emotion",
+                evidence_id="self_share_after_explicit",
+            )
+            concise = next(
+                item
+                for item in memory.persona_profile(
+                    scope="/project/example",
+                    include_candidates=True,
+                )
+                if item["trait_key"] == "concise"
+            )
+            self.assertIn("表达尽量简洁", concise["statement"])
+            self.assertEqual(concise["evidence_count"], 2)
             memory.close()
+
+    def test_explicit_sunus_identity_becomes_stable_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            memory.record_turn(
+                user_input=(
+                    "我现在设定你的性别为女性格温柔可爱体贴，"
+                    "是一通晓天文地理音乐历史的才女"
+                ),
+                assistant_text="好呀。",
+                scope="/project/example",
+                receipt_id="r_identity_style",
+            )
+            memory.record_turn(
+                user_input="可以，以后你叫苏诺",
+                assistant_text="好。",
+                scope="/project/example",
+                receipt_id="r_identity_name",
+            )
+
+            profile = memory.persona_profile(scope="/project/example")
+            by_key = {item["trait_key"]: item for item in profile}
+
+            self.assertIn("gender_identity", by_key)
+            self.assertIn("sunus_name", by_key)
+            self.assertIn("warm", by_key)
+            self.assertIn("playful", by_key)
+            self.assertIn("attentive", by_key)
+            self.assertIn("knowledgeable", by_key)
+            self.assertIn("女性", by_key["gender_identity"]["statement"])
+            self.assertIn("苏诺", by_key["sunus_name"]["statement"])
+            memory.close()
+
+    def test_repeated_self_share_becomes_stable_persona_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            messages = (
+                ("今天还好吗？", "daily_emotion"),
+                ("记得慢慢来呀。", "daily_emotion"),
+                ("今天有没有开心一点呢？", "daily_emotion"),
+            )
+            for index, (text, topic) in enumerate(messages, start=1):
+                memory_id = memory.add(
+                    content=f"Sunus 主动分享：{text}",
+                    scope="global",
+                    kind="self_share",
+                    status="supported",
+                    tags=("proactive", "self_share", topic),
+                    source="test",
+                )
+                memory.learn_persona_from_self_share(
+                    text,
+                    topic=topic,
+                    evidence_id=memory_id,
+                )
+                profile = memory.persona_profile(
+                    scope="/project/example",
+                    include_candidates=True,
+                )
+                attentive = next(
+                    item
+                    for item in profile
+                    if item["trait_key"] == "attentive"
+                )
+                self.assertEqual(attentive["evidence_count"], index)
+                self.assertEqual(
+                    attentive["status"],
+                    "candidate" if index < 3 else "stable",
+                )
+
+            stable = memory.persona_profile(scope="/project/example")
+            self.assertIn(
+                "attentive",
+                {item["trait_key"] for item in stable},
+            )
+            self.assertTrue(
+                all(item["confidence"] >= 0.67 for item in stable)
+            )
+            memory.close()
+
+    def test_persona_distillation_keeps_six_stable_traits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            keys = (
+                "attentive",
+                "curious",
+                "warm",
+                "playful",
+                "concise",
+                "reflective",
+                "reliable",
+                "relationship_aware",
+            )
+            for key in keys:
+                memory._record_persona_evidence(
+                    trait_key=key,
+                    statement=f"trait {key}",
+                    category="test",
+                    evidence_id=f"evidence_{key}",
+                    explicit=True,
+                )
+
+            result = memory.distill_persona(max_stable=6)
+            profile = memory.persona_profile(
+                scope="/project/example",
+                include_candidates=True,
+                limit=20,
+            )
+
+            self.assertEqual(result["stable"], 6)
+            self.assertEqual(result["demoted"], 2)
+            self.assertEqual(
+                sum(item["status"] == "stable" for item in profile),
+                6,
+            )
+            memory.close()
+
+    def test_persona_backfill_is_idempotent_for_existing_memories(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "memory.db"
+            memory = MemoryStore(path)
+            memory.add(
+                content="Sunus 互动习惯：回答时先给结论，再说明关键依据",
+                scope="global",
+                kind="persona",
+                status="supported",
+                tags=("persona", "interaction", "style"),
+            )
+            memory.add(
+                content="用户偏好：我现在设定你的性别为女性，性格温柔",
+                scope="global",
+                kind="preference",
+                status="supported",
+                tags=("preference", "persistent"),
+            )
+            for index, text in enumerate(
+                ("今天还好吗？", "记得慢慢来呀。", "今天开心一点了吗？"),
+                start=1,
+            ):
+                memory.add(
+                    content=f"Sunus 主动分享：{text}",
+                    scope="global",
+                    kind="self_share",
+                    status="supported",
+                    tags=("proactive", "self_share", "daily_emotion"),
+                    metadata={"topic": "daily_emotion"},
+                    source="test",
+                )
+            memory.close()
+
+            reopened = MemoryStore(path)
+            profile = reopened.persona_profile(
+                scope="/project/example",
+                include_candidates=True,
+                limit=20,
+            )
+            by_key = {item["trait_key"]: item for item in profile}
+            self.assertEqual(by_key["conclusion_first"]["status"], "stable")
+            self.assertEqual(by_key["gender_identity"]["status"], "stable")
+            self.assertIn("warm", by_key)
+            self.assertEqual(by_key["attentive"]["status"], "stable")
+            self.assertEqual(by_key["attentive"]["evidence_count"], 3)
+            reopened.close()
+
+            reopened_again = MemoryStore(path)
+            again = {
+                item["trait_key"]: item
+                for item in reopened_again.persona_profile(
+                    scope="/project/example",
+                    include_candidates=True,
+                    limit=20,
+                )
+            }
+            self.assertEqual(again["attentive"]["evidence_count"], 3)
+            self.assertEqual(
+                again["attentive"]["version"],
+                by_key["attentive"]["version"],
+            )
+            reopened_again.close()
 
     def test_persistent_quirks_survive_recency_window(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -250,6 +451,24 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual([item["id"] for item in rows], [memory_id])
             self.assertIn("persistent", rows[0]["tags"].split(","))
             reopened.close()
+
+    def test_partial_work_turn_is_tagged_as_unresolved_project(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+
+            memory.record_turn(
+                user_input="继续修复 Sunus 项目的测试链路",
+                assistant_text="目前只完成了前半部分。",
+                scope="/project/example",
+                receipt_id="r_partial",
+                turn_status="partial_result",
+            )
+
+            rows = memory.recent(scope="/project/example", limit=5)
+            episode = next(item for item in rows if item["kind"] == "episode")
+            self.assertIn("unresolved_project", episode["tags"].split(","))
+            self.assertIn('"turn_status": "partial_result"', episode["metadata"])
+            memory.close()
 
 
 if __name__ == "__main__":

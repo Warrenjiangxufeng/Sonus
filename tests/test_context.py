@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from sonus.context import (
+from sunus.context import (
     compact_messages,
     estimate_messages_tokens,
     repair_tool_pairs,

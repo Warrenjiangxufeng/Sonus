@@ -4,5 +4,5 @@ SELF=$(/usr/local/bin/python3 -c 'import os,sys; print(os.path.realpath(sys.argv
 BIN_DIR=$(dirname "$SELF")
 PROJECT_ROOT=$(dirname "$BIN_DIR")
 export PYTHONPATH="$PROJECT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
-exec /usr/local/bin/python3 -m sonus "$@"
+exec /usr/local/bin/python3 -m sunus "$@"
 

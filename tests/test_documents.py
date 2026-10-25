@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from sonus.documents import render_document
+from sunus.documents import render_document
 
 
 class DocumentTests(unittest.TestCase):
@@ -18,11 +18,11 @@ class DocumentTests(unittest.TestCase):
                 {"heading": "安全边界", "body": "安全内容"},
                 {"heading": "验证", "body": "验证内容"},
             ],
-            sources=["src/sonus/agent.py"],
+            sources=["src/sunus/agent.py"],
             generated_at="2026-10-24T00:00:00+00:00",
         )
-        self.assertIn("sonus_document: design", content)
-        self.assertIn("sonus_sources:", content)
+        self.assertIn("sunus_document: design", content)
+        self.assertIn("sunus_sources:", content)
         self.assertIn("# 测试设计", content)
         self.assertIn("## 架构", content)
 

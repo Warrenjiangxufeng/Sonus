@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from sonus.scope import classify_request
+from sunus.scope import (
+    classify_request,
+    classify_request_with_context,
+    is_casual_conversation,
+)
 
 
 class RequestScopeTests(unittest.TestCase):
@@ -36,6 +40,50 @@ class RequestScopeTests(unittest.TestCase):
         self.assertTrue(scope.allows_suggestions)
         self.assertFalse(scope.allows_mutation)
         self.assertFalse(scope.allows_commands)
+
+    def test_casual_conversation_is_separate_from_project_questions(self) -> None:
+        for text in (
+            "哈喽在干嘛",
+            "聊天别这么呆板嘛，你是女孩吗",
+            "是有点冷淡了",
+            "怎么追一个不太喜欢你的相亲对象啊",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_casual_conversation(text))
+
+        for text in (
+            "codex CLI 能同时开两个窗口吗",
+            "修复登录接口并运行测试",
+            "分析当前项目架构",
+            "读取 Documents/Sunus/README.md",
+            "读取 note.txt",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_casual_conversation(text))
+
+    def test_referential_followup_inherits_only_proposed_capability(self) -> None:
+        previous = (
+            "我手里确实有联网工具，只是默认关着。"
+            "你要是愿意，我现在试一次，去搜搜看。"
+        )
+        scope = classify_request_with_context(
+            "试一下，特别是江浙沪ip的",
+            previous_assistant=previous,
+        )
+        self.assertTrue(scope.allows_network)
+        self.assertFalse(scope.allows_mutation)
+        self.assertFalse(scope.allows_commands)
+        self.assertFalse(
+            is_casual_conversation(
+                "试一下，特别是江浙沪ip的",
+                previous_assistant=previous,
+            )
+        )
+        without_network_offer = classify_request_with_context(
+            "试一下",
+            previous_assistant="我刚才只是在解释概念。",
+        )
+        self.assertFalse(without_network_offer.allows_network)
 
 
 if __name__ == "__main__":

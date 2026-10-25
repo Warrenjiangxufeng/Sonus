@@ -7,10 +7,10 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from sonus.cli import run_exec
-from sonus.config import RuntimeConfig
-from sonus.model import ModelReply
-from sonus.storage import list_sessions
+from sunus.cli import run_exec
+from sunus.config import RuntimeConfig
+from sunus.model import ModelReply
+from sunus.storage import list_sessions
 
 
 class ResumeAwareModel:
@@ -75,7 +75,7 @@ class SessionCliTests(unittest.TestCase):
             config = self.config(root)
             model = ResumeAwareModel()
             with (
-                patch("sonus.cli.create_model_client", return_value=model),
+                patch("sunus.cli.create_model_client", return_value=model),
                 redirect_stdout(io.StringIO()),
             ):
                 first_code = run_exec(
@@ -103,7 +103,7 @@ class SessionCliTests(unittest.TestCase):
             config = self.config(root)
             model = ResumeAwareModel()
             with (
-                patch("sonus.cli.create_model_client", return_value=model),
+                patch("sunus.cli.create_model_client", return_value=model),
                 redirect_stdout(io.StringIO()),
             ):
                 run_exec(config, "第一轮", json_mode=True, verbose=False)

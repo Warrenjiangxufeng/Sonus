@@ -8,9 +8,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sonus.config import (
+from sunus.config import (
     ConfigError,
-    load_sonus_deepseek_config,
+    load_sunus_deepseek_config,
     redact_text,
     redact_value,
     resolve_config,
@@ -19,7 +19,7 @@ from sonus.config import (
 
 
 class ConfigTests(unittest.TestCase):
-    def test_reads_sonus_deepseek_provider(self) -> None:
+    def test_reads_sunus_deepseek_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.toml"
             path.write_text(
@@ -31,7 +31,7 @@ experimental_bearer_token ="sk-test-secret-value"
 """.strip(),
                 encoding="utf-8",
             )
-            key, base = load_sonus_deepseek_config(path)
+            key, base = load_sunus_deepseek_config(path)
             self.assertEqual(key, "sk-test-secret-value")
             self.assertEqual(base, "https://api.deepseek.com")
 
@@ -45,9 +45,9 @@ experimental_bearer_token ="sk-test-secret-value"
                 encoding="utf-8",
             )
             env = {
-                "SONUS_DATA_DIR": str(data),
-                "SONUS_API_KEY": "sk-test-env",
-                "SONUS_MODEL": "deepseek-flash",
+                "SUNUS_DATA_DIR": str(data),
+                "SUNUS_API_KEY": "sk-test-env",
+                "SUNUS_MODEL": "deepseek-flash",
             }
             with patch.dict(os.environ, env, clear=False):
                 config = resolve_config(root / "workspace")
@@ -67,15 +67,16 @@ experimental_bearer_token ="sk-test-secret-value"
                 },
             )
             self.assertEqual(config.proactive.user_gender, "")
-            self.assertEqual(config.proactive.sonus_gender, "")
+            self.assertEqual(config.proactive.sunus_gender, "")
             self.assertEqual(config.proactive.custom_topics, ())
             self.assertEqual(config.proactive.custom_quirks, ())
             self.assertEqual(config.loop_budget.profile, "standard")
-            self.assertEqual(config.loop_budget.max_model_calls, 20)
-            self.assertEqual(config.loop_budget.max_response_tokens, 2048)
+            self.assertEqual(config.loop_budget.max_model_calls, 60)
+            self.assertEqual(config.loop_budget.max_response_tokens, 8192)
             self.assertEqual(config.loop_budget.finalization_reserve, 2)
-            self.assertEqual(config.loop_budget.context_soft_tokens, 24_000)
-            self.assertEqual(config.loop_budget.context_hard_tokens, 40_000)
+            self.assertEqual(config.loop_budget.context_soft_tokens, 200_000)
+            self.assertEqual(config.loop_budget.context_hard_tokens, 960_000)
+            self.assertEqual(config.loop_budget.max_total_tokens, 2_000_000)
             self.assertNotIn("sk-test-env", repr(config))
             mode = stat.S_IMODE(data.stat().st_mode)
             self.assertEqual(mode, 0o700)
@@ -107,7 +108,7 @@ experimental_bearer_token ="sk-test-secret-value"
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             env = {
-                "SONUS_DATA_DIR": str(root / "data"),
+                "SUNUS_DATA_DIR": str(root / "data"),
                 "MINIMAX_API_KEY": "mx-test",
             }
             with patch.dict(os.environ, env, clear=True):
@@ -125,7 +126,7 @@ experimental_bearer_token ="sk-test-secret-value"
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             env = {
-                "SONUS_DATA_DIR": str(root / "data"),
+                "SUNUS_DATA_DIR": str(root / "data"),
                 "OPENAI_API_KEY": "sk-openai-test",
             }
             with patch.dict(os.environ, env, clear=True):
@@ -155,8 +156,8 @@ experimental_bearer_token ="sk-test-secret-value"
                 encoding="utf-8",
             )
             env = {
-                "SONUS_DATA_DIR": str(data),
-                "SONUS_API_KEY": "sk-test",
+                "SUNUS_DATA_DIR": str(data),
+                "SUNUS_API_KEY": "sk-test",
             }
             with patch.dict(os.environ, env, clear=True):
                 config = resolve_config(
@@ -170,6 +171,24 @@ experimental_bearer_token ="sk-test-secret-value"
             self.assertEqual(config.loop_budget.finalization_reserve, 1)
             self.assertEqual(config.loop_budget.context_keep_recent, 10)
             self.assertEqual(config.max_steps, 8)
+
+    def test_deep_profile_supports_million_token_context_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            env = {
+                "SUNUS_DATA_DIR": str(root / "data"),
+                "SUNUS_API_KEY": "sk-test",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                config = resolve_config(
+                    root / "workspace",
+                    budget_profile="deep",
+                )
+            self.assertEqual(config.loop_budget.context_soft_tokens, 400_000)
+            self.assertEqual(config.loop_budget.context_hard_tokens, 960_000)
+            self.assertEqual(config.loop_budget.max_total_tokens, 4_000_000)
+            self.assertEqual(config.loop_budget.max_response_tokens, 16_384)
+            self.assertEqual(config.max_tokens, 16_384)
 
     def test_proactive_topic_gender_and_custom_focus(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -187,7 +206,7 @@ experimental_bearer_token ="sk-test-secret-value"
                                 "user_gender": 10,
                                 "user_custom": 25,
                             },
-                            "sonus_gender": "女",
+                            "sunus_gender": "女",
                             "user_gender": "男",
                             "custom_quirks": ["收集钢笔", "雨天散步"],
                         }
@@ -197,15 +216,15 @@ experimental_bearer_token ="sk-test-secret-value"
                 encoding="utf-8",
             )
             env = {
-                "SONUS_DATA_DIR": str(data),
-                "SONUS_API_KEY": "sk-test",
+                "SUNUS_DATA_DIR": str(data),
+                "SUNUS_API_KEY": "sk-test",
             }
             with patch.dict(os.environ, env, clear=True):
                 config = resolve_config(root / "workspace")
 
             self.assertEqual(dict(config.proactive.topic_weights)["daily_emotion"], 35)
             self.assertEqual(config.proactive.user_gender, "男")
-            self.assertEqual(config.proactive.sonus_gender, "女")
+            self.assertEqual(config.proactive.sunus_gender, "女")
             self.assertEqual(
                 config.proactive.custom_quirks,
                 ("收集钢笔", "雨天散步"),
@@ -231,8 +250,8 @@ experimental_bearer_token ="sk-test-secret-value"
                 encoding="utf-8",
             )
             env = {
-                "SONUS_DATA_DIR": str(data),
-                "SONUS_API_KEY": "sk-test",
+                "SUNUS_DATA_DIR": str(data),
+                "SUNUS_API_KEY": "sk-test",
             }
             with (
                 patch.dict(os.environ, env, clear=True),

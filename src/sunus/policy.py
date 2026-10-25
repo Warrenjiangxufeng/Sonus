@@ -46,7 +46,7 @@ class PathGuard:
 
     def assert_writable(self, path: Path) -> None:
         resolved = path.resolve(strict=False)
-        protected_parts = {".git", ".sonus", "__pycache__"}
+        protected_parts = {".git", ".sunus", "__pycache__"}
         try:
             relative = resolved.relative_to(self.workspace)
         except ValueError:
@@ -471,12 +471,12 @@ class ApprovalManager:
             return True
         if not self.interactive:
             print(
-                f"Sonus 已拒绝 {action}：超出当前任务授权（{risk}）；"
+                f"Sunus 已拒绝 {action}：超出当前任务授权（{risk}）；"
                 "请在交互终端确认，或由本次任务显式授权。",
                 file=sys.stderr,
             )
             return False
-        print(f"\nSonus 请求执行：{action}（风险 {risk}）")
+        print(f"\nSunus 请求执行：{action}（风险 {risk}）")
         print(detail.strip()[:3000])
         try:
             choice = _choose_approval_option()
@@ -491,7 +491,7 @@ class ApprovalManager:
     def require_command(self, command: str) -> bool:
         denial = command_denial_reason(command)
         if denial:
-            print(f"Sonus 已阻止命令：{denial}", file=sys.stderr)
+            print(f"Sunus 已阻止命令：{denial}", file=sys.stderr)
             return False
         risk = command_risk(command, workspace=self.workspace)
         try:

@@ -7,7 +7,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from sonus.policy import (
+from sunus.policy import (
     ApprovalManager,
     PathGuard,
     PolicyError,
@@ -25,7 +25,7 @@ class PolicyTests(unittest.TestCase):
             guard = PathGuard(Path(temp) / "workspace")
             self.assertEqual(guard.resolve("src/file.py"), guard.workspace / "src/file.py")
             with self.assertRaises(PolicyError):
-                guard.resolve("/tmp/outside-sonus-test")
+                guard.resolve("/tmp/outside-sunus-test")
 
     def test_path_guard_blocks_runtime_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -33,7 +33,7 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaises(PolicyError):
                 guard.assert_writable(Path(temp) / ".git" / "config")
             with self.assertRaises(PolicyError):
-                guard.assert_writable(Path(temp) / ".sonus" / "state")
+                guard.assert_writable(Path(temp) / ".sunus" / "state")
 
     def test_dangerous_command_rules(self) -> None:
         self.assertTrue(command_denial_reason("sudo rm file"))
@@ -91,7 +91,7 @@ class PolicyTests(unittest.TestCase):
         approvals = ApprovalManager(auto_approve=False, interactive=False)
         self.assertTrue(approvals.require_command("git status --short"))
         self.assertTrue(approvals.require_command("ls -la"))
-        self.assertTrue(approvals.require_command("rg Sonus ."))
+        self.assertTrue(approvals.require_command("rg Sunus ."))
         self.assertTrue(approvals.require_command("shasum -a 256 README.md"))
         self.assertTrue(
             approvals.require_command(
@@ -135,8 +135,8 @@ class PolicyTests(unittest.TestCase):
             default_grant=TaskGrant(risk_ceiling="R0"),
         )
         with (
-            patch("sonus.policy.sys.stdin.isatty", return_value=True),
-            patch("sonus.policy._read_choice_key", return_value="ENTER"),
+            patch("sunus.policy.sys.stdin.isatty", return_value=True),
+            patch("sunus.policy._read_choice_key", return_value="ENTER"),
             redirect_stdout(io.StringIO()),
             redirect_stderr(io.StringIO()),
         ):
@@ -150,8 +150,8 @@ class PolicyTests(unittest.TestCase):
 
     def test_approval_menu_supports_arrows_and_quick_keys(self) -> None:
         with (
-            patch("sonus.policy.os.read", side_effect=[b"\x1b", b"[", b"B"]),
-            patch("sonus.policy.select.select", return_value=([0], [], [])),
+            patch("sunus.policy.os.read", side_effect=[b"\x1b", b"[", b"B"]),
+            patch("sunus.policy.select.select", return_value=([0], [], [])),
         ):
             self.assertEqual(_read_menu_key(0), "DOWN")
         keys = iter(["DOWN", "ENTER"])
@@ -181,7 +181,7 @@ class PolicyTests(unittest.TestCase):
             default_grant=TaskGrant(risk_ceiling="R0"),
         )
         with (
-            patch("sonus.policy._choose_approval_option", return_value=1),
+            patch("sunus.policy._choose_approval_option", return_value=1),
             redirect_stdout(io.StringIO()),
             redirect_stderr(io.StringIO()),
         ):

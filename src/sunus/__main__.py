@@ -1,4 +1,4 @@
-from sonus.cli import main
+from sunus.cli import main
 
 
 if __name__ == "__main__":

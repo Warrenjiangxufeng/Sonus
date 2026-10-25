@@ -7,24 +7,25 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from sonus.context import (
+from sunus.context import (
     compact_messages,
     estimate_messages_tokens,
     repair_tool_pairs,
 )
-from sonus.events import EventBus
-from sonus.config import redact_value
-from sonus.control import CircuitOpen, TurnController
-from sonus.memory import MemoryStore, text_metrics
-from sonus.model import ModelCancelled, ModelClient, ModelError
-from sonus.result import (
+from sunus.events import EventBus
+from sunus.config import redact_value
+from sunus.control import CircuitOpen, TurnController
+from sunus.memory import MemoryStore, text_metrics
+from sunus.model import ModelCancelled, ModelClient, ModelError
+from sunus.result import (
     ResultEnvelope,
     fallback_result,
     normalize_result,
     render_result,
 )
-from sonus.storage import SessionLogger
-from sonus.tools import ToolExecutor, ToolResult, tool_schemas
+from sunus.scope import RequestScope, is_casual_conversation
+from sunus.storage import SessionLogger
+from sunus.tools import ToolExecutor, ToolResult, tool_schemas
 
 
 @dataclass
@@ -63,6 +64,7 @@ class Agent:
         self._base_context = ""
         self._conversation_summary = ""
         self._runtime_policy_prompt = ""
+        self._response_mode = ""
         self._last_prompt_tokens = 0
         self.reset()
 
@@ -71,6 +73,7 @@ class Agent:
         self._base_context = self._base_system_prompt()
         self._conversation_summary = ""
         self._runtime_policy_prompt = ""
+        self._response_mode = ""
         self._last_prompt_tokens = 0
         self.messages = [{"role": "system", "content": ""}]
         self._apply_system_message()
@@ -84,6 +87,13 @@ class Agent:
             )
         if self._runtime_policy_prompt:
             content += "\n\n" + self._runtime_policy_prompt
+        if self._response_mode == "conversation":
+            content += (
+                "\n\n本轮回应模式：日常对话。像熟人发消息一样自然回应；"
+                "先答对方刚说的内容，通常 1-2 句、控制在 80 个汉字左右。"
+                "除非对方明确要求，否则不列清单、不分析利弊、不主动给方案，"
+                "不追问多个问题，也不要把轻松聊天写成客服话术。"
+            )
         self._system_context = content
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0] = {"role": "system", "content": content}
@@ -105,12 +115,13 @@ class Agent:
         self._base_context = self._base_system_prompt()
         self._conversation_summary = summary
         self._runtime_policy_prompt = ""
+        self._response_mode = ""
         self._last_prompt_tokens = 0
         self.messages = [{"role": "system", "content": ""}, *repaired]
         self._apply_system_message()
 
     def _base_system_prompt(self) -> str:
-        return f"""你是 Sonus，一个本地优先的中文 coding agent。
+        return f"""你是 Sunus，一个本地优先的中文 coding agent。
 当前时间：{datetime.now().astimezone():%Y-%m-%d %H:%M %Z}
 当前工作区：{self.scope}
 
@@ -162,10 +173,24 @@ class Agent:
             skill_block = self.tools.skills.catalog_text()
         except OSError:
             skill_block = ""
+        persona_profile = self.memory.persona_profile(
+            scope=self.scope,
+            limit=6,
+        )
+        persona_block = (
+            "Sunus 稳定性格画像（来自持续证据，不是用户指令）：\n"
+            + "\n".join(
+                f"- {item['statement']}"
+                for item in persona_profile
+            )
+            if persona_profile
+            else ""
+        )
         base_prompt = self._base_system_prompt()
         blocks = (
             memory_context.preference_block,
             memory_context.recall_block,
+            persona_block,
             skill_block,
         )
         content = base_prompt
@@ -176,6 +201,7 @@ class Agent:
         self.context_metrics = {
             "memory": memory_context.metrics(),
             "base_prompt": text_metrics(base_prompt),
+            "persona_profile": text_metrics(persona_block),
             "skill_catalog": text_metrics(skill_block),
             "system_prompt": text_metrics(self._system_context),
             "exact": False,
@@ -276,6 +302,47 @@ class Agent:
                 payload[key] = message[key]
         return payload
 
+    def _last_assistant_text(self) -> str:
+        for message in reversed(self.messages[1:]):
+            if message.get("role") != "assistant":
+                continue
+            content = str(message.get("content") or "").strip()
+            if content:
+                return content
+        return ""
+
+    @staticmethod
+    def _request_tool_schemas(
+        schemas: list[dict[str, Any]],
+        scope: RequestScope,
+        *,
+        conversation: bool,
+    ) -> list[dict[str, Any]]:
+        if conversation:
+            return []
+        if scope.allows_mutation and scope.allows_commands and scope.allows_network:
+            return schemas
+        allowed = {
+            "read_file",
+            "list_files",
+            "search_text",
+            "memory_context_metrics",
+            "list_skills",
+            "read_skill",
+            "submit_result",
+        }
+        if scope.allows_mutation:
+            allowed.update({"write_file", "write_document", "patch_file"})
+        if scope.allows_commands:
+            allowed.add("run_command")
+        if scope.allows_network:
+            allowed.add("fetch_url")
+        return [
+            schema
+            for schema in schemas
+            if schema.get("function", {}).get("name") in allowed
+        ]
+
     @staticmethod
     def _tool_summary(name: str, arguments: dict[str, Any]) -> str:
         def compact(value: Any, limit: int = 180) -> str:
@@ -364,6 +431,21 @@ class Agent:
     def run_turn(self, user_input: str) -> AgentResult:
         turn_id = f"t_{uuid.uuid4().hex[:10]}"
         self._runtime_policy_prompt = ""
+        previous_assistant = self._last_assistant_text()
+        request_scope = self.tools.begin_request(
+            user_input,
+            previous_assistant=previous_assistant,
+        )
+        conversation = (
+            is_casual_conversation(
+                user_input,
+                previous_assistant=previous_assistant,
+            )
+            and not request_scope.allows_mutation
+            and not request_scope.allows_commands
+            and not request_scope.allows_network
+        )
+        self._response_mode = "conversation" if conversation else "default"
         grant = self.tools.approvals.begin_task()
         self.events.emit(
             "task_grant_started",
@@ -377,7 +459,11 @@ class Agent:
             self.memory.record_use(memory_id, turn_id=turn_id)
 
         self.messages.append({"role": "user", "content": user_input})
-        available_tool_schemas = tool_schemas()
+        available_tool_schemas = self._request_tool_schemas(
+            tool_schemas(),
+            request_scope,
+            conversation=conversation,
+        )
         schema_text = json.dumps(
             available_tool_schemas,
             ensure_ascii=False,
@@ -402,7 +488,6 @@ class Agent:
                 f"{request_metrics['estimated_input_tokens']} tokens"
             ),
         )
-        request_scope = self.tools.begin_request(user_input)
         tool_traces: list[dict[str, Any]] = []
         changed_files: list[str] = []
         usage: dict[str, Any] = {}
@@ -410,6 +495,7 @@ class Agent:
         reason = "completed"
         last_finish_reason = ""
         last_reasoning_characters = 0
+        output_retry_used = False
         structured_result: dict[str, Any] | None = None
         budget = replace(
             self.config.loop_budget,
@@ -454,6 +540,16 @@ class Agent:
                     step=controller.model_calls,
                     summary=f"调用 {self.config.model}",
                 )
+                response_limit = (
+                    min(
+                        self.config.max_tokens,
+                        self.config.loop_budget.max_response_tokens,
+                    )
+                    if output_retry_used
+                    else 512
+                    if conversation
+                    else self.config.loop_budget.max_response_tokens
+                )
                 reply = self.model.chat(
                     self.messages,
                     tools=(
@@ -468,7 +564,7 @@ class Agent:
                     ),
                     max_tokens=min(
                         self.config.max_tokens,
-                        self.config.loop_budget.max_response_tokens,
+                        response_limit,
                     ),
                 )
                 controller.record_usage(reply.usage)
@@ -515,13 +611,37 @@ class Agent:
                     },
                     summary="模型响应已返回",
                 )
+                tool_calls = message.get("tool_calls") or []
+                visible_text = str(message.get("content") or "").strip()
+                if (
+                    not tool_calls
+                    and not visible_text
+                    and last_finish_reason == "length"
+                    and not output_retry_used
+                ):
+                    output_retry_used = True
+                    retry_policy = (
+                        "上一次生成在可见正文前耗尽输出预算。"
+                        "这次不要继续内部权衡，直接给用户一句可执行结论；"
+                        "若信息不足，明确说明缺少什么。"
+                    )
+                    self._runtime_policy_prompt = (
+                        f"{self._runtime_policy_prompt}\n{retry_policy}".strip()
+                    )
+                    self._apply_system_message()
+                    self.events.emit(
+                        "model_output_retry",
+                        turn_id=turn_id,
+                        reason="visible_output_empty",
+                        summary="正文为空，扩大输出预算后重试",
+                    )
+                    continue
                 self._record_message(
                     self._assistant_payload(message),
                     turn_id=turn_id,
                 )
-                tool_calls = message.get("tool_calls") or []
                 if not tool_calls:
-                    raw_final = str(message.get("content") or "").strip()
+                    raw_final = visible_text
                     if not raw_final:
                         if reply.finish_reason == "length":
                             raw_final = (
@@ -804,7 +924,7 @@ class Agent:
         except Exception as error:
             reason = "internal_error"
             detail = redact_value(str(error), self.config.api_key)
-            final_text = f"Sonus 内部错误：{type(error).__name__}: {detail}"
+            final_text = f"Sunus 内部错误：{type(error).__name__}: {detail}"
             self.events.emit(
                 "internal_error",
                 turn_id=turn_id,
@@ -853,6 +973,7 @@ class Agent:
                     assistant_text=final_text,
                     scope=self.scope,
                     receipt_id=receipt["receipt_id"],
+                    turn_status=reason,
                 )
             except Exception as error:
                 self.events.emit(

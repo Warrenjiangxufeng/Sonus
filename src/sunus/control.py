@@ -7,8 +7,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from sonus.config import LoopBudgetConfig
-from sonus.events import EventBus
+from sunus.config import LoopBudgetConfig
+from sunus.events import EventBus
 
 
 class CircuitOpen(RuntimeError):
@@ -50,6 +50,7 @@ class TurnController:
         self.recovery_count = 0
         self.evidence_seen: set[str] = set()
         self.errors: dict[str, _ErrorRecord] = {}
+        self.error_counts_at_recovery: dict[str, int] = {}
         self.blocked_tool_signatures: set[str] = set()
         self.blocked_tools: dict[str, str] = {}
         self._warned: set[str] = set()
@@ -261,20 +262,29 @@ class TurnController:
         self.round_has_progress = False
 
     def _recovery_if_needed(self) -> str | None:
-        max_error_count = max(
-            (record.count for record in self.errors.values()),
-            default=0,
+        unrecovered_errors = {
+            fingerprint: record
+            for fingerprint, record in self.errors.items()
+            if record.count >= self.budget.same_error_soft
+            and record.count > self.error_counts_at_recovery.get(fingerprint, 0)
+        }
+        newest_error = max(
+            unrecovered_errors.values(),
+            key=lambda record: record.count,
+            default=None,
         )
         reason = ""
         if self.no_progress_rounds >= self.budget.no_progress_soft:
             reason = f"连续 {self.no_progress_rounds} 轮没有发现新证据"
-        elif max_error_count >= self.budget.same_error_soft:
-            reason = f"同类错误已重复 {max_error_count} 次"
+        elif newest_error is not None:
+            reason = f"同类错误已重复 {newest_error.count} 次"
         if not reason:
             return None
         if self.recovery_count >= self.budget.max_recoveries:
             self._trip(f"恢复次数已达上限：{reason}")
         self.recovery_count += 1
+        for fingerprint, record in unrecovered_errors.items():
+            self.error_counts_at_recovery[fingerprint] = record.count
         prompt = self._recovery_prompt(reason)
         self._emit(
             "recovery_requested",

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from sonus.config import redact_value
+from sunus.config import redact_value
 
 
 class EventBus:
@@ -64,7 +64,7 @@ class EventBus:
             elif self._verbose:
                 summary = event.get("summary") or event.get("reason") or ""
                 print(
-                    f"[sonus:{event_type}] {str(summary)[:160]}",
+                    f"[sunus:{event_type}] {str(summary)[:160]}",
                     file=sys.stderr,
                     flush=True,
                 )

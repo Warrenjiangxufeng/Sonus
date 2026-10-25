@@ -5,8 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from sonus.cli import copy_transcript_messages
-from sonus.storage import (
+from sunus.cli import copy_transcript_messages
+from sunus.storage import (
     SessionLogger,
     list_sessions,
     load_session,
