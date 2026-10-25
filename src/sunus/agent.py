@@ -26,7 +26,12 @@ from sunus.model import (
     normalize_dsml_message,
 )
 from sunus.model_events import ModelEvent
-from sunus.reasoning import diagnostic_protocol_prompt, is_diagnostic_request
+from sunus.reasoning import (
+    diagnostic_protocol_prompt,
+    is_diagnostic_request,
+    is_status_query_request,
+    status_query_prompt,
+)
 from sunus.result import (
     ResultEnvelope,
     fallback_result,
@@ -142,6 +147,7 @@ class Agent:
         self._runtime_policy_prompt = ""
         self._tool_visibility_prompt = ""
         self._diagnostic_prompt = ""
+        self._status_prompt = ""
         self._response_mode = ""
         self._last_prompt_tokens = 0
         self.reset()
@@ -153,6 +159,7 @@ class Agent:
         self._runtime_policy_prompt = ""
         self._tool_visibility_prompt = ""
         self._diagnostic_prompt = ""
+        self._status_prompt = ""
         self._response_mode = ""
         self._last_prompt_tokens = 0
         self._session_memory_flushed = False
@@ -215,6 +222,8 @@ class Agent:
             content += "\n\n" + self._tool_visibility_prompt
         if self._diagnostic_prompt:
             content += "\n\n" + self._diagnostic_prompt
+        if self._status_prompt:
+            content += "\n\n" + self._status_prompt
         if self._response_mode == "conversation":
             content += (
                 "\n\n本轮回应模式：日常对话。像熟人发消息一样自然回应；"
@@ -245,6 +254,7 @@ class Agent:
         self._runtime_policy_prompt = ""
         self._tool_visibility_prompt = ""
         self._diagnostic_prompt = ""
+        self._status_prompt = ""
         self._response_mode = ""
         self._last_prompt_tokens = 0
         self.messages = [{"role": "system", "content": ""}, *repaired]
@@ -872,11 +882,13 @@ class Agent:
         turn_id = f"t_{uuid.uuid4().hex[:10]}"
         self._runtime_policy_prompt = ""
         self._tool_visibility_prompt = ""
+        status_query = is_status_query_request(user_input)
         self._diagnostic_prompt = (
             diagnostic_protocol_prompt()
             if is_diagnostic_request(user_input)
             else ""
         )
+        self._status_prompt = status_query_prompt() if status_query else ""
         usage: dict[str, Any] = {}
         previous_assistant = self._last_assistant_text()
         request_scope = self.tools.begin_request(
@@ -1381,6 +1393,7 @@ class Agent:
                                 envelope,
                                 tool_traces=tool_traces,
                                 changed_files=changed_files,
+                                drop_details=bool(self._status_prompt),
                             )
                             if normalized != envelope:
                                 self.events.emit(

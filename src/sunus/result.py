@@ -248,6 +248,7 @@ def normalize_result(
     *,
     tool_traces: list[dict[str, Any]],
     changed_files: list[str],
+    drop_details: bool = False,
 ) -> ResultEnvelope:
     actual_changes = set(changed_files)
     mutation_items = tuple(
@@ -279,7 +280,7 @@ def normalize_result(
     if envelope.kind in {"answer", "analysis"}:
         return replace(
             envelope,
-            details=envelope.details[:3],
+            details=() if drop_details else envelope.details[:3],
             changes=(),
             verification=(),
             risks=envelope.risks[:1],

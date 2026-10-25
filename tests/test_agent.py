@@ -474,6 +474,37 @@ class StructuredResultModel:
         )
 
 
+class StatusResultModel:
+    def __init__(self) -> None:
+        self.last_messages: list[dict] = []
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.last_messages = messages
+        return ModelReply(
+            message={
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_status",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_result",
+                            "arguments": (
+                                '{"kind":"answer","status":"completed",'
+                                '"summary":"已推送，远端为 5769f43。",'
+                                '"details":["git status 干净",'
+                                '"ls-remote 返回同一哈希"]}'
+                            ),
+                        },
+                    }
+                ],
+            },
+            usage={"total_tokens": 5},
+            finish_reason="tool_calls",
+        )
+
+
 class TextualDSMLResultModel:
     def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
         return ModelReply(
@@ -690,6 +721,53 @@ class AgentTests(unittest.TestCase):
                 "result_schema_fallback",
                 events.path.read_text(encoding="utf-8"),
             )
+            memory.close()
+
+    def test_status_query_keeps_scope_and_drops_details(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_status", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+            )
+            model = StatusResultModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("查一下本地sunus代码有没有提交到git")
+
+            self.assertEqual(result.reason, "completed")
+            self.assertEqual(result.text, "已推送，远端为 5769f43。")
+            self.assertEqual(result.structured_result["details"], [])
+            system_prompt = model.last_messages[0]["content"]
+            self.assertIn("本轮是简单状态查询", system_prompt)
+            self.assertNotIn("本轮是诊断或根因分析", system_prompt)
             memory.close()
 
     def test_textual_dsml_result_is_converted_and_executed(self) -> None:

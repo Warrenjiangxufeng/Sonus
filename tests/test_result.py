@@ -102,6 +102,25 @@ class ResultEnvelopeTests(unittest.TestCase):
         self.assertNotIn("**验证**", rendered)
         self.assertIn("**限制**：未查证 schema", rendered)
 
+    def test_status_answer_drops_repeated_details(self) -> None:
+        envelope = ResultEnvelope.from_mapping(
+            {
+                "kind": "answer",
+                "status": "completed",
+                "summary": "已推送，远端为 5769f43。",
+                "details": ["git status 干净", "ls-remote 返回同一哈希"],
+            }
+        )
+        normalized = normalize_result(
+            envelope,
+            tool_traces=[],
+            changed_files=[],
+            drop_details=True,
+        )
+
+        self.assertEqual(normalized.details, ())
+        self.assertEqual(render_result(normalized), "已推送，远端为 5769f43。")
+
     def test_change_report_only_keeps_actual_mutations_and_commands(self) -> None:
         envelope = ResultEnvelope.from_mapping(
             {
