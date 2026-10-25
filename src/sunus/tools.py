@@ -205,7 +205,8 @@ def tool_schemas() -> list[dict[str, Any]]:
     return [
         fn(
             "read_file",
-            "Read a UTF-8 text file inside the workspace. Returns numbered lines.",
+            "Read a UTF-8 text file inside the workspace. Returns numbered lines. "
+            "Batch independent file reads in one model turn.",
             {
                 "path": {"type": "string", "description": "Workspace-relative path."},
                 "start_line": {"type": "integer", "minimum": 1, "default": 1},
@@ -215,7 +216,8 @@ def tool_schemas() -> list[dict[str, Any]]:
         ),
         fn(
             "list_files",
-            "List files and directories inside the workspace.",
+            "List files and directories inside the workspace. Batch independent "
+            "listings in one model turn.",
             {
                 "path": {"type": "string", "default": "."},
                 "depth": {"type": "integer", "minimum": 1, "maximum": 8, "default": 2},
@@ -227,7 +229,7 @@ def tool_schemas() -> list[dict[str, Any]]:
             "search_text",
             "Preferred bounded literal-text search inside workspace files. Uses ripgrep with "
             "sensitive/cache exclusions and a hard timeout when available; use this before "
-            "shell-level recursive grep or rg.",
+            "shell-level recursive grep or rg. Batch independent searches in one model turn.",
             {
                 "query": {"type": "string"},
                 "path": {"type": "string", "default": "."},

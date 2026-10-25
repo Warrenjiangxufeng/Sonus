@@ -38,6 +38,23 @@ from sunus.storage import SessionLogger
 from sunus.tools import ToolExecutor, ToolResult
 
 
+MODEL_USAGE_EVENT_KEYS = frozenset(
+    {
+        "prompt_tokens",
+        "completion_tokens",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "prompt_tokens_details",
+        "completion_tokens_details",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    }
+)
+
+
 @dataclass
 class AgentResult:
     text: str
@@ -325,6 +342,7 @@ class Agent:
 12. 缺少依赖、tokenizer 或工具时不要擅自安装；先确认用户是否明确授权，以及本轮是否开放命令工具。用户明确要求安装且命令可用时，执行安装并验证；未开放时说明“本轮权限不足”，不得声称具有该能力却永远无法启用。
 13. 区分观察、推断和结论。单个失败入口不能推出全局缺失；强断言必须先核对权威事实，并考虑至少一个替代解释。
 14. 查找代码或文本时优先使用 `search_text`；不要把 `grep -r`/`rg` 扫描用户主目录、`Documents` 等大目录作为首选。确需跨目录搜索时，先锁定候选路径，显式排除缓存、依赖和运行数据，并设置短超时。
+15. 多个互相独立的只读检查必须在同一轮 `tool_calls` 中批量发起，避免逐项等待模型往返；只有后一项依赖前一项结果时才串行。
 
 任务边界：
 - 只执行用户当前消息明确要求的动作。建议、假设、示例、推测、可选优化和未点名待办都不是执行指令。
@@ -1144,14 +1162,7 @@ class Agent:
                     usage={
                         key: value
                         for key, value in reply.usage.items()
-                        if key
-                        in {
-                            "prompt_tokens",
-                            "completion_tokens",
-                            "input_tokens",
-                            "output_tokens",
-                            "total_tokens",
-                        }
+                        if key in MODEL_USAGE_EVENT_KEYS
                     },
                     summary="模型响应已返回",
                 )

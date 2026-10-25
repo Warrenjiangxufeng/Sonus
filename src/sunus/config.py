@@ -54,10 +54,10 @@ LOOP_BUDGET_PROFILES: dict[str, dict[str, int]] = {
         "max_total_tokens": 2_000_000,
         "max_response_tokens": 8192,
         "finalization_reserve": 2,
-        "context_soft_tokens": 200_000,
-        "context_hard_tokens": 960_000,
-        "context_keep_recent": 48,
-        "context_summary_chars": 48_000,
+        "context_soft_tokens": 48_000,
+        "context_hard_tokens": 96_000,
+        "context_keep_recent": 24,
+        "context_summary_chars": 16_000,
     },
     "deep": {
         "max_model_calls": 120,
@@ -139,10 +139,10 @@ class LoopBudgetConfig:
     consecutive_failure_hard: int = 4
     max_recoveries: int = 2
     finalization_reserve: int = 2
-    context_soft_tokens: int = 200_000
-    context_hard_tokens: int = 960_000
-    context_keep_recent: int = 48
-    context_summary_chars: int = 48_000
+    context_soft_tokens: int = 48_000
+    context_hard_tokens: int = 96_000
+    context_keep_recent: int = 24
+    context_summary_chars: int = 16_000
 
 
 @dataclass(frozen=True)

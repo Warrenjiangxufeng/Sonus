@@ -45,14 +45,24 @@ class FakeAgentModel:
                         }
                     ],
                 },
-                usage={"prompt_tokens": 10, "completion_tokens": 5},
+                usage={
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "prompt_cache_hit_tokens": 7,
+                    "prompt_cache_miss_tokens": 3,
+                },
                 finish_reason="tool_calls",
             )
         tool_messages = [item for item in messages if item.get("role") == "tool"]
         assert tool_messages and "sunus test" in tool_messages[-1]["content"]
         return ModelReply(
             message={"role": "assistant", "content": "文件内容已确认。"},
-            usage={"prompt_tokens": 8, "completion_tokens": 4},
+            usage={
+                "prompt_tokens": 8,
+                "completion_tokens": 4,
+                "prompt_cache_hit_tokens": 6,
+                "prompt_cache_miss_tokens": 2,
+            },
             finish_reason="stop",
         )
 
@@ -607,6 +617,14 @@ class AgentTests(unittest.TestCase):
             self.assertIn("输出规范", model.last_messages[0]["content"])
             self.assertIn("结论先行", model.last_messages[0]["content"])
             self.assertIn("任务边界", model.last_messages[0]["content"])
+            self.assertIn(
+                "多个互相独立的只读检查必须在同一轮 `tool_calls` 中批量发起",
+                model.last_messages[0]["content"],
+            )
+            self.assertEqual(result.usage["prompt_cache_hit_tokens"], 13)
+            self.assertEqual(result.usage["prompt_cache_miss_tokens"], 5)
+            self.assertIn('"prompt_cache_hit_tokens":7', events_text)
+            self.assertIn('"prompt_cache_miss_tokens":3', events_text)
             assistant_messages = [
                 item
                 for item in model.last_messages
