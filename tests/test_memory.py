@@ -8,6 +8,66 @@ from sunus.memory import MemoryStore, estimate_tokens, text_metrics
 
 
 class MemoryTests(unittest.TestCase):
+    def test_explicit_memory_request_detection(self) -> None:
+        self.assertTrue(
+            MemoryStore.is_explicit_memory_request(
+                "明确需要记住复盘的东西，请落库"
+            )
+        )
+        self.assertTrue(
+            MemoryStore.is_explicit_memory_request(
+                "那你可要记好了，下次不要再犯了"
+            )
+        )
+        self.assertFalse(
+            MemoryStore.is_explicit_memory_request(
+                "为什么没有把复盘内容落库？"
+            )
+        )
+
+    def test_explicit_review_is_pinned_into_unrelated_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            memory_id = memory.record_explicit_review(
+                user_input="复盘授权熔断原因",
+                assistant_text="commands 与 command 映射错误。",
+                scope="/project/example",
+                receipt_id="r_review",
+                turn_status="circuit_open",
+            )
+
+            context = memory.build_context(
+                scope="/project/example",
+                query="天气怎么样",
+            )
+
+            self.assertIn(memory_id, {item["id"] for item in context.recalled})
+            memory.close()
+
+    def test_explicit_review_for_same_receipt_updates_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            first = memory.record_explicit_review(
+                user_input="记住复盘",
+                assistant_text="旧结论",
+                scope="/project/example",
+                receipt_id="r_same",
+                turn_status="completed",
+            )
+            second = memory.record_explicit_review(
+                user_input="记住复盘",
+                assistant_text="新结论",
+                scope="/project/example",
+                receipt_id="r_same",
+                turn_status="completed",
+            )
+
+            self.assertEqual(first, second)
+            row = memory.get(first)
+            self.assertIn("新结论", row["content"])
+            self.assertNotIn("旧结论", row["content"])
+            memory.close()
+
     def test_preference_recall_credit_and_forget(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             memory = MemoryStore(Path(temp) / "memory.db")

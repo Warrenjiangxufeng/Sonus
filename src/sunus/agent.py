@@ -155,6 +155,8 @@ class Agent:
         self._planning_prompt = ""
         self._last_request_scope = None
         self._task_state = TaskState()
+        self._memory_write_required = False
+        self._remembered_this_turn = False
         self._response_mode = ""
         self._last_prompt_tokens = 0
         self.reset()
@@ -170,6 +172,8 @@ class Agent:
         self._planning_prompt = ""
         self._last_request_scope = None
         self._task_state = TaskState()
+        self._memory_write_required = False
+        self._remembered_this_turn = False
         self._response_mode = ""
         self._last_prompt_tokens = 0
         self._session_memory_flushed = False
@@ -274,6 +278,8 @@ class Agent:
         self._planning_prompt = ""
         self._last_request_scope = None
         self._task_state = TaskState.from_mapping(task_state)
+        self._memory_write_required = False
+        self._remembered_this_turn = False
         self._response_mode = ""
         self._last_prompt_tokens = 0
         self.messages = [{"role": "system", "content": ""}, *repaired]
@@ -377,6 +383,7 @@ class Agent:
 18. 查询“上次、刚才”的失败时先用 inspect_runtime_history 的 recent/latest_failure；需要一段时间的规律时用 trend，让运行时在本地按错误指纹和日期聚合，绝不把数百天逐条日志塞进上下文；只有确定 turn_id 后才用 mode=turn 下钻。不要用 error/crash/Traceback 等泛词搜索整个 .sunus。
 19. 一张候选清单加一次单回合下钻足以判断时立即停止；若两个以上候选都可能是“上次”且无法区分，问用户一个具体的时间或任务锚点，不要继续遍历。365 天全有错误也不等于需要看 365 天每条记录。
 20. 其他文件、源码、文档和配置也使用同一原则：先按路径/时间/类型列候选或 count_by_file 聚合，再只读命中文件的相关行；一次范围搜索足够后停止，禁止用泛词扫描整个工作区来碰运气。
+21. 用户明确要求“记住、落库、长期保存、不要忘”或要求保存复盘时，必须调用 remember 写入桌面记忆库；只有拿到真实 memory_id 才能说已经记住。故障轮次也要保存用户要求的复盘结论。
 
 任务边界：
 - 只执行用户当前消息明确要求的动作。建议、假设、示例、推测、可选优化和未点名待办都不是执行指令。
@@ -577,6 +584,7 @@ class Agent:
             "list_files",
             "search_text",
             "memory_context_metrics",
+            "remember",
             "inspect_environment",
             "inspect_runtime_history",
             "list_skills",
@@ -690,6 +698,10 @@ class Agent:
         if name == "request_authorization":
             capability = compact(arguments.get("capability", ""), 40)
             return f"请求授权 · {capability}"
+        if name == "remember":
+            kind = compact(arguments.get("kind", "review"), 30)
+            scope = compact(arguments.get("scope", "project"), 30)
+            return f"写入记忆 · {kind} · {scope}"
         if name == "fetch_url":
             return f"访问网络 · {compact(arguments.get('url', ''))}"
         if name == "memory_context_metrics":
@@ -912,12 +924,23 @@ class Agent:
             content=result.content,
             changed_files=result.changed_files,
         )
+        if invocation.name == "remember" and result.ok:
+            self._remembered_this_turn = True
+            self.events.emit(
+                "memory_recorded",
+                turn_id=turn_id,
+                summary=result.content,
+            )
 
     def run_turn(self, user_input: str) -> AgentResult:
         turn_id = f"t_{uuid.uuid4().hex[:10]}"
         self._runtime_policy_prompt = ""
         self._tool_visibility_prompt = ""
         status_query = is_status_query_request(user_input)
+        self._memory_write_required = (
+            self.memory.is_explicit_memory_request(user_input)
+        )
+        self._remembered_this_turn = False
         self._diagnostic_prompt = (
             diagnostic_protocol_prompt()
             if is_diagnostic_request(user_input)
@@ -1662,6 +1685,29 @@ class Agent:
             metrics=metrics,
             structured_result=structured_result,
         )
+        if self._memory_write_required and not self._remembered_this_turn:
+            try:
+                memory_id = self.memory.record_explicit_review(
+                    user_input=user_input,
+                    assistant_text=final_text,
+                    scope=self.scope,
+                    receipt_id=receipt["receipt_id"],
+                    turn_status=reason,
+                    persistent=True,
+                )
+                final_text += f"\n\n已写入持久复盘记忆：`{memory_id}`"
+                self.events.emit(
+                    "memory_recorded",
+                    turn_id=turn_id,
+                    memory_id=memory_id,
+                    summary="明确记忆请求已落库",
+                )
+            except Exception as error:
+                self.events.emit(
+                    "memory_write_error",
+                    turn_id=turn_id,
+                    summary=f"明确记忆写入失败: {error}",
+                )
         # blocked 仍属有效对话：用户说了话、也拿到了答复，只是没达成目标。
         # 只有真正的故障（模型报错、内部异常、熔断）才不该污染记忆。
         if reason not in {

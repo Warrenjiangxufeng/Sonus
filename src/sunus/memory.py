@@ -442,7 +442,17 @@ class MemoryStore:
         recall_limit: int = 5,
     ) -> MemoryContext:
         preferences = self.recent_preferences(scope=scope, limit=preference_limit)
-        recalled = self.search(query, scope=scope, limit=recall_limit)
+        pinned = self.recent_persistent_reviews(scope=scope, limit=3)
+        searched = self.search(query, scope=scope, limit=recall_limit)
+        recalled: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in [*pinned, *searched]:
+            memory_id = str(item.get("id") or "")
+            if memory_id and memory_id in seen:
+                continue
+            if memory_id:
+                seen.add(memory_id)
+            recalled.append(item)
         return MemoryContext(
             preferences=tuple(preferences),
             recalled=tuple(recalled),
@@ -455,6 +465,27 @@ class MemoryStore:
                 label="相关记忆",
             ),
         )
+
+    def recent_persistent_reviews(
+        self,
+        *,
+        scope: str,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM memories
+                WHERE kind = 'review'
+                  AND status IN ('supported', 'verified')
+                  AND scope IN ('global', ?)
+                  AND instr(',' || tags || ',', ',persistent,') > 0
+                ORDER BY COALESCE(verified_at, created_at) DESC
+                LIMIT ?
+                """,
+                (scope, max(1, min(10, limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def context_metrics(
         self,
@@ -953,14 +984,10 @@ class MemoryStore:
             if unresolved_project:
                 tags.append("unresolved_project")
             created.append(
-                self.add(
+                self._upsert_receipt_episode(
                     content=episode,
                     scope=scope,
-                    kind="episode",
-                    status="supported",
                     tags=tuple(tags),
-                    source="turn_receipt",
-                    evidence_kind="receipt",
                     receipt_id=receipt_id,
                     metadata={"turn_status": turn_status},
                 )
@@ -1021,6 +1048,62 @@ class MemoryStore:
             self.distill_persona()
         return created
 
+    def _upsert_receipt_episode(
+        self,
+        *,
+        content: str,
+        scope: str,
+        tags: tuple[str, ...],
+        receipt_id: str,
+        metadata: dict[str, Any],
+    ) -> str:
+        clean = _safe_text(content)
+        tag_text = ",".join(dict.fromkeys(tags))
+        metadata_text = json.dumps(metadata, ensure_ascii=False)
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                """
+                SELECT memory_id FROM memory_evidence
+                WHERE receipt_id = ? AND evidence_kind = 'receipt'
+                ORDER BY id LIMIT 1
+                """,
+                (receipt_id,),
+            ).fetchone()
+            if row is None:
+                return self.add(
+                    content=clean,
+                    scope=scope,
+                    kind="episode",
+                    status="supported",
+                    tags=tags,
+                    source="turn_receipt",
+                    evidence_kind="receipt",
+                    receipt_id=receipt_id,
+                    metadata=metadata,
+                )
+            memory_id = str(row["memory_id"])
+            self._connection.execute(
+                """
+                UPDATE memories
+                SET content = ?, tags = ?, status = 'supported',
+                    verified_at = ?, metadata = ?
+                WHERE id = ?
+                """,
+                (clean, tag_text, iso(), metadata_text, memory_id),
+            )
+            self._connection.execute(
+                "DELETE FROM memory_fts WHERE memory_id = ?",
+                (memory_id,),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO memory_fts(memory_id, content, tags, scope)
+                VALUES (?, ?, ?, ?)
+                """,
+                (memory_id, clean, tag_text, scope),
+            )
+            return memory_id
+
     def record_session_summary(
         self,
         *,
@@ -1041,6 +1124,124 @@ class MemoryStore:
             source="session_close",
             evidence_kind="session_summary",
             metadata={"session_id": session_id},
+        )
+
+    def record_explicit_review(
+        self,
+        *,
+        user_input: str,
+        assistant_text: str,
+        scope: str,
+        receipt_id: str,
+        turn_status: str,
+        persistent: bool = True,
+    ) -> str:
+        content = _safe_text(
+            "复盘记录：\n"
+            f"用户要求：{user_input}\n"
+            f"结论与结果：{assistant_text}",
+            limit=4000,
+        )
+        tags = ["review", "explicit", "conversation"]
+        if persistent:
+            tags.append("persistent")
+        return self._upsert_explicit_review(
+            content=content,
+            scope=scope,
+            tags=tuple(tags),
+            receipt_id=receipt_id,
+            metadata={
+                "turn_status": turn_status,
+                "persistent": persistent,
+            },
+        )
+
+    def _upsert_explicit_review(
+        self,
+        *,
+        content: str,
+        scope: str,
+        tags: tuple[str, ...],
+        receipt_id: str,
+        metadata: dict[str, Any],
+    ) -> str:
+        clean = _safe_text(content)
+        tag_text = ",".join(dict.fromkeys(tags))
+        metadata_text = json.dumps(metadata, ensure_ascii=False)
+        with self._lock, self._connection:
+            rows = self._connection.execute(
+                """
+                SELECT memories.id, memories.created_at
+                FROM memory_evidence
+                JOIN memories ON memories.id = memory_evidence.memory_id
+                WHERE memory_evidence.receipt_id = ?
+                  AND memory_evidence.evidence_kind = 'user_request'
+                  AND memories.kind = 'review'
+                ORDER BY memories.created_at DESC
+                """,
+                (receipt_id,),
+            ).fetchall()
+            if not rows:
+                return self.add(
+                    content=clean,
+                    scope=scope,
+                    kind="review",
+                    status="supported",
+                    tags=tags,
+                    source="explicit_review",
+                    evidence_kind="user_request",
+                    receipt_id=receipt_id,
+                    metadata=metadata,
+                )
+            memory_id = str(rows[0]["id"])
+            for duplicate in rows[1:]:
+                duplicate_id = str(duplicate["id"])
+                self._connection.execute(
+                    "UPDATE memories SET status = 'superseded' WHERE id = ?",
+                    (duplicate_id,),
+                )
+                self._connection.execute(
+                    "DELETE FROM memory_fts WHERE memory_id = ?",
+                    (duplicate_id,),
+                )
+            self._connection.execute(
+                """
+                UPDATE memories
+                SET content = ?, tags = ?, status = 'supported',
+                    verified_at = ?, metadata = ?
+                WHERE id = ?
+                """,
+                (clean, tag_text, iso(), metadata_text, memory_id),
+            )
+            self._connection.execute(
+                "DELETE FROM memory_fts WHERE memory_id = ?",
+                (memory_id,),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO memory_fts(memory_id, content, tags, scope)
+                VALUES (?, ?, ?, ?)
+                """,
+                (memory_id, clean, tag_text, scope),
+            )
+            return memory_id
+
+    @staticmethod
+    def is_explicit_memory_request(user_input: str) -> bool:
+        text = str(user_input or "").strip()
+        if not text:
+            return False
+        if re.search(r"(?:为什么|为何|是不是|是否|怎么|如何)", text):
+            return False
+        return bool(
+            re.search(
+                r"(?:需要|要|请|给我)?记住|记下来|写入记忆|存到记忆|"
+                r"落库|持久保存|长期保存|记好了|记好|记着|牢记|别忘|"
+                r"不要忘|下次不要|下次别|以后记得|"
+                r"复盘.{0,20}(?:记下|保存|写入|落库)",
+                text,
+                re.IGNORECASE,
+            )
         )
 
     @staticmethod

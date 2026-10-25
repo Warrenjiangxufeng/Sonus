@@ -33,6 +33,7 @@ from sunus.config import (
 from sunus.environment import discover_environment
 from sunus.events import EventBus
 from sunus.memory import MemoryStore
+from sunus.memory_import import import_session_memory
 from sunus.model import ModelClient, ModelError, create_model_client
 from sunus.policy import CAPABILITIES, ApprovalManager, PathGuard
 from sunus.proactive import (
@@ -1771,6 +1772,14 @@ def memory_command(config: RuntimeConfig, args: argparse.Namespace) -> int:
     memory = MemoryStore(config.data_dir / "memory.db")
     scope = str(config.workspace)
     try:
+        if args.memory_action == "import-sessions":
+            result = import_session_memory(
+                memory,
+                data_dir=config.data_dir,
+                date=args.date,
+            )
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         if args.memory_action == "recent":
             rows = memory.recent(scope=scope, limit=args.limit)
         elif args.memory_action == "search":
@@ -2087,6 +2096,14 @@ def make_parser() -> argparse.ArgumentParser:
 
     memory = sub.add_parser("memory", help="Manage Sunus memory")
     memory_sub = memory.add_subparsers(dest="memory_action", required=True)
+    import_sessions = memory_sub.add_parser(
+        "import-sessions",
+        help="Import one local date of session receipts into memory",
+    )
+    import_sessions.add_argument(
+        "--date",
+        default=datetime.now().astimezone().strftime("%Y-%m-%d"),
+    )
     recent = memory_sub.add_parser("recent")
     recent.add_argument("--limit", type=int, default=20)
     search = memory_sub.add_parser("search")

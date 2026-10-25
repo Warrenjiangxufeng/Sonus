@@ -1652,6 +1652,56 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(memory.recent(scope=str(root.resolve()), limit=5), [])
             memory.close()
 
+    def test_explicit_memory_request_falls_back_to_persistent_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_explicit_memory", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+            )
+            agent = Agent(
+                config=config,
+                model=CapturingReplyModel("复盘结论：显式记忆必须先落库。"),
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("请记住这轮复盘并落库")
+
+            reviews = memory.recent_persistent_reviews(
+                scope=str(root.resolve()),
+                limit=3,
+            )
+            self.assertEqual(len(reviews), 1)
+            self.assertIn(reviews[0]["id"], result.text)
+            self.assertIn(
+                "memory_recorded",
+                events.path.read_text(encoding="utf-8"),
+            )
+            memory.close()
+
     def test_empty_truncated_output_is_labeled_as_runtime_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "workspace"

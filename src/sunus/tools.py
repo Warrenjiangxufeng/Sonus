@@ -296,6 +296,31 @@ def tool_schemas() -> list[dict[str, Any]]:
             [],
         ),
         fn(
+            "remember",
+            "Persist an explicitly requested durable preference, review, lesson, "
+            "or episode. Use only when the user asks Sunus to remember or review.",
+            {
+                "content": {"type": "string"},
+                "kind": {
+                    "type": "string",
+                    "enum": ["preference", "review", "lesson", "episode"],
+                    "default": "review",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["project", "global"],
+                    "default": "project",
+                },
+                "persistent": {"type": "boolean", "default": True},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "default": [],
+                },
+            },
+            ["content"],
+        ),
+        fn(
             "inspect_environment",
             "Inspect the current Python, shell, pytest executable and matching "
             "interpreter. Use this before claiming a local tool is missing.",
@@ -503,6 +528,7 @@ class ToolExecutor:
             "list_files": self._list_files,
             "search_text": self._search_text,
             "memory_context_metrics": self._memory_context_metrics,
+            "remember": self._remember,
             "inspect_environment": self._inspect_environment,
             "inspect_runtime_history": self._inspect_runtime_history,
             "write_file": self._write_file,
@@ -1067,6 +1093,35 @@ class ToolExecutor:
                 "Token 是依赖无关估算，不是 Provider 精确 usage。"
             ),
         )
+
+    def _remember(self, args: dict[str, Any]) -> ToolResult:
+        if self.memory is None:
+            return ToolResult(False, "当前运行未配置记忆库")
+        kind = str(args.get("kind") or "review")
+        if kind not in {"preference", "review", "lesson", "episode"}:
+            return ToolResult(False, "不支持的记忆类型")
+        scope = str(args.get("scope") or "project")
+        scope_value = "global" if scope == "global" else str(self.workspace.resolve())
+        tags = [
+            str(item)
+            for item in args.get("tags") or []
+            if str(item).strip()
+        ]
+        if kind == "review":
+            tags.extend(["review", "explicit"])
+        if bool(args.get("persistent", True)):
+            tags.append("persistent")
+        memory_id = self.memory.add(
+            content=str(args.get("content") or ""),
+            scope=scope_value,
+            kind=kind,
+            status="supported",
+            tags=tuple(dict.fromkeys(tags)),
+            source="agent_remember_tool",
+            evidence_kind="explicit_user_request",
+            metadata={"persistent": bool(args.get("persistent", True))},
+        )
+        return ToolResult(True, f"已写入记忆 {memory_id}")
 
     def _inspect_environment(self, args: dict[str, Any]) -> ToolResult:
         requested = args.get("commands", [])

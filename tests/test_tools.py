@@ -23,6 +23,7 @@ class ToolTests(unittest.TestCase):
         self.assertIn("submit_result", names)
         self.assertIn("write_document", names)
         self.assertIn("memory_context_metrics", names)
+        self.assertIn("remember", names)
         self.assertIn("inspect_environment", names)
         self.assertIn("inspect_runtime_history", names)
         self.assertIn("request_authorization", names)
@@ -166,6 +167,32 @@ class ToolTests(unittest.TestCase):
             self.assertIsNotNone(executor.request_scope)
             self.assertTrue(executor.request_scope.allows_mutation)
             self.assertTrue(executor.request_scope.allows_commands)
+
+    def test_remember_writes_supported_persistent_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            memory = MemoryStore(root / ".data" / "memory.db")
+            executor = self.make_executor(root, memory=memory)
+
+            result = executor.execute(
+                "remember",
+                {
+                    "content": "复盘：授权能力名必须统一。",
+                    "kind": "review",
+                    "persistent": True,
+                },
+            )
+
+            self.assertTrue(result.ok)
+            rows = memory.recent_persistent_reviews(
+                scope=str(root.resolve()),
+                limit=3,
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["kind"], "review")
+            self.assertEqual(rows[0]["status"], "supported")
+            self.assertIn("persistent", rows[0]["tags"].split(","))
+            memory.close()
 
     def test_command_authorization_is_not_confused_with_network(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
