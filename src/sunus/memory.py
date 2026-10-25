@@ -966,7 +966,7 @@ class MemoryStore:
         created: list[str] = []
         episode = _safe_text(
             f"用户：{user_input}\nSunus：{assistant_text}",
-            limit=3000,
+            limit=12000,
         )
         if episode:
             unresolved_project = (
@@ -1140,7 +1140,7 @@ class MemoryStore:
             "复盘记录：\n"
             f"用户要求：{user_input}\n"
             f"结论与结果：{assistant_text}",
-            limit=4000,
+            limit=12000,
         )
         tags = ["review", "explicit", "conversation"]
         if persistent:
