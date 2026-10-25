@@ -434,6 +434,33 @@ class ModelHttpTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_connection_release_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            client = DeepSeekClient(
+                RuntimeConfig(
+                    workspace=Path(temp),
+                    data_dir=Path(temp),
+                    api_key="sk-test",
+                    base_url="https://example.invalid",
+                    model="deepseek-flash",
+                )
+            )
+
+            class Connection:
+                def __init__(self) -> None:
+                    self.close_count = 0
+
+                def close(self) -> None:
+                    self.close_count += 1
+
+            connection = Connection()
+            client._connection = connection  # type: ignore[assignment]
+
+            client._release_connection(connection)  # type: ignore[arg-type]
+            client._release_connection(connection)  # type: ignore[arg-type]
+
+            self.assertEqual(connection.close_count, 1)
+
     def test_minimax_payload_uses_completion_tokens_and_reasoning(self) -> None:
         Handler.last_payload = None
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

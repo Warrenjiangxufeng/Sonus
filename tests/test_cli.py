@@ -5,6 +5,7 @@ import termios
 import threading
 import unittest
 from contextlib import redirect_stdout
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sunus.cli import (
@@ -19,11 +20,13 @@ from sunus.cli import (
     _read_thinking_key,
     _thinking_interrupt_pressed,
     _wrap_input_lines,
+    handle_slash,
     make_parser,
     print_banner,
     render_terminal_markdown,
     residual_text,
 )
+from sunus.policy import ApprovalManager
 
 
 class CliTests(unittest.TestCase):
@@ -212,6 +215,27 @@ class CliTests(unittest.TestCase):
         self.assertEqual(provider.model, "test-model")
         budget = parser.parse_args(["--budget", "quick"])
         self.assertEqual(budget.budget, "quick")
+
+    def test_permission_slash_commands_grant_revoke_and_reset(self) -> None:
+        approvals = ApprovalManager(auto_approve=False, interactive=False)
+        components = SimpleNamespace(approvals=approvals)
+
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(handle_slash("/approve off write", components))
+        self.assertEqual(approvals.permission_state()["write"], "deny")
+
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(
+                handle_slash("/approve on write,command", components)
+            )
+        self.assertEqual(approvals.permission_state()["write"], "allow")
+        self.assertEqual(approvals.permission_state()["command"], "allow")
+
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(handle_slash("/permissions", components))
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(handle_slash("/approve reset write", components))
+        self.assertEqual(approvals.permission_state()["write"], "auto")
 
     def test_banner_only_contains_brand_description(self) -> None:
         output = io.StringIO()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import heapq
 import json
 import os
 import re
@@ -12,7 +13,9 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +29,7 @@ from sunus.scope import RequestScope, classify_request_with_context
 from sunus.skills import SKILLS_DIRNAME, SkillLibrary
 from sunus.storage import ArtifactStore
 from sunus.result import result_tool_schema
+from sunus.runtime_history import inspect_runtime_history
 from sunus.tool_registry import ToolRegistry, ToolSpec
 
 
@@ -222,6 +226,13 @@ def tool_schemas() -> list[dict[str, Any]]:
                 "path": {"type": "string", "default": "."},
                 "depth": {"type": "integer", "minimum": 1, "maximum": 8, "default": 2},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 250},
+                "sort_by_mtime": {"type": "boolean", "default": False},
+                "modified_within_days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 365,
+                    "default": 0,
+                },
             },
             [],
         ),
@@ -235,6 +246,15 @@ def tool_schemas() -> list[dict[str, Any]]:
                 "path": {"type": "string", "default": "."},
                 "glob": {"type": "string", "default": "*"},
                 "max_results": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+                "output": {
+                    "type": "string",
+                    "enum": ["lines", "files"],
+                    "default": "lines",
+                    "description": (
+                        "Use files for a metadata-first pass that groups matches "
+                        "by path before reading selected files."
+                    ),
+                },
                 "timeout_sec": {
                     "type": "integer",
                     "minimum": 1,
@@ -288,6 +308,38 @@ def tool_schemas() -> list[dict[str, Any]]:
                         "or uninstalling a command."
                     ),
                 },
+            },
+            [],
+        ),
+        fn(
+            "inspect_runtime_history",
+            "Query bounded recent Sunus activity without broad full-text scanning: "
+            "recent sessions, recent failures, or one turn timeline.",
+            {
+                "mode": {
+                    "type": "string",
+                    "enum": [
+                        "recent",
+                        "latest_failure",
+                        "failures",
+                        "trend",
+                        "turn",
+                    ],
+                    "default": "recent",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "default": 10,
+                },
+                "days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 365,
+                    "default": 2,
+                },
+                "turn_id": {"type": "string", "default": ""},
             },
             [],
         ),
@@ -417,6 +469,7 @@ class ToolExecutor:
         approvals: ApprovalManager,
         artifacts: ArtifactStore,
         events: EventBus,
+        data_dir: Path | None = None,
         secret: str = "",
         memory: MemoryStore | None = None,
         mcp_servers: tuple[Any, ...] = (),
@@ -426,6 +479,8 @@ class ToolExecutor:
         self.path_guard = path_guard
         self.approvals = approvals
         self.artifacts = artifacts
+        self.data_dir = data_dir or artifacts.root.parent
+        self.current_session_id = ""
         self.events = events
         self.secret = secret
         self.memory = memory
@@ -443,6 +498,7 @@ class ToolExecutor:
             "search_text": self._search_text,
             "memory_context_metrics": self._memory_context_metrics,
             "inspect_environment": self._inspect_environment,
+            "inspect_runtime_history": self._inspect_runtime_history,
             "write_file": self._write_file,
             "write_document": self._write_document,
             "patch_file": self._patch_file,
@@ -458,6 +514,7 @@ class ToolExecutor:
             "search_text",
             "memory_context_metrics",
             "inspect_environment",
+            "inspect_runtime_history",
             "list_skills",
             "read_skill",
             "submit_result",
@@ -523,10 +580,12 @@ class ToolExecutor:
         previous_assistant: str = "",
         previous_scope: RequestScope | None = None,
     ) -> RequestScope:
-        self.request_scope = classify_request_with_context(
-            text,
-            previous_assistant=previous_assistant,
-            previous_scope=previous_scope,
+        self.request_scope = self.approvals.apply_scope(
+            classify_request_with_context(
+                text,
+                previous_assistant=previous_assistant,
+                previous_scope=previous_scope,
+            )
         )
         return self.request_scope
 
@@ -632,7 +691,23 @@ class ToolExecutor:
             return ToolResult(False, f"不是目录: {root}")
         depth_limit = min(8, max(1, int(args.get("depth", 2))))
         max_results = min(1000, max(1, int(args.get("max_results", 250))))
-        results: list[str] = []
+        sort_by_mtime = bool(args.get("sort_by_mtime", False))
+        modified_days = max(0, min(365, int(args.get("modified_within_days", 0))))
+        cutoff = time.time() - modified_days * 86400 if modified_days else 0
+        results: list[tuple[str, float]] = []
+
+        def add_result(path: Path, modified: float, *, directory: bool = False) -> None:
+            relative = self.path_guard.relative(path)
+            if directory:
+                relative += "/"
+            item = (modified, relative)
+            if sort_by_mtime:
+                heapq.heappush(results, item)
+                if len(results) > max_results:
+                    heapq.heappop(results)
+            else:
+                results.append(item)
+
         root_depth = len(root.parts)
         for current, dirs, files in os.walk(root):
             current_path = Path(current)
@@ -641,17 +716,38 @@ class ToolExecutor:
             if relative_depth >= depth_limit:
                 dirs[:] = []
             for directory in dirs:
-                results.append(f"{self.path_guard.relative(current_path / directory)}/")
-                if len(results) >= max_results:
+                directory_path = current_path / directory
+                try:
+                    modified = directory_path.stat().st_mtime
+                except OSError:
+                    modified = 0
+                if modified >= cutoff:
+                    add_result(directory_path, modified, directory=True)
+                if not sort_by_mtime and len(results) >= max_results:
                     break
             for filename in sorted(files):
-                if len(results) >= max_results:
+                if not sort_by_mtime and len(results) >= max_results:
                     break
                 if not _ignored(filename):
-                    results.append(self.path_guard.relative(current_path / filename))
-            if len(results) >= max_results:
+                    file_path = current_path / filename
+                    try:
+                        modified = file_path.stat().st_mtime
+                    except OSError:
+                        modified = 0
+                    if modified >= cutoff:
+                        add_result(file_path, modified)
+            if not sort_by_mtime and len(results) >= max_results:
                 break
-        return ToolResult(True, "\n".join(results) or "(empty directory)")
+        if sort_by_mtime:
+            results.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            content = "\n".join(
+                f"{path}\t"
+                f"{datetime.fromtimestamp(modified).astimezone():%Y-%m-%d %H:%M:%S}"
+                for modified, path in results
+            )
+        else:
+            content = "\n".join(path for _modified, path in results)
+        return ToolResult(True, content or "(empty directory)")
 
     @staticmethod
     def _stop_process(process: subprocess.Popen[bytes]) -> None:
@@ -882,6 +978,10 @@ class ToolExecutor:
             return ToolResult(False, f"搜索路径不是目录: {root}")
         glob = str(args.get("glob", "*") or "*")
         limit = min(500, max(1, int(args.get("max_results", 100))))
+        output = str(args.get("output") or "lines")
+        if output not in {"lines", "files"}:
+            return ToolResult(False, "output 必须是 lines 或 files")
+        search_limit = min(5000, max(limit, limit * 20)) if output == "files" else limit
         timeout_sec = min(
             30,
             max(1, int(args.get("timeout_sec", SEARCH_TIMEOUT_SEC))),
@@ -893,7 +993,7 @@ class ToolExecutor:
                 root=root,
                 query=query,
                 glob=glob,
-                limit=limit,
+                limit=search_limit,
                 timeout_sec=timeout_sec,
             )
             notes = ["engine=rg"]
@@ -902,14 +1002,27 @@ class ToolExecutor:
                 root=root,
                 query=query,
                 glob=glob,
-                limit=limit,
+                limit=search_limit,
                 timeout_sec=timeout_sec,
             )
             notes = [
                 f"engine=bounded-python-fallback (rg not found; scanned {scanned} files)"
             ]
 
-        content = "\n".join(lines) or "(no matches)"
+        if output == "files":
+            counts: Counter[str] = Counter()
+            for line in lines:
+                path, separator, _detail = line.partition(":")
+                if separator:
+                    counts[path] += 1
+            grouped = counts.most_common(limit)
+            content = (
+                "\n".join(f"{path}\t{count} 命中" for path, count in grouped)
+                or "(no matches)"
+            )
+            notes.append(f"grouped_by_file={len(grouped)}")
+        else:
+            content = "\n".join(lines) or "(no matches)"
         if failure:
             notes.append(failure)
         return ToolResult(
@@ -969,6 +1082,20 @@ class ToolExecutor:
             ),
         )
 
+    def _inspect_runtime_history(self, args: dict[str, Any]) -> ToolResult:
+        payload = inspect_runtime_history(
+            self.data_dir,
+            mode=str(args.get("mode") or "recent"),
+            limit=int(args.get("limit", 10)),
+            days=int(args.get("days", 2)),
+            turn_id=str(args.get("turn_id") or ""),
+            exclude_session=self.current_session_id,
+        )
+        return ToolResult(
+            bool(payload.get("ok")),
+            json.dumps(payload, ensure_ascii=False),
+        )
+
     def _write_file(self, args: dict[str, Any]) -> ToolResult:
         path = self.path_guard.resolve(str(args["path"]))
         self.path_guard.assert_writable(path)
@@ -978,6 +1105,7 @@ class ToolExecutor:
         if not self.approvals.require(
             "写入文件",
             f"{path}\n将写入 {len(content.encode('utf-8'))} 字节。",
+            capability="write",
         ):
             return ToolResult(False, "用户拒绝写入文件")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1004,6 +1132,7 @@ class ToolExecutor:
         if not self.approvals.require(
             "写入结构化文档",
             f"{path}\n模板: {args.get('profile')}\n将写入 {size} 字节。",
+            capability="write",
         ):
             return ToolResult(False, "用户拒绝写入文档")
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1037,6 +1166,7 @@ class ToolExecutor:
         if not self.approvals.require(
             "修改文件",
             f"{path}\n替换 {occurrences if replace_all else 1} 处。\n--- old ---\n{preview}",
+            capability="write",
         ):
             return ToolResult(False, "用户拒绝修改文件")
         updated = content.replace(old_text, new_text, -1 if replace_all else 1)
@@ -1114,6 +1244,33 @@ class ToolExecutor:
             return ToolResult(False, "当前没有可扩展的任务范围")
         if not reason:
             return ToolResult(False, "授权请求缺少原因")
+        requested = (
+            {"write", "command"}
+            if capability == "mutation_and_commands"
+            else {"write"}
+            if capability == "mutation"
+            else {capability}
+        )
+        states = self.approvals.permission_state()
+        denied = sorted(item for item in requested if states.get(item) == "deny")
+        if denied:
+            return ToolResult(
+                False,
+                "用户已明确撤销授权，当前回合不能自动弹窗绕过："
+                + "、".join(denied),
+            )
+        already_allowed = all(
+            (
+                self.request_scope.allows_mutation
+                if item == "write"
+                else self.request_scope.allows_commands
+                if item == "command"
+                else self.request_scope.allows_network
+            )
+            for item in requested
+        )
+        if already_allowed:
+            return ToolResult(True, "所需能力已获当前任务授权")
 
         approved = self.approvals.require(
             "扩大当前任务授权",
@@ -1143,7 +1300,12 @@ class ToolExecutor:
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return ToolResult(False, "仅支持 http/https URL")
-        if not self.approvals.require("访问网络", url, risk="R2"):
+        if not self.approvals.require(
+            "访问网络",
+            url,
+            risk="R2",
+            capability="network",
+        ):
             return ToolResult(False, "用户拒绝访问网络")
         max_chars = min(100000, max(1000, int(args.get("max_chars", 30000))))
         request = urllib.request.Request(

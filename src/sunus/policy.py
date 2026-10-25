@@ -8,9 +8,45 @@ import sys
 import termios
 import threading
 import tty
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Literal
+
+from sunus.scope import RequestScope
+
+
+CAPABILITY_ALIASES = {
+    "write": "write",
+    "edit": "write",
+    "files": "write",
+    "file": "write",
+    "写入": "write",
+    "写文件": "write",
+    "command": "command",
+    "commands": "command",
+    "shell": "command",
+    "run": "command",
+    "命令": "command",
+    "network": "network",
+    "web": "network",
+    "网络": "network",
+}
+CAPABILITIES = frozenset(CAPABILITY_ALIASES.values())
+
+
+def normalize_capabilities(values: Iterable[str]) -> set[str]:
+    selected: set[str] = set()
+    for value in values:
+        for item in re.split(r"[,，、\s]+", str(value).strip().lower()):
+            if not item:
+                continue
+            if item in {"all", "全部", "所有"}:
+                selected.update(CAPABILITIES)
+                continue
+            capability = CAPABILITY_ALIASES.get(item)
+            if capability:
+                selected.add(capability)
+    return selected
 
 
 class PolicyError(RuntimeError):
@@ -458,6 +494,11 @@ class ApprovalManager:
         self.prompt_event = prompt_event
         self.before_prompt = before_prompt
         self.after_prompt = after_prompt
+        self.capability_overrides: dict[str, bool] = {}
+        if auto_approve:
+            self.capability_overrides = {
+                capability: True for capability in CAPABILITIES
+            }
 
     def begin_task(self) -> TaskGrant:
         self.grant = self.default_grant
@@ -471,9 +512,73 @@ class ApprovalManager:
             "task_grant": self.grant.risk_ceiling,
             "session_allow": self.session_allow,
             "interactive": self.interactive,
+            "capabilities": self.permission_state(),
         }
 
-    def require(self, action: str, detail: str, *, risk: RiskLevel = "R1") -> bool:
+    def permission_state(self) -> dict[str, str]:
+        return {
+            capability: (
+                "allow"
+                if self.capability_overrides.get(capability) is True
+                else "deny"
+                if self.capability_overrides.get(capability) is False
+                else "auto"
+            )
+            for capability in sorted(CAPABILITIES)
+        }
+
+    def grant_capabilities(self, capabilities: Iterable[str]) -> set[str]:
+        selected = normalize_capabilities(capabilities)
+        for capability in selected:
+            self.capability_overrides[capability] = True
+        return selected
+
+    def revoke_capabilities(self, capabilities: Iterable[str]) -> set[str]:
+        selected = normalize_capabilities(capabilities)
+        for capability in selected:
+            self.capability_overrides[capability] = False
+        return selected
+
+    def reset_capabilities(self, capabilities: Iterable[str]) -> set[str]:
+        selected = normalize_capabilities(capabilities)
+        if not selected:
+            selected = set(CAPABILITIES)
+        for capability in selected:
+            self.capability_overrides.pop(capability, None)
+        return selected
+
+    def apply_scope(self, scope: RequestScope) -> RequestScope:
+        allows_mutation = scope.allows_mutation
+        allows_commands = scope.allows_commands
+        allows_network = scope.allows_network
+        for capability, allowed in self.capability_overrides.items():
+            if capability == "write":
+                allows_mutation = allowed
+            elif capability == "command":
+                allows_commands = allowed
+            elif capability == "network":
+                allows_network = allowed
+        return replace(
+            scope,
+            allows_mutation=allows_mutation,
+            allows_commands=allows_commands,
+            allows_network=allows_network,
+        )
+
+    def require(
+        self,
+        action: str,
+        detail: str,
+        *,
+        risk: RiskLevel = "R1",
+        capability: str | None = None,
+    ) -> bool:
+        if capability:
+            override = self.capability_overrides.get(capability)
+            if override is False:
+                return False
+            if override is True:
+                return True
         if self.session_allow or self.grant.allows(risk):
             return True
         if not self.interactive:
@@ -515,7 +620,12 @@ class ApprovalManager:
             quoted = shlex.join([command])
         except Exception:
             quoted = command
-        return self.require("运行命令", quoted, risk=risk)
+        return self.require(
+            "运行命令",
+            quoted,
+            risk=risk,
+            capability="command",
+        )
 
 
 def summarize_paths(paths: Iterable[Path], limit: int = 12) -> str:

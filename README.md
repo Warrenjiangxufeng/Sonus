@@ -312,8 +312,9 @@ Tab/Esc 仍只用于打断。取消下一轮输入会同时清空暂存。
 | 工具 | 行为 |
 | --- | --- |
 | `read_file` | 读取工作区内 UTF-8 文本并返回行号。 |
-| `list_files` | 按深度和数量限制列出目录。 |
-| `search_text` | 固定字符串搜索；优先使用 `rg`，缺失时使用有界 Python 回退。 |
+| `list_files` | 按深度和数量限制列出目录；可按 mtime 排序并按最近天数过滤。 |
+| `search_text` | 固定字符串搜索；可先按文件聚合命中数，再读取候选文件。 |
+| `inspect_runtime_history` | 查询最近会话、最近失败、365 天错误趋势或单回合时间线，只返回有界摘要。 |
 | `memory_context_metrics` | 统计当前查询实际注入的偏好、召回记忆字符数和无依赖 Token 估算；只读，并标记 `exact=false`。 |
 | `write_file` | 创建或完整覆盖文件。 |
 | `write_document` | 按固定模板生成带元数据和必选章节的 Markdown 文档。 |
@@ -323,6 +324,10 @@ Tab/Esc 仍只用于打断。取消下一轮输入会同时清空暂存。
 | `list_skills` | 列出本地技能及适用场景。 |
 | `read_skill` | 读取某个技能的完整流程。 |
 | `submit_result` | 提交最终结构化结果；校验通过后结束回合。 |
+
+通用检索遵循“元数据优先”：先用路径、时间、文件类型或按文件命中数缩小范围，
+再读取候选文件的相关行。即使全部历史都有错误，也只向模型返回聚合结果和少量
+最新样本；只有用户指定时间/turn_id 时才下钻原始记录。
 
 搜索默认最多 15 秒、20,000 个文件，单条匹配最多返回 500 字符，并跳过
 `.sunus`、`.git`、依赖目录和敏感目录。单次工具输出最多注入模型上下文
@@ -416,7 +421,19 @@ MiniMax 使用官方 OpenAI 兼容地址 `https://api.minimax.io/v1`。工具调
 
 支持上下方向键加 Enter、数字键 `1/2/3`、快捷键 `y/x`。系统级高风险规则无法通过菜单绕过。
 
-任务结束后 R1 Grant 自动过期。`--yes` 和 `/approve on` 只放开会话级高风险操作，不关闭硬拒绝规则。
+任务结束后 R1 Grant 自动过期。用户可在会话内按能力覆盖自动判断：
+
+```text
+/approve status
+/approve on write,command
+/approve off network
+/approve reset write
+/permissions
+```
+
+`write`、`command`、`network` 可分别允许、拒绝或恢复 `auto`。显式拒绝优先于
+请求意图，且 `request_authorization` 不能绕过；需要恢复时使用 `reset`。
+`--yes` 和 `/approve on`（不带能力）仍会放开全部高风险操作，但不关闭硬拒绝规则。
 
 ## 路径与执行边界
 
@@ -728,7 +745,11 @@ SQLite 主库、事件和会话文件。它不会依赖代码中写死的工具�
 /memory
 /tools
 /proactive status|ratios|pause|resume|reset|trigger
-/approve on|off
+/permissions
+/approve status
+/approve on [write,command,network|all]
+/approve off [write,command,network|all]
+/approve reset [write,command,network|all]
 /exit
 ```
 

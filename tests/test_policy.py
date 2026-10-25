@@ -16,7 +16,9 @@ from sunus.policy import (
     _read_menu_key,
     command_denial_reason,
     command_risk,
+    normalize_capabilities,
 )
+from sunus.scope import classify_request
 
 
 class PolicyTests(unittest.TestCase):
@@ -193,6 +195,61 @@ class PolicyTests(unittest.TestCase):
                 )
             )
         self.assertTrue(approvals.session_allow)
+
+    def test_capability_overrides_are_granular_and_resettable(self) -> None:
+        approvals = ApprovalManager(auto_approve=False, interactive=False)
+        scope = classify_request("修改文件并运行测试")
+
+        approvals.revoke_capabilities(["write"])
+        denied = approvals.apply_scope(scope)
+        self.assertFalse(denied.allows_mutation)
+        self.assertTrue(denied.allows_commands)
+
+        approvals.grant_capabilities(["write"])
+        approvals.revoke_capabilities(["command"])
+        mixed = approvals.apply_scope(scope)
+        self.assertTrue(mixed.allows_mutation)
+        self.assertFalse(mixed.allows_commands)
+
+        approvals.reset_capabilities(["write", "command"])
+        restored = approvals.apply_scope(scope)
+        self.assertTrue(restored.allows_mutation)
+        self.assertTrue(restored.allows_commands)
+        self.assertEqual(
+            approvals.permission_state(),
+            {"command": "auto", "network": "auto", "write": "auto"},
+        )
+
+    def test_network_grant_bypasses_popup_but_revoke_denies(self) -> None:
+        approvals = ApprovalManager(
+            auto_approve=False,
+            interactive=False,
+            default_grant=TaskGrant(risk_ceiling="R1"),
+        )
+        approvals.grant_capabilities(["network"])
+        self.assertTrue(
+            approvals.require(
+                "访问网络",
+                "https://example.com",
+                risk="R2",
+                capability="network",
+            )
+        )
+        approvals.revoke_capabilities(["network"])
+        self.assertFalse(
+            approvals.require(
+                "访问网络",
+                "https://example.com",
+                risk="R2",
+                capability="network",
+            )
+        )
+
+    def test_capability_aliases_are_normalized(self) -> None:
+        self.assertEqual(
+            normalize_capabilities(["写文件,shell", "网络", "all"]),
+            {"write", "command", "network"},
+        )
 
 
 if __name__ == "__main__":

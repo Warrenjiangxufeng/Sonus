@@ -35,6 +35,7 @@ class ToolRegistryTests(unittest.TestCase):
             write = tools.registry.get("write_file")
             command = tools.registry.get("run_command")
             authorization = tools.registry.get("request_authorization")
+            runtime_history = tools.registry.get("inspect_runtime_history")
             result = tools.registry.get("submit_result")
 
             self.assertIsNotNone(read)
@@ -47,6 +48,8 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertFalse(command.parallel_safe)
             self.assertFalse(authorization.read_only)
             self.assertFalse(authorization.parallel_safe)
+            self.assertTrue(runtime_history.read_only)
+            self.assertTrue(runtime_history.parallel_safe)
             self.assertFalse(result.parallel_safe)
             self.assertEqual(
                 {item.name for item in tools.specs()},
@@ -56,6 +59,7 @@ class ToolRegistryTests(unittest.TestCase):
                     "search_text",
                     "memory_context_metrics",
                     "inspect_environment",
+                    "inspect_runtime_history",
                     "write_file",
                     "write_document",
                     "patch_file",

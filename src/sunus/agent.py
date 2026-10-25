@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -358,6 +359,9 @@ class Agent:
 15. 多个互相独立的只读检查必须在同一轮 `tool_calls` 中批量发起，避免逐项等待模型往返；只有后一项依赖前一项结果时才串行。
 16. 诊断、解释和评审类回答先给结论，再给最多 3 条关键依据和 1 条修复方向；除非用户明确索要，不展示完整代码、diff、函数实现或大段日志。
 17. 任务确实需要未开放的写入、命令或网络能力时，调用 request_authorization 发起授权；不要仅凭工具清单自行判断为永久无权限。
+18. 查询“上次、刚才”的失败时先用 inspect_runtime_history 的 recent/latest_failure；需要一段时间的规律时用 trend，让运行时在本地按错误指纹和日期聚合，绝不把数百天逐条日志塞进上下文；只有确定 turn_id 后才用 mode=turn 下钻。不要用 error/crash/Traceback 等泛词搜索整个 .sunus。
+19. 一张候选清单加一次单回合下钻足以判断时立即停止；若两个以上候选都可能是“上次”且无法区分，问用户一个具体的时间或任务锚点，不要继续遍历。365 天全有错误也不等于需要看 365 天每条记录。
+20. 其他文件、源码、文档和配置也使用同一原则：先按路径/时间/类型列候选或 count_by_file 聚合，再只读命中文件的相关行；一次范围搜索足够后停止，禁止用泛词扫描整个工作区来碰运气。
 
 任务边界：
 - 只执行用户当前消息明确要求的动作。建议、假设、示例、推测、可选优化和未点名待办都不是执行指令。
@@ -559,6 +563,7 @@ class Agent:
             "search_text",
             "memory_context_metrics",
             "inspect_environment",
+            "inspect_runtime_history",
             "list_skills",
             "read_skill",
             "request_authorization",
@@ -1564,11 +1569,21 @@ class Agent:
         except Exception as error:
             reason = "internal_error"
             detail = redact_value(str(error), self.config.api_key)
+            trace = redact_value(
+                traceback.format_exc(),
+                self.config.api_key,
+            )
+            artifact = self.tools.artifacts.save(
+                trace,
+                prefix="internal-error",
+            )
             final_text = f"Sunus 内部错误：{type(error).__name__}: {detail}"
             self.events.emit(
                 "internal_error",
                 turn_id=turn_id,
                 summary=final_text,
+                traceback=trace[:12000],
+                artifact=str(artifact),
             )
 
         if structured_result is None:

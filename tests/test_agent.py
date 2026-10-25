@@ -699,6 +699,14 @@ class AgentTests(unittest.TestCase):
                 "诊断、解释和评审类回答先给结论",
                 model.last_messages[0]["content"],
             )
+            self.assertIn(
+                "查询“上次、刚才”的失败时先用 inspect_runtime_history",
+                model.last_messages[0]["content"],
+            )
+            self.assertIn(
+                "其他文件、源码、文档和配置也使用同一原则",
+                model.last_messages[0]["content"],
+            )
             self.assertEqual(result.usage["prompt_cache_hit_tokens"], 13)
             self.assertEqual(result.usage["prompt_cache_miss_tokens"], 5)
             self.assertIn('"prompt_cache_hit_tokens":7', events_text)
@@ -1534,6 +1542,8 @@ class AgentTests(unittest.TestCase):
             events_text = events.path.read_text(encoding="utf-8")
             self.assertIn('"reason": "internal_error"', session_text)
             self.assertIn("internal_error", events_text)
+            self.assertIn("Traceback (most recent call last)", events_text)
+            self.assertIn('"artifact"', events_text)
             self.assertIn("turn_end", events_text)
             self.assertEqual(tools.approvals.grant.risk_ceiling, "R0")
             self.assertEqual(memory.recent(scope=str(root.resolve()), limit=5), [])

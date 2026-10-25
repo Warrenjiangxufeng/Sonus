@@ -24,6 +24,7 @@ class ToolTests(unittest.TestCase):
         self.assertIn("write_document", names)
         self.assertIn("memory_context_metrics", names)
         self.assertIn("inspect_environment", names)
+        self.assertIn("inspect_runtime_history", names)
         self.assertIn("request_authorization", names)
 
     def make_executor(
@@ -43,6 +44,7 @@ class ToolTests(unittest.TestCase):
             ),
             artifacts=ArtifactStore(root, root / ".data"),
             events=EventBus(root / ".data"),
+            data_dir=root / ".data",
             memory=memory,
         )
 
@@ -64,6 +66,54 @@ class ToolTests(unittest.TestCase):
             listing = executor.execute("list_files", {"depth": 2})
             self.assertIn("a.txt", listing.content)
 
+    def test_search_can_aggregate_hits_by_file_before_reading(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root)
+            executor.execute(
+                "write_file",
+                {"path": "a.txt", "content": "needle\nneedle\n"},
+            )
+            executor.execute(
+                "write_file",
+                {"path": "b.txt", "content": "needle\n"},
+            )
+
+            result = executor.execute(
+                "search_text",
+                {"query": "needle", "output": "files"},
+            )
+
+            self.assertTrue(result.ok)
+            self.assertIn("a.txt\t2 命中", result.content)
+            self.assertIn("b.txt\t1 命中", result.content)
+            self.assertNotIn("needle\nneedle", result.content)
+
+    def test_list_files_can_filter_and_sort_by_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root)
+            old = root / "old.txt"
+            new = root / "new.txt"
+            old.write_text("old", encoding="utf-8")
+            new.write_text("new", encoding="utf-8")
+            now = time.time()
+            os.utime(old, (now - 10 * 86400, now - 10 * 86400))
+            os.utime(new, (now - 60, now - 60))
+
+            result = executor.execute(
+                "list_files",
+                {
+                    "depth": 1,
+                    "sort_by_mtime": True,
+                    "modified_within_days": 2,
+                },
+            )
+
+            self.assertTrue(result.ok)
+            self.assertIn("new.txt", result.content)
+            self.assertNotIn("old.txt", result.content)
+
     def test_command_output_and_exit_code(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             executor = self.make_executor(Path(temp))
@@ -71,6 +121,27 @@ class ToolTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertIn("exit_code=0", result.content)
             self.assertIn("ok", result.content)
+
+    def test_write_file_creates_missing_parent_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root)
+
+            result = executor.execute(
+                "write_file",
+                {
+                    "path": "Desktop/not-yet-created/file.txt",
+                    "content": "hello",
+                },
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(
+                (root / "Desktop" / "not-yet-created" / "file.txt").read_text(
+                    encoding="utf-8"
+                ),
+                "hello",
+            )
 
     def test_authorization_request_can_expand_current_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -121,6 +192,35 @@ class ToolTests(unittest.TestCase):
             payload = json.loads(result.content)
             self.assertNotIn("inventory", payload["path"])
             self.assertIn("requested_commands", payload)
+
+    def test_runtime_history_tool_returns_aggregate_not_raw_log_dump(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            events_path = root / ".data" / "events" / "2026-10-25.jsonl"
+            events_path.parent.mkdir(parents=True)
+            events_path.write_text(
+                json.dumps(
+                    {
+                        "type": "internal_error",
+                        "ts": "2026-10-25T10:00:00+00:00",
+                        "turn_id": "t_1",
+                        "summary": "TypeError: first",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            executor = self.make_executor(root)
+
+            result = executor.execute(
+                "inspect_runtime_history",
+                {"mode": "trend", "days": 365},
+            )
+
+            self.assertTrue(result.ok)
+            payload = json.loads(result.content)
+            self.assertEqual(payload["total_failures"], 1)
+            self.assertNotIn("rows", payload)
 
     def test_pipeline_masked_python_error_is_marked_failed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -301,6 +401,23 @@ class ToolTests(unittest.TestCase):
                 self.assertFalse(result.ok)
                 self.assertIn("没有明确要求", result.content)
             self.assertFalse((root / "new.txt").exists())
+
+    def test_explicit_capability_revoke_overrides_user_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root)
+            executor.approvals.revoke_capabilities(["write"])
+            scope = executor.begin_request("修改文件并运行测试")
+
+            self.assertFalse(scope.allows_mutation)
+            self.assertTrue(scope.allows_commands)
+            result = executor.execute(
+                "write_file",
+                {"path": "blocked.txt", "content": "blocked"},
+            )
+            self.assertFalse(result.ok)
+            self.assertIn("没有明确要求", result.content)
+            self.assertFalse((root / "blocked.txt").exists())
 
 
 if __name__ == "__main__":

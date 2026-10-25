@@ -34,7 +34,7 @@ from sunus.environment import discover_environment
 from sunus.events import EventBus
 from sunus.memory import MemoryStore
 from sunus.model import ModelClient, ModelError, create_model_client
-from sunus.policy import ApprovalManager, PathGuard
+from sunus.policy import CAPABILITIES, ApprovalManager, PathGuard
 from sunus.proactive import (
     PresenceContext,
     ProactiveScheduler,
@@ -655,6 +655,7 @@ def build_components(
         approvals=approvals,
         artifacts=artifacts,
         events=events,
+        data_dir=config.data_dir,
         secret=config.api_key,
         memory=memory,
         mcp_servers=config.mcp_servers,
@@ -667,6 +668,7 @@ def build_components(
         config.api_key,
         path=session_path,
     )
+    tools.current_session_id = session.session_id
     session.append(
         "meta",
         {
@@ -1102,7 +1104,10 @@ def print_help(config: RuntimeConfig) -> None:
   /status                     查看模型、工作区、记忆与主动陪伴状态
   /memory                     查看最近记忆摘要
   /proactive status|ratios|pause|resume|reset|trigger
-  /approve on|off             放开或收回高权限操作授权
+  /approve status             查看按能力划分的授权
+  /approve on [write,command,network|all]
+  /approve off [write,command,network|all]
+  /approve reset [write,command,network|all]
   /tools                      查看可用工具
   /exit                       退出
 
@@ -1163,21 +1168,56 @@ def handle_slash(command: str, components: Components) -> bool:
                 for item in components.tools.schemas()
             )
         )
-    elif name == "/approve":
+    elif name in {"/approve", "/permissions"}:
         value = parts[1].lower() if len(parts) > 1 else ""
-        if value == "on":
-            components.approvals.session_allow = True
-            print("本会话已放开超出常规任务授权的高风险操作。")
-        elif value == "off":
-            components.approvals.session_allow = False
-            print("已收回高权限操作授权，恢复任务级 R1 自动执行。")
-        else:
+        capability_values = parts[2:]
+        if name == "/permissions" and not value:
+            value = "status"
+        if value in {"on", "grant"}:
+            selected = components.approvals.grant_capabilities(
+                capability_values or CAPABILITIES
+            )
+            if not capability_values:
+                components.approvals.session_allow = True
             print(
-                json.dumps(
-                    components.approvals.describe(),
-                    ensure_ascii=False,
-                    indent=2,
+                "已允许本会话能力："
+                + ("、".join(sorted(selected)) or "无")
+            )
+        elif value in {"off", "revoke"}:
+            selected = components.approvals.revoke_capabilities(
+                capability_values or CAPABILITIES
+            )
+            components.approvals.session_allow = False
+            print(
+                "已拒绝本会话能力："
+                + ("、".join(sorted(selected)) or "无")
+            )
+        elif value in {"reset", "auto"}:
+            selected = components.approvals.reset_capabilities(
+                capability_values or CAPABILITIES
+            )
+            if not capability_values:
+                components.approvals.session_allow = False
+            print(
+                "已恢复按请求意图判断："
+                + ("、".join(sorted(selected)) or "当前能力")
+            )
+        else:
+            state = components.approvals.permission_state()
+            labels = {
+                "write": "写文件/修改",
+                "command": "本地命令",
+                "network": "网络访问",
+            }
+            print("当前会话授权：")
+            for capability in sorted(state):
+                print(
+                    f"  {labels.get(capability, capability)}: "
+                    f"{state[capability]}"
                 )
+            print(
+                "  session_allow: "
+                + ("on" if components.approvals.session_allow else "off")
             )
     elif name == "/proactive":
         action = parts[1].lower() if len(parts) > 1 else "status"

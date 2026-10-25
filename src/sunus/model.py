@@ -262,8 +262,30 @@ class BaseModelClient:
         self._cancel_event.set()
         with self._connection_lock:
             connection = self._connection
-            active_socket = self._active_socket
-        if active_socket is not None:
+        self._release_connection(connection, shutdown_socket=True)
+
+    def _release_connection(
+        self,
+        connection: http.client.HTTPConnection | None,
+        *,
+        shutdown_socket: bool = False,
+    ) -> None:
+        if connection is None:
+            return
+        with self._connection_lock:
+            if getattr(connection, "_sunus_released", False):
+                return
+            try:
+                setattr(connection, "_sunus_released", True)
+            except (AttributeError, TypeError):
+                pass
+            active_socket = (
+                self._active_socket if self._connection is connection else None
+            )
+            if self._connection is connection:
+                self._connection = None
+                self._active_socket = None
+        if shutdown_socket and active_socket is not None:
             try:
                 active_socket.shutdown(socket.SHUT_RDWR)
             except OSError:
@@ -272,11 +294,10 @@ class BaseModelClient:
                 active_socket.close()
             except OSError:
                 pass
-        if connection is not None:
-            try:
-                connection.close()
-            except Exception:
-                pass
+        try:
+            connection.close()
+        except Exception:
+            pass
 
     def _open_connection(
         self,
@@ -386,15 +407,7 @@ class BaseModelClient:
                     continue
                 raise ModelError(f"模型请求失败: {last_error}") from error
             finally:
-                with self._connection_lock:
-                    if self._connection is connection:
-                        self._connection = None
-                        self._active_socket = None
-                if connection is not None:
-                    try:
-                        connection.close()
-                    except Exception:
-                        pass
+                self._release_connection(connection)
         raise ModelError(last_error or "模型请求失败")
 
     def _request_stream(
@@ -444,11 +457,7 @@ class BaseModelClient:
                 TimeoutError,
                 socket.timeout,
             ) as error:
-                if connection is not None:
-                    try:
-                        connection.close()
-                    except Exception:
-                        pass
+                self._release_connection(connection)
                 last_error = redact_text(error, self.config.api_key)
                 if attempt < 2:
                     time.sleep(1.5 * (attempt + 1))
@@ -456,14 +465,7 @@ class BaseModelClient:
                 raise ModelError(f"模型流式请求失败: {last_error}") from error
             finally:
                 if not connected and connection is not None:
-                    with self._connection_lock:
-                        if self._connection is connection:
-                            self._connection = None
-                            self._active_socket = None
-                    try:
-                        connection.close()
-                    except Exception:
-                        pass
+                    self._release_connection(connection)
         if connection is None or response is None:
             raise ModelError(f"模型流式请求失败: {last_error}")
 
@@ -485,14 +487,7 @@ class BaseModelClient:
             if data_lines:
                 yield "\n".join(data_lines)
         finally:
-            with self._connection_lock:
-                if self._connection is connection:
-                    self._connection = None
-                    self._active_socket = None
-            try:
-                connection.close()
-            except Exception:
-                pass
+            self._release_connection(connection)
 
     def list_models(self) -> list[str]:
         payload = self._request("GET", "/models")

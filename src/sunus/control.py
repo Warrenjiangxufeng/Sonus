@@ -53,6 +53,8 @@ class TurnController:
         self.error_counts_at_recovery: dict[str, int] = {}
         self.blocked_tool_signatures: set[str] = set()
         self.blocked_tools: dict[str, str] = {}
+        self.search_calls = 0
+        self.search_checkpoint_sent = False
         self._warned: set[str] = set()
         self._started = False
         self.finalizing = False
@@ -89,6 +91,7 @@ class TurnController:
             "consecutive_failures": self.consecutive_failures,
             "recovery_count": self.recovery_count,
             "blocked_tools": len(self.blocked_tool_signatures),
+            "search_calls": self.search_calls,
             "error_fingerprints": len(self.errors),
             "finalizing": self.finalizing,
             "finalization_reserve": self.finalization_reserve,
@@ -145,6 +148,24 @@ class TurnController:
         else:
             self._check_hard_limits()
             recovery = None if self.finalizing else self._recovery_if_needed()
+            if (
+                recovery is None
+                and not self.finalizing
+                and self.search_calls >= 4
+                and not self.search_checkpoint_sent
+            ):
+                self.search_checkpoint_sent = True
+                recovery = (
+                    "检索收束检查点：本轮已完成至少 4 次全文搜索。"
+                    "停止继续更换关键词；先使用已有结果按文件聚合、缩小到具体候选，"
+                    "或改用 inspect_runtime_history。若仍无法区分“上次/最近”的对象，"
+                    "直接向用户询问一个时间或任务锚点。"
+                )
+                self._emit(
+                    "search_checkpoint",
+                    search_calls=self.search_calls,
+                    summary="搜索达到 4 次，要求收束",
+                )
         self._emit_warnings()
         self.model_calls += 1
         return recovery
@@ -175,6 +196,20 @@ class TurnController:
                 summary=reason,
             )
             return reason
+        if name == "search_text":
+            self.search_calls += 1
+            if self.search_calls > 6:
+                reason = (
+                    "本轮全文搜索已超过 6 次。停止更换关键词，"
+                    "改用文件聚合、局部读取或 inspect_runtime_history；"
+                    "无法区分对象时向用户询问时间锚点。"
+                )
+                self._emit(
+                    "search_budget_blocked",
+                    search_calls=self.search_calls,
+                    summary=reason,
+                )
+                return reason
         signature = self._tool_signature(name, arguments)
         self.tool_calls += 1
         self._emit_warnings()

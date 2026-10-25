@@ -171,6 +171,45 @@ class TurnControllerTests(unittest.TestCase):
         self.assertIsNone(controller.before_model_call())
         self.assertEqual(controller.recovery_count, 1)
 
+    def test_repeated_full_text_search_must_converge(self) -> None:
+        events = RecordingEvents()
+        controller = TurnController(
+            LoopBudgetConfig(
+                no_progress_soft=10,
+                no_progress_hard=20,
+            ),
+            events=events,  # type: ignore[arg-type]
+        )
+        controller.before_model_call()
+        for index in range(4):
+            args = {"query": f"term-{index}"}
+            controller.before_tool("search_text", args)
+            controller.record_tool_result(
+                "search_text",
+                args,
+                ok=True,
+                content=f"result-{index}",
+                changed_files=[],
+            )
+
+        checkpoint = controller.before_model_call()
+        self.assertIn("检索收束检查点", checkpoint or "")
+        self.assertIn(
+            "search_checkpoint",
+            [event_type for event_type, _payload in events.events],
+        )
+        self.assertIsNone(
+            controller.before_tool("search_text", {"query": "term-5"})
+        )
+        self.assertIsNone(
+            controller.before_tool("search_text", {"query": "term-6"})
+        )
+        blocked = controller.before_tool(
+            "search_text",
+            {"query": "term-7"},
+        )
+        self.assertIn("超过 6 次", blocked or "")
+
     def test_repeated_tool_failure_is_blocked(self) -> None:
         controller = TurnController(
             LoopBudgetConfig(
