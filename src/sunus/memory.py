@@ -147,6 +147,12 @@ class MemoryStore:
         except OSError:
             pass
         self._fts_enabled = self._initialize()
+        self._integrity = self.integrity_status()
+        if not self._integrity["ok"]:
+            raise sqlite3.DatabaseError(
+                "记忆数据库完整性检查失败: "
+                f"{json.dumps(self._integrity, ensure_ascii=False)}"
+            )
 
     def _initialize(self) -> bool:
         with self._connection:
@@ -171,6 +177,18 @@ class MemoryStore:
                     ON memories(scope, kind, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_memory_status
                     ON memories(status, created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS memory_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    memory_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    snapshot TEXT NOT NULL,
+                    previous_hash TEXT NOT NULL DEFAULT '',
+                    content_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_revisions_memory
+                    ON memory_revisions(memory_id, id DESC);
 
                 CREATE TABLE IF NOT EXISTS memory_evidence (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -253,6 +271,24 @@ class MemoryStore:
                 """
             )
         self._backfill_persona_traits()
+        try:
+            with self._connection:
+                missing = self._connection.execute(
+                    """
+                    SELECT memories.id
+                    FROM memories
+                    LEFT JOIN memory_revisions
+                      ON memory_revisions.memory_id = memories.id
+                    WHERE memory_revisions.id IS NULL
+                    """
+                ).fetchall()
+                for row in missing:
+                    self._append_memory_revision(
+                        str(row["id"]),
+                        "baseline",
+                    )
+        except sqlite3.OperationalError:
+            pass
         try:
             with self._connection:
                 self._connection.execute(
@@ -348,6 +384,7 @@ class MemoryStore:
                     "INSERT INTO memory_fts(memory_id, content, tags, scope) VALUES (?, ?, ?, ?)",
                     (memory_id, clean, tag_text, scope),
                 )
+                self._append_memory_revision(memory_id, "update")
             else:
                 memory_id = f"m_{uuid.uuid4().hex[:12]}"
                 self._connection.execute(
@@ -378,6 +415,7 @@ class MemoryStore:
                     "INSERT INTO memory_fts(memory_id, content, tags, scope) VALUES (?, ?, ?, ?)",
                     (memory_id, clean, tag_text, scope),
                 )
+                self._append_memory_revision(memory_id, "create")
             self._connection.execute(
                 """
                 INSERT INTO memory_evidence(memory_id, receipt_id, evidence_kind, detail)
@@ -395,6 +433,48 @@ class MemoryStore:
                     (memory_id,),
                 ).fetchone()
             )
+
+    def _append_memory_revision(self, memory_id: str, action: str) -> None:
+        row = self._connection.execute(
+            "SELECT * FROM memories WHERE id = ?",
+            (memory_id,),
+        ).fetchone()
+        if row is None:
+            return
+        snapshot = json.dumps(
+            dict(row),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        previous = self._connection.execute(
+            """
+            SELECT content_hash FROM memory_revisions
+            WHERE memory_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (memory_id,),
+        ).fetchone()
+        previous_hash = str(previous["content_hash"]) if previous else ""
+        content_hash = hashlib.sha256(
+            (previous_hash + snapshot).encode("utf-8")
+        ).hexdigest()
+        self._connection.execute(
+            """
+            INSERT INTO memory_revisions(
+                memory_id, action, snapshot, previous_hash,
+                content_hash, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                memory_id,
+                action,
+                snapshot,
+                previous_hash,
+                content_hash,
+                iso(),
+            ),
+        )
 
     def recent_preferences(
         self,
@@ -953,6 +1033,7 @@ class MemoryStore:
                     "UPDATE memories SET negative = negative + 1 WHERE id = ?",
                     (memory_id,),
                 )
+            self._append_memory_revision(memory_id, "credit")
 
     def record_turn(
         self,
@@ -1102,6 +1183,7 @@ class MemoryStore:
                 """,
                 (memory_id, clean, tag_text, scope),
             )
+            self._append_memory_revision(memory_id, "update")
             return memory_id
 
     def record_session_summary(
@@ -1204,6 +1286,7 @@ class MemoryStore:
                     "DELETE FROM memory_fts WHERE memory_id = ?",
                     (duplicate_id,),
                 )
+                self._append_memory_revision(duplicate_id, "supersede")
             self._connection.execute(
                 """
                 UPDATE memories
@@ -1224,6 +1307,7 @@ class MemoryStore:
                 """,
                 (memory_id, clean, tag_text, scope),
             )
+            self._append_memory_revision(memory_id, "update")
             return memory_id
 
     @staticmethod
@@ -1579,22 +1663,67 @@ class MemoryStore:
                     (memory_id,),
                 )
                 self._connection.execute(
-                    "DELETE FROM memory_evidence WHERE memory_id = ?",
-                    (memory_id,),
+                    """
+                    UPDATE memories
+                    SET status = 'archived',
+                        metadata = json_set(
+                            CASE
+                                WHEN json_valid(metadata) THEN metadata
+                                ELSE '{}'
+                            END,
+                            '$.archived_at', ?
+                        )
+                    WHERE id = ?
+                    """,
+                    (iso(), memory_id),
                 )
-                self._connection.execute(
-                    "DELETE FROM memory_usage WHERE memory_id = ?",
-                    (memory_id,),
-                )
-                self._connection.execute(
-                    "DELETE FROM memory_credit WHERE memory_id = ?",
-                    (memory_id,),
-                )
-                self._connection.execute(
-                    "DELETE FROM memories WHERE id = ?",
-                    (memory_id,),
+                self._append_memory_revision(
+                    memory_id,
+                    "archive",
                 )
         return len(ids)
+
+    def verify_revision_chain(self) -> dict[str, Any]:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT memory_id, snapshot, previous_hash, content_hash
+                FROM memory_revisions ORDER BY memory_id, id
+                """
+            ).fetchall()
+        previous_by_memory: dict[str, str] = {}
+        broken: list[str] = []
+        for row in rows:
+            memory_id = str(row["memory_id"])
+            previous_hash = str(row["previous_hash"])
+            if previous_hash != previous_by_memory.get(memory_id, ""):
+                broken.append(memory_id)
+            expected = hashlib.sha256(
+                (previous_hash + str(row["snapshot"])).encode("utf-8")
+            ).hexdigest()
+            if expected != str(row["content_hash"]):
+                broken.append(memory_id)
+            previous_by_memory[memory_id] = str(row["content_hash"])
+        return {
+            "ok": not broken,
+            "revisions": len(rows),
+            "broken_memory_ids": sorted(set(broken)),
+        }
+
+    def integrity_status(self) -> dict[str, Any]:
+        with self._lock:
+            quick_check = self._connection.execute(
+                "PRAGMA quick_check"
+            ).fetchone()
+        quick_ok = bool(
+            quick_check is not None and str(quick_check[0]).lower() == "ok"
+        )
+        revisions = self.verify_revision_chain()
+        return {
+            "ok": quick_ok and revisions["ok"],
+            "quick_check": str(quick_check[0]) if quick_check else "unknown",
+            "revisions": revisions,
+        }
 
 
 def memory_context_text(entries: list[dict[str, Any]], *, label: str) -> str:

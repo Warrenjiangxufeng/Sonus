@@ -463,12 +463,17 @@ MiniMax 使用官方 OpenAI 兼容地址 `https://api.minimax.io/v1`。工具调
 - `memory_evidence`：记忆来源、Receipt 和证据类型。
 - `memory_usage`：哪一轮使用了哪条记忆。
 - `memory_credit`：有效、无效和未知反馈。
+- `memory_revisions`：追加式记忆快照与链式哈希，记录创建、更新、信用和归档。
 - `memory_fts`：FTS5 全文检索索引；不可用时回退普通表。
 - `persona_traits`：Sunus 可演化性格画像，记录证据数、置信度、版本与状态。
 - `proactive_state`：主动陪伴状态。
 - `proactive_messages`：已生成主动消息与指纹。
 
-记忆按 `global` 或项目作用域隔离。明确偏好语句形成 `preference`，普通任务形成 `episode`，明确的表达/沟通反馈形成 `persona`，实际发出的主动消息形成 `self_share`。支持检索、信用、蒸馏和显式物理删除。
+记忆按 `global` 或项目作用域隔离。明确偏好语句形成 `preference`，普通任务形成 `episode`，明确的表达/沟通反馈形成 `persona`，实际发出的主动消息形成 `self_share`。支持检索、信用、蒸馏和软归档。
+
+`~/.sunus/core-identity.json` 保存代码级核心不变量：事实准确、安全与越权边界、
+记忆不可静默清除。启动时会校验清单；被修改时先备份为 `core-identity.tampered-*`
+再恢复标准清单。`persona.name` 不进入核心清单，仍然完全由用户配置。
 
 性格设定分为两层：`SUNUS_GENDER`、名字等属于明确身份设定；`persona_traits`
 属于可演化画像。你明确指定的性格或沟通方式会立即成为稳定特质；Sunus 从
@@ -497,7 +502,7 @@ sunus memory add "以后先给结论" --kind preference --global-scope --tags co
 sunus memory forget <id> --yes
 ```
 
-`forget` 会同时清理索引、证据、使用记录和信用记录，属于显式物理删除。
+`forget` 只把记忆标记为 `archived` 并移出检索，原始内容、证据、使用记录、信用和 revision 链都会保留。
 
 ## 本地技能
 

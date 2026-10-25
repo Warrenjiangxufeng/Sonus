@@ -8,6 +8,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from sunus.core_identity import CoreIdentityState, ensure_core_identity
+
 
 class ConfigError(RuntimeError):
     pass
@@ -212,6 +214,7 @@ class RuntimeConfig:
     mcp_servers: tuple[MCPServerConfig, ...] = ()
     max_parallel_tools: int = 4
     streaming: bool = True
+    core_identity: CoreIdentityState = field(default_factory=CoreIdentityState)
 
     @property
     def has_api_key(self) -> bool:
@@ -388,6 +391,7 @@ def resolve_config(
         data_dir.chmod(0o700)
     except OSError:
         pass
+    core_identity = ensure_core_identity(data_dir)
     user = _load_user_config(data_dir)
 
     sunus_key, sunus_base = load_sunus_deepseek_config()
@@ -833,6 +837,7 @@ def resolve_config(
             min(16, int(runtime_payload.get("max_parallel_tools", 4))),
         ),
         streaming=bool(runtime_payload.get("streaming", True)),
+        core_identity=core_identity,
     )
 
 
@@ -911,6 +916,7 @@ def config_summary(config: RuntimeConfig) -> dict[str, Any]:
         "model": config.model,
         "base_url": config.base_url,
         "api_key_loaded": config.has_api_key,
+        "core_identity": config.core_identity.to_dict(),
         "max_steps": config.max_steps,
         "max_tokens": config.max_tokens,
         "runtime": {

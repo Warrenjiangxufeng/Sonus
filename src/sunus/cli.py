@@ -1842,10 +1842,10 @@ def memory_command(config: RuntimeConfig, args: argparse.Namespace) -> int:
             return 0
         elif args.memory_action == "forget":
             if not (config.auto_approve or getattr(args, "forget_yes", False)):
-                print("物理删除记忆需要显式使用 --yes。", file=sys.stderr)
+                print("归档记忆需要显式使用 --yes。", file=sys.stderr)
                 return 2
             count = memory.forget(args.identifier)
-            print(f"已删除 {count} 条记忆。")
+            print(f"已归档 {count} 条记忆，原始内容和审计记录已保留。")
             return 0
         else:
             raise ValueError(f"未知 memory 操作: {args.memory_action}")

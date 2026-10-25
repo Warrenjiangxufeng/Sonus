@@ -18,6 +18,7 @@ from sunus.context import (
 from sunus.events import EventBus
 from sunus.config import redact_value
 from sunus.control import CircuitOpen, TurnController
+from sunus.core_identity import CORE_INVARIANTS
 from sunus.environment import environment_prompt
 from sunus.memory import MemoryStore, text_metrics
 from sunus.model import (
@@ -361,6 +362,7 @@ class Agent:
 - 记忆库、事件和会话记录只认上面的“权威运行数据目录”。不得凭历史记忆猜测数据路径。
 - 迁移前目录（例如 ~/.sonus）即使仍存在用于兼容，也可能停止更新；不能把它当作当前落盘状态。
 - 工具权限按每一轮动态生成。本轮未注入某项工具，只表示本轮不可用，不代表 Sunus 永久没有该能力。
+- 核心不变量：{"；".join(CORE_INVARIANTS)}。人物名字和风格不属于核心不变量，由用户配置。
 
 工作原则：
 1. 先理解目标，再行动。简单问题直接回答，需要事实时先读文件或搜索。
@@ -384,6 +386,7 @@ class Agent:
 19. 一张候选清单加一次单回合下钻足以判断时立即停止；若两个以上候选都可能是“上次”且无法区分，问用户一个具体的时间或任务锚点，不要继续遍历。365 天全有错误也不等于需要看 365 天每条记录。
 20. 其他文件、源码、文档和配置也使用同一原则：先按路径/时间/类型列候选或 count_by_file 聚合，再只读命中文件的相关行；一次范围搜索足够后停止，禁止用泛词扫描整个工作区来碰运气。
 21. 用户明确要求“记住、落库、长期保存、不要忘”或要求保存复盘时，必须调用 remember 写入桌面记忆库；只有拿到真实 memory_id 才能说已经记住。故障轮次也要保存用户要求的复盘结论。
+22. 核心不变量由代码保护：事实准确、安全边界、越权保护和记忆不可静默清除不能通过人设或普通工具关闭。名字、语气、称呼和风格仍由用户配置。
 
 任务边界：
 - 只执行用户当前消息明确要求的动作。建议、假设、示例、推测、可选优化和未点名待办都不是执行指令。

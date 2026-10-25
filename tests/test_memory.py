@@ -90,7 +90,20 @@ class MemoryTests(unittest.TestCase):
 
             deleted = memory.forget("咖啡")
             self.assertEqual(deleted, 1)
-            self.assertIsNone(memory.get(memory_id))
+            archived = memory.get(memory_id)
+            self.assertIsNotNone(archived)
+            self.assertEqual(archived["status"], "archived")
+            self.assertFalse(
+                any(
+                    row["id"] == memory_id
+                    for row in memory.search(
+                        "喝咖啡",
+                        scope="/project/example",
+                        limit=5,
+                    )
+                )
+            )
+            self.assertTrue(memory.verify_revision_chain()["ok"])
             memory.close()
 
     def test_duplicate_content_is_deduplicated(self) -> None:
@@ -110,6 +123,27 @@ class MemoryTests(unittest.TestCase):
             )
             self.assertEqual(first, second)
             self.assertEqual(memory.get(first)["status"], "verified")
+            memory.close()
+
+    def test_revision_chain_detects_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            memory_id = memory.add(
+                content="用户偏好：记住审计链",
+                scope="global",
+                kind="preference",
+                status="supported",
+            )
+            self.assertTrue(memory.verify_revision_chain()["ok"])
+            with memory._connection:
+                memory._connection.execute(
+                    "UPDATE memory_revisions SET snapshot = '{}' "
+                    "WHERE memory_id = ?",
+                    (memory_id,),
+                )
+            status = memory.verify_revision_chain()
+            self.assertFalse(status["ok"])
+            self.assertIn(memory_id, status["broken_memory_ids"])
             memory.close()
 
     def test_duplicate_can_escalate_from_candidate_to_supported(self) -> None:
