@@ -26,6 +26,8 @@ class ReasoningTests(unittest.TestCase):
         self.assertIn("inspect_environment", prompt)
         self.assertIn("单个失败入口不能证明", prompt)
         self.assertIn("不输出思维链", prompt)
+        self.assertIn("最多 3 条关键依据", prompt)
+        self.assertIn("不展示完整代码、diff", prompt)
 
 
 if __name__ == "__main__":

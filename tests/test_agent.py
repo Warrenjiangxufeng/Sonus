@@ -622,6 +622,10 @@ class AgentTests(unittest.TestCase):
                 "多个互相独立的只读检查必须在同一轮 `tool_calls` 中批量发起",
                 model.last_messages[0]["content"],
             )
+            self.assertIn(
+                "诊断、解释和评审类回答先给结论",
+                model.last_messages[0]["content"],
+            )
             self.assertEqual(result.usage["prompt_cache_hit_tokens"], 13)
             self.assertEqual(result.usage["prompt_cache_miss_tokens"], 5)
             self.assertIn('"prompt_cache_hit_tokens":7', events_text)

@@ -17,7 +17,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TextIO
 
 from sunus import __version__
 from sunus.agent import Agent, AgentResult
@@ -54,6 +54,7 @@ from sunus.tools import ToolExecutor, find_ripgrep
 
 
 RESET = "\033[0m"
+BOLD = "\033[1m"
 CYAN = "\033[36m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
@@ -64,6 +65,87 @@ _IUTF8_FLAG = getattr(termios, "IUTF8", 0x4000)
 
 def color(text: str, code: str, enabled: bool) -> str:
     return f"{code}{text}{RESET}" if enabled else text
+
+
+def _terminal_inline_markdown(line: str, *, color_enabled: bool) -> str:
+    parts = re.split(r"(`[^`\n]+`)", line)
+    rendered: list[str] = []
+    for part in parts:
+        if len(part) >= 2 and part.startswith("`") and part.endswith("`"):
+            content = part[1:-1]
+            rendered.append(color(content, CYAN, color_enabled))
+            continue
+        if color_enabled:
+            part = re.sub(
+                r"\*\*(.+?)\*\*",
+                lambda match: color(match.group(1), BOLD, True),
+                part,
+            )
+        else:
+            part = re.sub(r"\*\*(.+?)\*\*", r"\1", part)
+        rendered.append(part)
+    return "".join(rendered)
+
+
+def render_terminal_markdown(text: str, *, color_enabled: bool) -> str:
+    """Render the small Markdown subset used by ResultEnvelope in a terminal."""
+    lines: list[str] = []
+    in_code = False
+    for raw_line in str(text or "").splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("```"):
+            if in_code:
+                lines.append(color("  └─", DIM, color_enabled))
+                in_code = False
+            else:
+                in_code = True
+                language = stripped[3:].strip()
+                label = f"  ┌─ {language}" if language else "  ┌─ code"
+                lines.append(color(label, DIM, color_enabled))
+            continue
+        if in_code:
+            lines.append(color(f"  {raw_line}", DIM, color_enabled))
+            continue
+        heading = re.match(r"^(#{1,6})\s+(.*)$", raw_line)
+        if heading:
+            title = _terminal_inline_markdown(
+                heading.group(2),
+                color_enabled=color_enabled,
+            )
+            marker = "▌ " if len(heading.group(1)) <= 2 else "• "
+            lines.append(color(marker + title, BOLD + CYAN, color_enabled))
+            continue
+        bullet = re.match(r"^(\s*)[-*]\s+(.*)$", raw_line)
+        if bullet:
+            body = _terminal_inline_markdown(
+                bullet.group(2),
+                color_enabled=color_enabled,
+            )
+            lines.append(f"{bullet.group(1)}• {body}")
+            continue
+        quote = re.match(r"^\s*>\s?(.*)$", raw_line)
+        if quote:
+            body = _terminal_inline_markdown(
+                quote.group(1),
+                color_enabled=color_enabled,
+            )
+            lines.append(color(f"│ {body}", DIM, color_enabled))
+            continue
+        lines.append(
+            _terminal_inline_markdown(raw_line, color_enabled=color_enabled)
+        )
+    return "\n".join(lines)
+
+
+def print_terminal_markdown(
+    text: str,
+    *,
+    stream: TextIO | None = None,
+    color_enabled: bool | None = None,
+) -> None:
+    stream = stream or sys.stdout
+    enabled = stream.isatty() if color_enabled is None else color_enabled
+    print(render_terminal_markdown(text, color_enabled=enabled), file=stream)
 
 
 def _enable_utf8_input(descriptor: int) -> bool:
@@ -124,11 +206,13 @@ class RuntimeEventRenderer:
         *,
         color_enabled: bool | None = None,
         is_tty: bool | None = None,
+        activity_stream: TextIO | None = None,
     ) -> None:
         self.color_enabled = (
             sys.stdout.isatty() if color_enabled is None else color_enabled
         )
         self.is_tty = sys.stdout.isatty() if is_tty is None else is_tty
+        self.activity_stream = activity_stream or sys.stderr
         self._line_active = False
         self._analysis_count = 0
         self._tool_counts: dict[str, int] = {}
@@ -137,16 +221,23 @@ class RuntimeEventRenderer:
 
     def _status(self, text: str, code: str = "") -> None:
         if not self.is_tty:
-            print(color(text.strip(), code, self.color_enabled), flush=True)
             return
-        sys.stdout.write("\r\x1b[2K" + color(text, code, self.color_enabled))
-        sys.stdout.flush()
+        self.activity_stream.write(
+            "\r\x1b[2K" + color(text, code, self.color_enabled)
+        )
+        self.activity_stream.flush()
         self._line_active = True
 
     def _finish(self, text: str, code: str = "") -> None:
-        if self.is_tty and self._line_active:
-            sys.stdout.write("\r\x1b[2K")
-        print(color(text, code, self.color_enabled), flush=True)
+        if not self.is_tty:
+            return
+        if self._line_active:
+            self.activity_stream.write("\r\x1b[2K")
+        print(
+            color(text, code, self.color_enabled),
+            file=self.activity_stream,
+            flush=True,
+        )
         self._line_active = False
 
     def _summary(self) -> str:
@@ -179,11 +270,6 @@ class RuntimeEventRenderer:
             text = str(event.get("text") or "")
             if not text:
                 return
-            if self.is_tty and self._line_active:
-                sys.stdout.write("\r\x1b[2K")
-            sys.stdout.write(color(text, "", self.color_enabled))
-            sys.stdout.flush()
-            self._line_active = False
             self.streamed_text += text
             return
         if event_type == "assistant_progress":
@@ -229,8 +315,6 @@ class RuntimeEventRenderer:
             )
             return
         if event_type == "turn_end":
-            if self.streamed_text:
-                print()
             reason = str(event.get("reason") or "completed")
             if reason == "completed":
                 self._finish(self._summary(), GREEN)
@@ -1232,13 +1316,9 @@ def run_repl(
             except KeyboardInterrupt:
                 print("\n操作已中断。")
                 continue
-            if renderer is not None and renderer.streamed_text:
-                remainder = residual_text(result.text, renderer.streamed_text)
-                if remainder:
-                    print(remainder)
+            print_terminal_markdown(result.text)
+            if renderer is not None:
                 renderer.streamed_text = ""
-            else:
-                print(result.text)
             if result.reason not in {"completed"}:
                 print(
                     color(
@@ -1323,7 +1403,7 @@ def run_exec(
                 )
             )
         else:
-            print(result.text)
+            print_terminal_markdown(result.text)
         return 0 if result.reason == "completed" else 1
     finally:
         components.close()

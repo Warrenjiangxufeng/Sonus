@@ -17,6 +17,7 @@ from sunus.cli import (
     _thinking_interrupt_pressed,
     make_parser,
     print_banner,
+    render_terminal_markdown,
     residual_text,
 )
 
@@ -179,40 +180,43 @@ class CliTests(unittest.TestCase):
 
     def test_runtime_renderer_shows_compact_operation_chain(self) -> None:
         output = io.StringIO()
-        renderer = RuntimeEventRenderer(color_enabled=False, is_tty=True)
-        with redirect_stdout(output):
-            renderer(
-                {
-                    "type": "task_grant_started",
-                    "risk_ceiling": "R1",
-                }
-            )
-            renderer({"type": "model_request", "step": 1})
-            renderer(
-                {
-                    "type": "assistant_progress",
-                    "summary": "先检查说明文件，再确认目录职责。",
-                }
-            )
-            renderer(
-                {
-                    "type": "tool_call",
-                    "call_id": "call_1",
-                    "name": "read_file",
-                    "summary": "读取文件 · note.txt",
-                }
-            )
-            renderer(
-                {
-                    "type": "tool_result",
-                    "call_id": "call_1",
-                    "name": "read_file",
-                    "ok": True,
-                    "changed_files": [],
-                    "preview": "已读取 12 行",
-                }
-            )
-            renderer({"type": "turn_end", "reason": "completed"})
+        renderer = RuntimeEventRenderer(
+            color_enabled=False,
+            is_tty=True,
+            activity_stream=output,
+        )
+        renderer(
+            {
+                "type": "task_grant_started",
+                "risk_ceiling": "R1",
+            }
+        )
+        renderer({"type": "model_request", "step": 1})
+        renderer(
+            {
+                "type": "assistant_progress",
+                "summary": "先检查说明文件，再确认目录职责。",
+            }
+        )
+        renderer(
+            {
+                "type": "tool_call",
+                "call_id": "call_1",
+                "name": "read_file",
+                "summary": "读取文件 · note.txt",
+            }
+        )
+        renderer(
+            {
+                "type": "tool_result",
+                "call_id": "call_1",
+                "name": "read_file",
+                "ok": True,
+                "changed_files": [],
+                "preview": "已读取 12 行",
+            }
+        )
+        renderer({"type": "turn_end", "reason": "completed"})
         text = output.getvalue()
         self.assertIn("思考中…", text)
         self.assertIn("先检查说明文件", text)
@@ -223,45 +227,72 @@ class CliTests(unittest.TestCase):
 
     def test_runtime_renderer_tracks_assistant_delta(self) -> None:
         output = io.StringIO()
-        renderer = RuntimeEventRenderer(color_enabled=False, is_tty=False)
-        with redirect_stdout(output):
-            renderer({"type": "model_request", "step": 1})
-            renderer({"type": "assistant_delta", "text": "你好"})
-            renderer({"type": "assistant_delta", "text": "，世界。"})
-            renderer({"type": "turn_end", "reason": "completed"})
+        renderer = RuntimeEventRenderer(
+            color_enabled=False,
+            is_tty=True,
+            activity_stream=output,
+        )
+        renderer({"type": "model_request", "step": 1})
+        renderer({"type": "assistant_delta", "text": "你好"})
+        renderer({"type": "assistant_delta", "text": "，世界。"})
+        renderer({"type": "turn_end", "reason": "completed"})
         text = output.getvalue()
         self.assertEqual(renderer.streamed_text, "你好，世界。")
-        self.assertIn("你好，世界。", text)
+        self.assertNotIn("你好，世界。", text)
         self.assertIn("✓ 完成", text)
 
-    def test_runtime_renderer_streams_lines_without_tty(self) -> None:
+    def test_runtime_renderer_is_silent_without_tty(self) -> None:
         output = io.StringIO()
-        renderer = RuntimeEventRenderer(color_enabled=False, is_tty=False)
-        with redirect_stdout(output):
-            renderer({"type": "model_request", "step": 1})
-            renderer(
-                {
-                    "type": "tool_call",
-                    "call_id": "call_1",
-                    "name": "read_file",
-                    "summary": "读取文件 · note.txt",
-                }
-            )
-            renderer(
-                {
-                    "type": "tool_result",
-                    "call_id": "call_1",
-                    "name": "read_file",
-                    "ok": True,
-                    "preview": "已读取 1 行",
-                }
-            )
-            renderer({"type": "turn_end", "reason": "completed"})
+        renderer = RuntimeEventRenderer(
+            color_enabled=False,
+            is_tty=False,
+            activity_stream=output,
+        )
+        renderer({"type": "model_request", "step": 1})
+        renderer(
+            {
+                "type": "tool_call",
+                "call_id": "call_1",
+                "name": "read_file",
+                "summary": "读取文件 · note.txt",
+            }
+        )
+        renderer(
+            {
+                "type": "tool_result",
+                "call_id": "call_1",
+                "name": "read_file",
+                "ok": True,
+                "preview": "已读取 1 行",
+            }
+        )
+        renderer({"type": "turn_end", "reason": "completed"})
         text = output.getvalue()
-        self.assertIn("思考中", text)
-        self.assertIn("读取文件 · note.txt", text)
-        self.assertIn("已读取 1 行", text)
-        self.assertIn("完成 · 1 次分析", text)
+        self.assertEqual(text, "")
+
+    def test_terminal_markdown_renders_answer_structure(self) -> None:
+        raw = (
+            "## 结论\n\n"
+            "**重点** 是 `cli.py`。\n\n"
+            "- 第一项\n"
+            "- 第二项\n\n"
+            "```python\nprint('ok')\n```"
+        )
+
+        plain = render_terminal_markdown(raw, color_enabled=False)
+
+        self.assertIn("▌ 结论", plain)
+        self.assertIn("重点 是 cli.py", plain)
+        self.assertIn("• 第一项", plain)
+        self.assertIn("┌─ python", plain)
+        self.assertIn("└─", plain)
+        self.assertNotIn("**", plain)
+        self.assertNotIn("```", plain)
+        self.assertNotIn("`cli.py`", plain)
+
+        colored = render_terminal_markdown(raw, color_enabled=True)
+        self.assertIn("\033[1m", colored)
+        self.assertIn("\033[36m", colored)
 
     def test_thinking_state_observer(self) -> None:
         event = threading.Event()
