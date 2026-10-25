@@ -14,7 +14,12 @@ from sunus.events import EventBus
 from sunus.memory import MemoryStore
 from sunus.policy import ApprovalManager, PathGuard
 from sunus.storage import ArtifactStore
-from sunus.tools import ToolExecutor, find_ripgrep, tool_schemas
+from sunus.tools import (
+    ToolExecutor,
+    _command_changes_target_state,
+    find_ripgrep,
+    tool_schemas,
+)
 
 
 class ToolTests(unittest.TestCase):
@@ -319,6 +324,41 @@ class ToolTests(unittest.TestCase):
             self.assertIn("exit_code=0", result.content)
             self.assertIn("semantic_check", result.content)
             self.assertIn("Python traceback", result.content)
+
+    def test_runtime_version_requirement_is_marked_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            executor = self.make_executor(Path(temp))
+            result = executor.execute(
+                "run_command",
+                {
+                    "command": (
+                        "printf 'Playwright requires Node.js 20 or higher.\\n'"
+                    )
+                },
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("exit_code=0", result.content)
+            self.assertIn("运行时版本不兼容", result.content)
+
+    def test_browser_navigation_is_marked_as_state_change(self) -> None:
+        self.assertTrue(
+            _command_changes_target_state(
+                "osascript -e 'tell application \"Google Chrome\" "
+                "to make new window'"
+            )
+        )
+        self.assertTrue(
+            _command_changes_target_state(
+                "playwright-cli open https://platform.deepseek.com/usage"
+            )
+        )
+        self.assertFalse(
+            _command_changes_target_state(
+                "pgrep -fl 'Google Chrome'; osascript -e "
+                "'tell application \"Google Chrome\" to count windows'"
+            )
+        )
 
     def test_memory_context_metrics_is_read_only_and_allowed_for_question(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

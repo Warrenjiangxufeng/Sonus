@@ -100,6 +100,14 @@ _DANGEROUS_PATTERNS = (
     re.compile(r"(?i)\bdd\b[^\n]*\bof\s*=\s*/dev/"),
     re.compile(r"(?i)\brm\s+-(?:[a-z]*r[a-z]*f|[a-z]*f[a-z]*r)\s+(?:/|~|\\$HOME)(?:\s|$)"),
     re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;"),
+    re.compile(
+        r"(?i)Object\.defineProperty\s*\(\s*process\.versions"
+        r"|process\.versions\.node\s*="
+    ),
+    re.compile(
+        r"(?i)\bNODE_OPTIONS\s*=.*--require\s+"
+        r"(?:/tmp/|/private/tmp/).*(?:shim|node20|pw-node)"
+    ),
 )
 
 _SENSITIVE_COMMAND_PATTERNS = (

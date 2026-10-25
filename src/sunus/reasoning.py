@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+
+from sunus.scope import RequestScope
 
 
 _DIAGNOSTIC_PATTERN = re.compile(
@@ -28,6 +31,161 @@ _LOOKUP_PATTERN = re.compile(
     r"告诉我.*(?:内容|结果|文件|页面|标题|URL))",
     re.IGNORECASE,
 )
+_PLAYWRIGHT_PATTERN = re.compile(
+    r"(?:playwright-cli|playwright\s+cli)",
+    re.IGNORECASE,
+)
+_BROWSER_PATTERN = re.compile(r"(?:浏览器|标签页|已打开网页|网页展示)", re.I)
+_TEMPORAL_PATTERN = re.compile(r"(?:上次|刚才|最近)", re.I)
+
+
+@dataclass(frozen=True)
+class ReasoningPlan:
+    mode: str
+    complexity: str
+    capabilities: tuple[str, ...]
+    preferred_tools: tuple[str, ...]
+    max_exploration_calls: int
+    stop_condition: str
+    answer_style: str
+    drop_details: bool = False
+    strategy: str = ""
+
+    def prompt(self) -> str:
+        lines = [
+            "代码生成的单层推理计划（只执行这一套，不叠加其他模式提示）：",
+            f"- 模式: {self.mode}",
+            f"- 复杂度: {self.complexity}",
+            f"- 必需能力: {', '.join(self.capabilities) or '无副作用'}",
+            f"- 首选路径: {', '.join(self.preferred_tools) or '直接回答'}",
+            f"- 探索上限: {self.max_exploration_calls} 个动作",
+            f"- 停止条件: {self.stop_condition}",
+            f"- 表达: {self.answer_style}",
+        ]
+        if self.strategy:
+            lines.append(f"- 专项策略: {self.strategy}")
+        return "\n".join(lines)
+
+
+def build_reasoning_plan(
+    text: str,
+    scope: RequestScope,
+    *,
+    conversation: bool = False,
+) -> ReasoningPlan:
+    value = str(text or "")
+    capabilities = tuple(sorted(scope.required_capabilities))
+    if conversation:
+        return ReasoningPlan(
+            mode="关系性对话",
+            complexity="低",
+            capabilities=(),
+            preferred_tools=(),
+            max_exploration_calls=0,
+            stop_condition="回应当下主要需求后立即停止，不展开成分析报告。",
+            answer_style=(
+                "像正常熟人说话，通常 1-3 句；不使用固定昵称、括号动作或强行撒娇；"
+                "可以保留一点犹豫，不默认列点或做咨询式总结。"
+            ),
+            strategy=(
+                "先判断对方要陪伴、理解、评价、建议还是纠正；只选一个回应动作；"
+                "只依据真实上下文，不过度心理分析。"
+            ),
+        )
+    if is_status_query_request(value):
+        return ReasoningPlan(
+            mode="简单状态查询",
+            complexity="低",
+            capabilities=capabilities,
+            preferred_tools=("最小只读检查", "直接回答"),
+            max_exploration_calls=3,
+            stop_condition="拿到状态和关键标识即停止，不扩展未点名对象。",
+            answer_style="首句给结论，1-3 句；details 留空，不复述工具日志。",
+            drop_details=True,
+        )
+    if is_playwright_cli_request(value):
+        return ReasoningPlan(
+            mode="Playwright CLI 工具链",
+            complexity="中",
+            capabilities=capabilities or ("command",),
+            preferred_tools=("inspect_environment", "playwright-cli", "inspect_browser"),
+            max_exploration_calls=5,
+            stop_condition=(
+                "版本不兼容、登录页、验证码或现有 Chrome 状态无法复用时立即停止并说明下一步。"
+            ),
+            answer_style="报告实际状态、阻塞点和唯一下一步；不展示整段排障过程。",
+            strategy=(
+                "最多一次环境检查和一次包元数据；禁止伪造 process.versions、"
+                "临时 Node shim 或修改 node_modules。现有 Chrome 与新 Playwright profile 分离。"
+            ),
+        )
+    if is_diagnostic_request(value):
+        tools = (
+            ("inspect_runtime_history", "turn")
+            if _TEMPORAL_PATTERN.search(value)
+            else ("search_text", "read_file", "run_command")
+        )
+        return ReasoningPlan(
+            mode="根因诊断",
+            complexity="高",
+            capabilities=capabilities,
+            preferred_tools=tools,
+            max_exploration_calls=6,
+            stop_condition=(
+                "证据足以区分假设后停止；两个以上候选无法区分时询问一个时间或对象锚点。"
+            ),
+            answer_style="结论、最多 3 条依据、1 条修复方向；不展示完整代码和工具日志。",
+            strategy=(
+                "至少形成两个竞争假设，并主动寻找能区分它们的证据；"
+                "单个失败入口不能证明整体缺失；失败先归因为权限、路径、"
+                "超时、模型或验证，再换路径。"
+            ),
+        )
+    if _BROWSER_PATTERN.search(value):
+        return ReasoningPlan(
+            mode="浏览器只读查证",
+            complexity="低",
+            capabilities=capabilities or ("command",),
+            preferred_tools=("inspect_browser", "submit_result"),
+            max_exploration_calls=2,
+            stop_condition=(
+                "拿到页面标题、URL或正文即停止；权限关闭时说明一个恢复入口，不猜内容。"
+            ),
+            answer_style="直接给页面事实，1-3 句；details 留空。",
+            drop_details=True,
+            strategy="禁止剪贴板、模拟按键和多轮 osascript 试探。",
+        )
+    if is_simple_lookup_request(value):
+        return ReasoningPlan(
+            mode="只读查证",
+            complexity="低",
+            capabilities=capabilities,
+            preferred_tools=("list_files", "search_text", "read_file"),
+            max_exploration_calls=4,
+            stop_condition="拿到点名对象的结果即停止，不扩大目录。",
+            answer_style="直接结果，1-3 句；details 留空。",
+            drop_details=True,
+        )
+    if scope.allows_mutation:
+        return ReasoningPlan(
+            mode="修改交付",
+            complexity="中",
+            capabilities=capabilities or ("write", "command"),
+            preferred_tools=("read_file", "patch_file", "run_command", "submit_result"),
+            max_exploration_calls=8,
+            stop_condition="改动验证完成或出现明确阻塞即停止。",
+            answer_style="简要说明改动、验证结果和剩余风险。",
+            strategy="先读后改；修改后运行最相关验证。",
+        )
+    return ReasoningPlan(
+        mode="一般任务",
+        complexity="低",
+        capabilities=capabilities,
+        preferred_tools=("按需使用最小只读工具",),
+        max_exploration_calls=4,
+        stop_condition="足以回答时立即停止。",
+        answer_style="结论先行，最长 3 个短段。",
+    )
 
 
 def is_diagnostic_request(text: str) -> bool:
@@ -53,6 +211,19 @@ def is_simple_lookup_request(text: str) -> bool:
     return bool(_LOOKUP_PATTERN.search(value)) and not is_diagnostic_request(
         value
     )
+
+
+def is_playwright_cli_request(text: str) -> bool:
+    return bool(_PLAYWRIGHT_PATTERN.search(str(text or "")))
+
+
+def playwright_cli_prompt() -> str:
+    return """本轮明确涉及 playwright-cli，按固定检查链执行：
+1. 先用一次 inspect_environment 确认 CLI、Node 版本和可用解释器；需要版本兼容信息时最多再看一次包元数据。
+2. 如果 CLI 与当前 Node 不兼容，直接报告所需版本并请用户决定安装或改用其他路径；禁止伪造 process.versions、注入临时 shim、修改 node_modules 来假装兼容。
+3. 明确区分“已打开的 Chrome”和“Playwright 新 Chromium profile”。Playwright 新 profile 不能复用现有 Chrome 登录态；用户要读现有页面时优先 inspect_browser 或已配置的 CDP，不要擅自打开登录页。
+4. 打开、关闭、帮助查询和内容读取属于不同步骤；不要从浏览器安装目录、Electron 应用或全局包中碰运气。
+5. 出现登录页、验证码或用户凭据要求时立即停止，向用户说明当前窗口和所需下一步，不尝试自行登录。"""
 
 
 def lookup_query_prompt() -> str:

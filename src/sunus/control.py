@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from sunus.config import LoopBudgetConfig
@@ -25,6 +25,25 @@ class _ErrorRecord:
     count: int
     tool_signature: str
     tool_label: str
+
+
+@dataclass
+class _FailureStrategyRecord:
+    key: str
+    label: str
+    count: int
+    examples: list[str] = field(default_factory=list)
+
+
+_RUNTIME_COMPATIBILITY_PATTERN = re.compile(
+    r"(?i)(?:"
+    r"unexpected token ['\"]?\?\?=|"
+    r"url\.canparse is not a function|"
+    r"requires (?:node(?:\.js)?|python|java|ruby|go)\s+\d+(?:\.\d+)*"
+    r"\s+or (?:higher|newer)|"
+    r"cannot find module ['\"][^'\"]*(?:playwright|node_modules)"
+    r")"
+)
 
 
 class TurnController:
@@ -51,6 +70,8 @@ class TurnController:
         self.evidence_seen: set[str] = set()
         self.errors: dict[str, _ErrorRecord] = {}
         self.error_counts_at_recovery: dict[str, int] = {}
+        self.failure_strategies: dict[str, _FailureStrategyRecord] = {}
+        self.strategy_counts_at_recovery: dict[str, int] = {}
         self.blocked_tool_signatures: set[str] = set()
         self.blocked_tools: dict[str, str] = {}
         self.search_calls = 0
@@ -93,6 +114,7 @@ class TurnController:
             "blocked_tools": len(self.blocked_tool_signatures),
             "search_calls": self.search_calls,
             "error_fingerprints": len(self.errors),
+            "failure_strategies": len(self.failure_strategies),
             "finalizing": self.finalizing,
             "finalization_reserve": self.finalization_reserve,
         }
@@ -231,6 +253,7 @@ class TurnController:
         ok: bool,
         content: str,
         changed_files: list[str],
+        state_changed: bool = False,
     ) -> None:
         signature = self._tool_signature(name, arguments)
         normalized = self._normalize(content)
@@ -242,8 +265,11 @@ class TurnController:
                 default=str,
             )
         )
-        if evidence not in self.evidence_seen:
+        new_evidence = evidence not in self.evidence_seen
+        if new_evidence:
             self.evidence_seen.add(evidence)
+
+        if ok and new_evidence:
             self.round_has_progress = True
             self.no_progress_rounds = 0
             self._emit(
@@ -254,7 +280,21 @@ class TurnController:
 
         if ok:
             self.consecutive_failures = 0
+            if changed_files or state_changed:
+                self._clear_failure_state(
+                    reason=(
+                        "文件状态已变化"
+                        if changed_files
+                        else "目标系统状态已变化"
+                    )
+                )
             return
+        if new_evidence:
+            self._emit(
+                "diagnostic_evidence",
+                name=name,
+                summary="失败提供了新证据，但不算解决进展",
+            )
 
         self.consecutive_failures += 1
         error_family, error_detail, error_label = self._error_fingerprint(
@@ -279,13 +319,54 @@ class TurnController:
         if record.count >= self.budget.same_error_soft:
             self.blocked_tool_signatures.add(signature)
             self.blocked_tools[signature] = tool_label
+        strategy_key = self._failure_strategy_key(
+            name,
+            error_family,
+            error_detail,
+            content,
+        )
+        strategy = self.failure_strategies.get(strategy_key)
+        if strategy is None:
+            strategy = _FailureStrategyRecord(
+                key=strategy_key,
+                label=self._failure_strategy_label(strategy_key),
+                count=0,
+            )
+            self.failure_strategies[strategy_key] = strategy
+        strategy.count += 1
+        if error_label not in strategy.examples:
+            strategy.examples.append(error_label)
+            strategy.examples = strategy.examples[-3:]
         self._emit(
             "tool_error",
             name=name,
             count=record.count,
+            strategy=strategy_key,
+            strategy_count=strategy.count,
             summary=error_label,
         )
         self._check_hard_limits()
+
+    def _clear_failure_state(self, *, reason: str) -> None:
+        """A real state change invalidates previous retry thresholds."""
+        had_failures = bool(
+            self.errors
+            or self.failure_strategies
+            or self.blocked_tool_signatures
+        )
+        self.consecutive_failures = 0
+        self.errors.clear()
+        self.error_counts_at_recovery.clear()
+        self.failure_strategies.clear()
+        self.strategy_counts_at_recovery.clear()
+        self.blocked_tool_signatures.clear()
+        self.blocked_tools.clear()
+        if had_failures:
+            self._emit(
+                "failure_state_reset",
+                reason=reason,
+                summary=f"{reason}，旧失败阈值已重置",
+            )
 
     def _finalize_previous_round(self) -> None:
         if self.model_calls == 0:
@@ -308,9 +389,25 @@ class TurnController:
             key=lambda record: record.count,
             default=None,
         )
+        unrecovered_strategies = {
+            key: record
+            for key, record in self.failure_strategies.items()
+            if record.count >= self.budget.same_error_soft
+            and record.count > self.strategy_counts_at_recovery.get(key, 0)
+        }
+        newest_strategy = max(
+            unrecovered_strategies.values(),
+            key=lambda record: record.count,
+            default=None,
+        )
         reason = ""
         if self.no_progress_rounds >= self.budget.no_progress_soft:
             reason = f"连续 {self.no_progress_rounds} 轮没有发现新证据"
+        elif newest_strategy is not None:
+            reason = (
+                f"同类失败策略「{newest_strategy.label}」"
+                f"已重复 {newest_strategy.count} 次"
+            )
         elif newest_error is not None:
             reason = f"同类错误已重复 {newest_error.count} 次"
         if not reason:
@@ -320,6 +417,8 @@ class TurnController:
         self.recovery_count += 1
         for fingerprint, record in unrecovered_errors.items():
             self.error_counts_at_recovery[fingerprint] = record.count
+        for strategy_key, record in unrecovered_strategies.items():
+            self.strategy_counts_at_recovery[strategy_key] = record.count
         prompt = self._recovery_prompt(reason)
         self._emit(
             "recovery_requested",
@@ -340,6 +439,16 @@ class TurnController:
             f"{item.label[:240]}（{item.count} 次）"
             for item in errors
         ]
+        strategies = sorted(
+            self.failure_strategies.values(),
+            key=lambda item: item.count,
+            reverse=True,
+        )[:4]
+        strategy_lines = [
+            f"- {item.label}（{item.count} 次）: "
+            + "；".join(example[:160] for example in item.examples)
+            for item in strategies
+        ]
         families = {item.family for item in errors}
         guidance: list[str] = []
         if "authorization" in families:
@@ -354,6 +463,11 @@ class TurnController:
             guidance.append("模型失败：保留已有证据，收口或等待用户重试。")
         if "verification" in families:
             guidance.append("验证失败：读取首个真实错误，区分代码、环境和权限。")
+        if any(item.key == "runtime-compatibility" for item in strategies):
+            guidance.append(
+                "运行时或依赖不兼容：停止改参数、伪造版本或注入 shim；"
+                "改用兼容运行时，或明确请求安装。"
+            )
         blocked = sorted(self.blocked_tools.values())[:6]
         return (
             "运行控制恢复检查点："
@@ -362,6 +476,8 @@ class TurnController:
             + ("\n".join(error_lines) or "- 无明确错误，但缺少新证据")
             + "\n失败归因后的候选路径：\n"
             + ("\n".join(f"- {item}" for item in guidance) or "- 无")
+            + "\n重复失败策略：\n"
+            + ("\n".join(strategy_lines) or "- 无")
             + "\n禁止重复的工具调用指纹：\n"
             + ("\n".join(f"- {value}" for value in blocked) or "- 无")
             + "\n请给出一个新的、最小可验证动作，并明确成功判据。"
@@ -399,6 +515,12 @@ class TurnController:
         )
         if max_error_count >= self.budget.same_error_hard:
             self._trip(f"同类错误重复达到 {max_error_count} 次")
+        max_strategy_count = max(
+            (record.count for record in self.failure_strategies.values()),
+            default=0,
+        )
+        if max_strategy_count >= self.budget.same_error_hard:
+            self._trip(f"同类失败策略重复达到 {max_strategy_count} 次")
         if self.consecutive_failures >= self.budget.consecutive_failure_hard:
             self._trip(f"连续失败达到 {self.consecutive_failures} 次")
 
@@ -509,6 +631,84 @@ class TurnController:
         else:
             family = f"{tool_name}:tool-failure"
         return family, detail, label
+
+    @classmethod
+    def _failure_strategy_key(
+        cls,
+        tool_name: str,
+        family: str,
+        detail: str,
+        content: str,
+    ) -> str:
+        try:
+            payload = json.loads(content)
+        except (TypeError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict) and payload.get("error"):
+            error_code = str(payload.get("error") or "unknown").strip()
+            target = str(
+                payload.get("browser")
+                or payload.get("path")
+                or payload.get("target")
+                or ""
+            ).strip()
+            error_detail = str(payload.get("detail") or detail)
+            reason = cls._structured_failure_reason(
+                error_code,
+                error_detail,
+            )
+            return (
+                f"{tool_name}|structured|{target or 'target'}|"
+                f"{error_code}|{reason}"
+            )
+        if _RUNTIME_COMPATIBILITY_PATTERN.search(detail):
+            return "runtime-compatibility"
+        if family in {"authorization", "path", "timeout", "model"}:
+            return f"{tool_name}|{family}"
+        return f"{tool_name}|{family}|{cls._hash(detail.lower())}"
+
+    @classmethod
+    def _structured_failure_reason(
+        cls,
+        error_code: str,
+        detail: str,
+    ) -> str:
+        value = str(detail or "")
+        if re.search(
+            r"javascript.*(?:已关闭|disabled)|allow javascript",
+            value,
+            re.IGNORECASE,
+        ):
+            return "javascript-disabled"
+        if re.search(
+            r"(?:不能获得|invalid index|invalid.*window|window\s+1)",
+            value,
+            re.IGNORECASE,
+        ):
+            return "no-window"
+        if re.search(
+            r"not authorized|not permitted|permission denied|权限",
+            value,
+            re.IGNORECASE,
+        ):
+            return "permission"
+        if error_code == "browser_not_running":
+            return "not-running"
+        normalized = cls._normalize_error_line(value).lower()
+        return f"detail-{cls._hash(normalized)}"
+
+    @staticmethod
+    def _failure_strategy_label(key: str) -> str:
+        if key == "runtime-compatibility":
+            return "运行时或依赖版本不兼容"
+        parts = key.split("|")
+        tool_name = parts[0]
+        if len(parts) >= 5 and parts[1] == "structured":
+            return (
+                f"{tool_name} / {parts[2]} / {parts[3]} / {parts[4]}"
+            )
+        family = parts[1] if len(parts) > 1 else "unknown"
+        return f"{tool_name} / {family or 'unknown'}"
 
     @staticmethod
     def _normalize_error_line(value: str) -> str:

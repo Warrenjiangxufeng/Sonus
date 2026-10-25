@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from dataclasses import replace
 
@@ -170,6 +171,203 @@ class TurnControllerTests(unittest.TestCase):
         )
         self.assertIsNone(controller.before_model_call())
         self.assertEqual(controller.recovery_count, 1)
+
+    def test_failure_output_is_evidence_but_not_progress(self) -> None:
+        events = RecordingEvents()
+        controller = TurnController(
+            LoopBudgetConfig(no_progress_soft=2, no_progress_hard=4),
+            events=events,  # type: ignore[arg-type]
+        )
+        controller.before_model_call()
+        controller.record_tool_result(
+            "run_command",
+            {"command": "first broken probe"},
+            ok=False,
+            content="Error: first failure",
+            changed_files=[],
+        )
+        controller.before_model_call()
+
+        self.assertEqual(controller.no_progress_rounds, 1)
+        event_types = [event_type for event_type, _ in events.events]
+        self.assertNotIn("progress_marked", event_types)
+        self.assertIn("diagnostic_evidence", event_types)
+
+    def test_varied_runtime_errors_share_one_failure_strategy(self) -> None:
+        events = RecordingEvents()
+        controller = TurnController(
+            LoopBudgetConfig(
+                same_error_soft=2,
+                same_error_hard=3,
+                no_progress_soft=20,
+                no_progress_hard=21,
+                max_recoveries=2,
+            ),
+            events=events,  # type: ignore[arg-type]
+            clock=lambda: 0.0,
+        )
+        controller.before_model_call()
+        controller.record_tool_result(
+            "run_command",
+            {"command": "playwright-cli --help"},
+            ok=False,
+            content="SyntaxError: Unexpected token '??='",
+            changed_files=[],
+        )
+        controller.before_model_call()
+        controller.record_tool_result(
+            "run_command",
+            {"command": "node18 playwright-cli --help"},
+            ok=False,
+            content="Playwright requires Node.js 20 or higher.",
+            changed_files=[],
+        )
+
+        recovery = controller.before_model_call()
+        self.assertIn("同类失败策略", recovery or "")
+        self.assertIn("运行时或依赖版本不兼容", recovery or "")
+        self.assertEqual(controller.recovery_count, 1)
+        with self.assertRaises(CircuitOpen) as raised:
+            controller.record_tool_result(
+                "run_command",
+                {"command": "node18 shim playwright-cli"},
+                ok=False,
+                content="TypeError: URL.canParse is not a function",
+                changed_files=[],
+            )
+        self.assertIn("同类失败策略重复达到 3 次", raised.exception.reason)
+        self.assertEqual(len(controller.errors), 3)
+        self.assertEqual(len(controller.failure_strategies), 1)
+
+    def test_browser_failures_with_different_causes_stay_separate(self) -> None:
+        controller = TurnController(
+            LoopBudgetConfig(
+                same_error_soft=2,
+                same_error_hard=3,
+                no_progress_soft=20,
+                no_progress_hard=21,
+            )
+        )
+        controller.before_model_call()
+        failures = (
+            (
+                {"browser": "chrome", "mode": "active"},
+                {
+                    "ok": False,
+                    "browser": "chrome",
+                    "error": "browser_access_failed",
+                    "detail": "不能获得 window 1；无效的索引",
+                },
+            ),
+            (
+                {"browser": "safari", "mode": "active"},
+                {
+                    "ok": False,
+                    "browser": "safari",
+                    "error": "browser_not_running",
+                    "detail": "Safari 未运行",
+                },
+            ),
+            (
+                {"browser": "chrome", "mode": "content"},
+                {
+                    "ok": False,
+                    "browser": "chrome",
+                    "error": "browser_access_failed",
+                    "detail": "通过 AppleScript 执行 JavaScript 的功能已关闭",
+                },
+            ),
+        )
+        for arguments, payload in failures:
+            controller.record_tool_result(
+                "inspect_browser",
+                arguments,
+                ok=False,
+                content=json.dumps(payload, ensure_ascii=False),
+                changed_files=[],
+            )
+
+        self.assertEqual(len(controller.failure_strategies), 3)
+        self.assertTrue(
+            all(
+                record.count == 1
+                for record in controller.failure_strategies.values()
+            )
+        )
+
+    def test_external_state_change_resets_failure_strategy(self) -> None:
+        events = RecordingEvents()
+        controller = TurnController(
+            LoopBudgetConfig(
+                same_error_soft=2,
+                same_error_hard=3,
+                no_progress_soft=20,
+                no_progress_hard=21,
+            ),
+            events=events,  # type: ignore[arg-type]
+        )
+        payload = json.dumps(
+            {
+                "ok": False,
+                "browser": "chrome",
+                "error": "browser_access_failed",
+                "detail": "不能获得 window 1；无效的索引",
+            },
+            ensure_ascii=False,
+        )
+        for _ in range(2):
+            controller.record_tool_result(
+                "inspect_browser",
+                {"browser": "chrome", "mode": "active"},
+                ok=False,
+                content=payload,
+                changed_files=[],
+            )
+        self.assertTrue(controller.failure_strategies)
+
+        controller.record_tool_result(
+            "run_command",
+            {"command": "osascript -e 'make new window'"},
+            ok=True,
+            content="已打开 DeepSeek 页面",
+            changed_files=[],
+            state_changed=True,
+        )
+
+        self.assertEqual(controller.failure_strategies, {})
+        self.assertIn(
+            "failure_state_reset",
+            [event_type for event_type, _ in events.events],
+        )
+
+    def test_state_change_resets_previous_failure_strategy(self) -> None:
+        controller = TurnController(
+            LoopBudgetConfig(
+                same_error_soft=2,
+                same_error_hard=3,
+                no_progress_soft=20,
+                no_progress_hard=21,
+            )
+        )
+        controller.before_model_call()
+        for _ in range(2):
+            controller.record_tool_result(
+                "run_command",
+                {"command": "pytest"},
+                ok=False,
+                content="exit_code=1\nAssertionError: first",
+                changed_files=[],
+            )
+        controller.record_tool_result(
+            "patch_file",
+            {"path": "code.py"},
+            ok=True,
+            content="patched",
+            changed_files=["code.py"],
+        )
+
+        self.assertEqual(controller.failure_strategies, {})
+        self.assertEqual(controller.errors, {})
 
     def test_repeated_full_text_search_must_converge(self) -> None:
         events = RecordingEvents()

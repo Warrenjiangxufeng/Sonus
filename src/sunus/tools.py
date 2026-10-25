@@ -62,6 +62,12 @@ def _semantic_command_failure(output: str) -> str:
     checks = (
         (r"(?m)^Traceback \(most recent call last\):\s*$", "Python traceback"),
         (r"(?m)^(?:[A-Za-z_][\w.]*)?(?:Error|Exception):", "异常"),
+        (
+            r"(?mi)^\s*(?:[A-Za-z_][\w.-]*\s+)?requires\s+"
+            r"(?:Node(?:\.js)?|Python|Java|Ruby|Go)\s+"
+            r"\d+(?:\.\d+)*\s+or\s+(?:higher|newer)\b",
+            "运行时版本不兼容",
+        ),
         (r"(?m)^(?:zsh|sh|bash): .*command not found", "命令不存在"),
         (r"(?m)^(?:zsh|sh|bash): .*no matches found", "路径或参数不存在"),
         (r"(?m)^(?:curl|wget): .*(?:Could not resolve host|Connection refused)", "网络失败"),
@@ -79,6 +85,20 @@ def _semantic_command_failure(output: str) -> str:
             )
             return f"{label}：{line[:300]}"
     return ""
+
+
+_TARGET_STATE_COMMAND_PATTERN = re.compile(
+    r"(?i)(?:"
+    r"\bopen\s+-a\s+[^;&|]*\b(?:chrome|safari|firefox|edge)\b|"
+    r"\bosascript\b[^;&|]*(?:make\s+new\s+window|set\s+url\s+of)|"
+    r"\bplaywright(?:-cli)?\b[^;&|]*\b(?:open|goto|navigate)\b"
+    r")"
+)
+
+
+def _command_changes_target_state(command: str) -> bool:
+    """Return true for high-confidence UI/navigation state changes."""
+    return bool(_TARGET_STATE_COMMAND_PATTERN.search(str(command or "")))
 
 
 _IGNORED_NAMES = {
@@ -182,6 +202,7 @@ class ToolResult:
     content: str
     changed_files: list[str] = field(default_factory=list)
     artifact: str | None = None
+    state_changed: bool = False
 
     def as_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"ok": self.ok, "content": self.content}
@@ -189,6 +210,8 @@ class ToolResult:
             payload["changed_files"] = self.changed_files
         if self.artifact:
             payload["artifact"] = self.artifact
+        if self.state_changed:
+            payload["state_changed"] = True
         return payload
 
 
@@ -1325,6 +1348,11 @@ class ToolExecutor:
             process.returncode == 0 and not semantic_failure,
             content,
             artifact=artifact,
+            state_changed=(
+                process.returncode == 0
+                and not semantic_failure
+                and _command_changes_target_state(command)
+            ),
         )
 
     def _request_authorization(self, args: dict[str, Any]) -> ToolResult:

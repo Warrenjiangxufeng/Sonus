@@ -251,6 +251,21 @@ class PolicyTests(unittest.TestCase):
             {"write", "command", "network"},
         )
 
+    def test_runtime_version_spoofing_is_hard_denied(self) -> None:
+        self.assertTrue(
+            command_denial_reason(
+                "node -e "
+                "'Object.defineProperty(process.versions,\"node\","
+                "{value:\"20.11.0\"})'"
+            )
+        )
+        self.assertTrue(
+            command_denial_reason(
+                "NODE_OPTIONS='--require /tmp/pw-node20-shim.js' "
+                "node playwright-cli.js open"
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

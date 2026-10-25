@@ -29,15 +29,12 @@ from sunus.model import (
 )
 from sunus.model_events import ModelEvent
 from sunus.reasoning import (
-    complex_task_prompt,
-    conversation_thinking_prompt,
-    diagnostic_protocol_prompt,
-    is_complex_request,
-    is_diagnostic_request,
-    is_simple_lookup_request,
-    is_status_query_request,
-    lookup_query_prompt,
-    status_query_prompt,
+    ReasoningPlan,
+    build_reasoning_plan,
+)
+from sunus.reasoning_traces import (
+    record_reasoning_trace,
+    seed_reasoning_exemplars,
 )
 from sunus.result import (
     ResultEnvelope,
@@ -147,6 +144,13 @@ class Agent:
         self.events = events
         self.session = session
         self.scope = str(Path(config.workspace).resolve())
+        try:
+            seed_reasoning_exemplars(self.memory)
+        except Exception as error:
+            self.events.emit(
+                "memory_write_error",
+                summary=f"策略示例初始化失败: {error}",
+            )
         self.messages: list[dict[str, Any]] = []
         self.context_metrics: dict[str, Any] = {}
         self._system_context = ""
@@ -154,10 +158,7 @@ class Agent:
         self._conversation_summary = ""
         self._runtime_policy_prompt = ""
         self._tool_visibility_prompt = ""
-        self._diagnostic_prompt = ""
-        self._status_prompt = ""
-        self._planning_prompt = ""
-        self._lookup_prompt = ""
+        self._reasoning_plan: ReasoningPlan | None = None
         self._last_request_scope = None
         self._task_state = TaskState()
         self._memory_write_required = False
@@ -172,10 +173,7 @@ class Agent:
         self._conversation_summary = ""
         self._runtime_policy_prompt = ""
         self._tool_visibility_prompt = ""
-        self._diagnostic_prompt = ""
-        self._status_prompt = ""
-        self._planning_prompt = ""
-        self._lookup_prompt = ""
+        self._reasoning_plan = None
         self._last_request_scope = None
         self._task_state = TaskState()
         self._memory_write_required = False
@@ -243,28 +241,8 @@ class Agent:
             content += "\n\n" + self._runtime_policy_prompt
         if self._tool_visibility_prompt:
             content += "\n\n" + self._tool_visibility_prompt
-        if self._diagnostic_prompt:
-            content += "\n\n" + self._diagnostic_prompt
-        if self._status_prompt:
-            content += "\n\n" + self._status_prompt
-        if self._planning_prompt:
-            content += "\n\n" + self._planning_prompt
-        if self._lookup_prompt:
-            content += "\n\n" + self._lookup_prompt
-        if self._response_mode == "conversation":
-            content += (
-                "\n\n"
-                + conversation_thinking_prompt()
-                + "\n\n本轮回应模式：日常对话。像熟人发消息一样自然回应；"
-                "先回应对方面向的情绪或真实问题，通常 1-3 句，内容需要时可到 4 句。"
-                "长度随内容变化，不固定凑字数。"
-                "除非对方明确要求，否则不列清单、不分析利弊、不主动给方案，"
-                "不追问多个问题，也不要把轻松聊天写成客服话术。"
-                "不要每句都用语气词、固定昵称或括号动作；只有对方主动角色扮演"
-                "或明确要求时才使用亲密动作描写。"
-                "表达个人判断时可以保留一点犹豫，不必把人际问题整理成完整框架；"
-                "对方指出机械或端着时，自然调整，不写检讨式总结。"
-            )
+        if self._reasoning_plan is not None:
+            content += "\n\n" + self._reasoning_plan.prompt()
         self._system_context = content
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0] = {"role": "system", "content": content}
@@ -288,10 +266,7 @@ class Agent:
         self._conversation_summary = summary
         self._runtime_policy_prompt = ""
         self._tool_visibility_prompt = ""
-        self._diagnostic_prompt = ""
-        self._status_prompt = ""
-        self._planning_prompt = ""
-        self._lookup_prompt = ""
+        self._reasoning_plan = None
         self._last_request_scope = None
         self._task_state = TaskState.from_mapping(task_state)
         self._memory_write_required = False
@@ -933,6 +908,7 @@ class Agent:
             ok=result.ok,
             changed_files=result.changed_files,
             artifact=result.artifact,
+            state_changed=result.state_changed,
             preview=self._tool_result_preview(invocation.name, result),
             summary=f"{invocation.name}: {'ok' if result.ok else 'failed'}",
         )
@@ -942,6 +918,7 @@ class Agent:
             ok=result.ok,
             content=result.content,
             changed_files=result.changed_files,
+            state_changed=result.state_changed,
         )
         self._task_state.record_tool(
             invocation.name,
@@ -962,25 +939,10 @@ class Agent:
         turn_id = f"t_{uuid.uuid4().hex[:10]}"
         self._runtime_policy_prompt = ""
         self._tool_visibility_prompt = ""
-        status_query = is_status_query_request(user_input)
         self._memory_write_required = (
             self.memory.is_explicit_memory_request(user_input)
         )
         self._remembered_this_turn = False
-        self._diagnostic_prompt = (
-            diagnostic_protocol_prompt()
-            if is_diagnostic_request(user_input)
-            else ""
-        )
-        self._status_prompt = status_query_prompt() if status_query else ""
-        self._planning_prompt = (
-            complex_task_prompt() if is_complex_request(user_input) else ""
-        )
-        self._lookup_prompt = (
-            lookup_query_prompt()
-            if is_simple_lookup_request(user_input)
-            else ""
-        )
         usage: dict[str, Any] = {}
         previous_assistant = self._last_assistant_text()
         request_scope = self.tools.begin_request(
@@ -1025,9 +987,14 @@ class Agent:
             else:
                 mode_source = "rule_fallback"
         self._response_mode = "conversation" if conversation else "default"
+        self._reasoning_plan = build_reasoning_plan(
+            user_input,
+            request_scope,
+            conversation=conversation,
+        )
         if not conversation:
             self._task_state.update(user_input, request_scope)
-            if self._planning_prompt:
+            if self._reasoning_plan.complexity == "高":
                 self._task_state.phase = "planning"
         grant = self.tools.approvals.begin_task()
         self.events.emit(
@@ -1500,7 +1467,8 @@ class Agent:
                                 tool_traces=tool_traces,
                                 changed_files=changed_files,
                                 drop_details=bool(
-                                    self._status_prompt or self._lookup_prompt
+                                    self._reasoning_plan
+                                    and self._reasoning_plan.drop_details
                                 ),
                             )
                             if normalized != envelope:
@@ -1727,6 +1695,34 @@ class Agent:
             metrics=metrics,
             structured_result=structured_result,
         )
+        if not conversation and self._reasoning_plan is not None:
+            try:
+                strategy_id = record_reasoning_trace(
+                    self.memory,
+                    scope=self.scope,
+                    receipt_id=receipt["receipt_id"],
+                    objective=self._task_state.objective,
+                    mode=self._reasoning_plan.mode,
+                    capabilities=self._reasoning_plan.capabilities,
+                    preferred_tools=self._reasoning_plan.preferred_tools,
+                    tool_traces=tool_traces,
+                    blocker=self._task_state.blocker,
+                    reason=reason,
+                )
+                if strategy_id:
+                    self.events.emit(
+                        "reasoning_trace_recorded",
+                        turn_id=turn_id,
+                        memory_id=strategy_id,
+                        mode=self._reasoning_plan.mode,
+                        summary="策略轨迹已写入记忆",
+                    )
+            except Exception as error:
+                self.events.emit(
+                    "memory_write_error",
+                    turn_id=turn_id,
+                    summary=f"策略轨迹写入失败: {error}",
+                )
         if self._memory_write_required and not self._remembered_this_turn:
             try:
                 memory_id = self.memory.record_explicit_review(

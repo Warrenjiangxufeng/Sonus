@@ -863,8 +863,8 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(result.text, "已推送，远端为 5769f43。")
             self.assertEqual(result.structured_result["details"], [])
             system_prompt = model.last_messages[0]["content"]
-            self.assertIn("本轮是简单状态查询", system_prompt)
-            self.assertNotIn("本轮是诊断或根因分析", system_prompt)
+            self.assertIn("模式: 简单状态查询", system_prompt)
+            self.assertNotIn("模式: 根因诊断", system_prompt)
             memory.close()
 
     def test_authorization_refreshes_tools_for_next_model_call(self) -> None:
@@ -1149,18 +1149,18 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(result.reason, "completed")
             self.assertEqual(model.last_max_tokens, 512)
             self.assertEqual(model.tool_names, set())
-            self.assertIn("本轮回应模式：日常对话", model.last_messages[0]["content"])
+            self.assertIn("模式: 关系性对话", model.last_messages[0]["content"])
             self.assertIn("不要调用任何工具", model.last_messages[0]["content"])
             self.assertIn(
-                "不要每句都用语气词、固定昵称或括号动作",
+                "不使用固定昵称、括号动作或强行撒娇",
                 model.last_messages[0]["content"],
             )
             self.assertIn(
-                "不必把人际问题整理成完整框架",
+                "不默认列点或做咨询式总结",
                 model.last_messages[0]["content"],
             )
             self.assertIn(
-                "本轮是关系性对话",
+                "先判断对方要陪伴",
                 model.last_messages[0]["content"],
             )
             self.assertNotIn(
@@ -1347,7 +1347,7 @@ class AgentTests(unittest.TestCase):
                     self.assertEqual(model.classification_calls, 1)
                     self.assertEqual(model.last_max_tokens, expected_limit)
                     self.assertEqual(
-                        "本轮回应模式：日常对话"
+                        "模式: 关系性对话"
                         in model.last_messages[0]["content"],
                         mode == "casual",
                     )
@@ -1662,7 +1662,17 @@ class AgentTests(unittest.TestCase):
             self.assertIn('"artifact"', events_text)
             self.assertIn("turn_end", events_text)
             self.assertEqual(tools.approvals.grant.risk_ceiling, "R0")
-            self.assertEqual(memory.recent(scope=str(root.resolve()), limit=5), [])
+            self.assertEqual(
+                [
+                    item
+                    for item in memory.recent(
+                        scope=str(root.resolve()),
+                        limit=10,
+                    )
+                    if item.get("source") != "codex_reasoning_exemplar"
+                ],
+                [],
+            )
             memory.close()
 
     def test_explicit_memory_request_falls_back_to_persistent_review(self) -> None:

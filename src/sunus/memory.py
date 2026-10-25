@@ -47,19 +47,32 @@ def _safe_text(value: str, limit: int = 6000) -> str:
     return cleaned[:limit]
 
 
-def _fts_tokens(query: str) -> list[str]:
+def _tokenize_text(text: str) -> list[str]:
     tokens: list[str] = []
-    for word in re.findall(r"[A-Za-z0-9_]{2,}", query.lower()):
+    for word in re.findall(r"[A-Za-z0-9_]{2,}", str(text or "").lower()):
         tokens.append(word)
-    for run in re.findall(r"[\u3400-\u9fff]{2,}", query):
+    for run in re.findall(r"[\u3400-\u9fff]+", str(text or "")):
         if len(run) <= 8:
             tokens.append(run)
+        if len(run) == 1:
+            continue
         tokens.extend(run[index : index + 2] for index in range(len(run) - 1))
     result: list[str] = []
     for token in tokens:
         if token and token not in result:
             result.append(token)
-    return result[:20]
+    return result
+
+
+def _fts_tokens(query: str) -> list[str]:
+    return _tokenize_text(query)[:20]
+
+
+def _fts_index_text(value: str) -> str:
+    return " ".join(_tokenize_text(value))
+
+
+FTS_INDEX_VERSION = "cjk-bigram-space-v1"
 
 
 TOKEN_ESTIMATOR = "cjk-ascii-v1"
@@ -215,6 +228,11 @@ class MemoryStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS memory_index_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS persona_traits (
                     id TEXT PRIMARY KEY,
                     scope TEXT NOT NULL,
@@ -270,6 +288,16 @@ class MemoryStore:
                   )
                 """
             )
+            self._connection.execute(
+                """
+                UPDATE memories
+                SET kind = 'episode', source = 'turn_receipt'
+                WHERE kind = 'strategy'
+                  AND source = 'reasoning_trace'
+                  AND json_valid(metadata)
+                  AND json_extract(metadata, '$.turn_status') IS NOT NULL
+                """
+            )
         self._backfill_persona_traits()
         try:
             with self._connection:
@@ -297,7 +325,7 @@ class MemoryStore:
                     USING fts5(memory_id UNINDEXED, content, tags, scope)
                     """
                 )
-            return True
+            fts_enabled = True
         except sqlite3.OperationalError:
             with self._connection:
                 self._connection.execute(
@@ -310,7 +338,49 @@ class MemoryStore:
                     )
                     """
                 )
-            return False
+            fts_enabled = False
+        self._ensure_fts_index(fts_enabled)
+        return fts_enabled
+
+    def _ensure_fts_index(self, fts_enabled: bool) -> None:
+        if not fts_enabled:
+            return
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                """
+                SELECT value FROM memory_index_meta
+                WHERE key = 'fts_index_version'
+                """
+            ).fetchone()
+            if row is not None and str(row["value"]) == FTS_INDEX_VERSION:
+                return
+            memories = self._connection.execute(
+                "SELECT id, content, tags, scope FROM memories"
+            ).fetchall()
+            self._connection.execute("DELETE FROM memory_fts")
+            self._connection.executemany(
+                """
+                INSERT INTO memory_fts(memory_id, content, tags, scope)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (
+                        str(item["id"]),
+                        _fts_index_text(str(item["content"] or "")),
+                        _fts_index_text(str(item["tags"] or "")),
+                        _fts_index_text(str(item["scope"] or "")),
+                    )
+                    for item in memories
+                ],
+            )
+            self._connection.execute(
+                """
+                INSERT INTO memory_index_meta(key, value)
+                VALUES ('fts_index_version', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (FTS_INDEX_VERSION,),
+            )
 
     def close(self) -> None:
         self._connection.close()
@@ -382,7 +452,12 @@ class MemoryStore:
                 )
                 self._connection.execute(
                     "INSERT INTO memory_fts(memory_id, content, tags, scope) VALUES (?, ?, ?, ?)",
-                    (memory_id, clean, tag_text, scope),
+                    (
+                        memory_id,
+                        _fts_index_text(clean),
+                        _fts_index_text(tag_text),
+                        _fts_index_text(scope),
+                    ),
                 )
                 self._append_memory_revision(memory_id, "update")
             else:
@@ -413,7 +488,12 @@ class MemoryStore:
                 )
                 self._connection.execute(
                     "INSERT INTO memory_fts(memory_id, content, tags, scope) VALUES (?, ?, ?, ?)",
-                    (memory_id, clean, tag_text, scope),
+                    (
+                        memory_id,
+                        _fts_index_text(clean),
+                        _fts_index_text(tag_text),
+                        _fts_index_text(scope),
+                    ),
                 )
                 self._append_memory_revision(memory_id, "create")
             self._connection.execute(
@@ -523,16 +603,46 @@ class MemoryStore:
     ) -> MemoryContext:
         preferences = self.recent_preferences(scope=scope, limit=preference_limit)
         pinned = self.recent_persistent_reviews(scope=scope, limit=3)
-        searched = self.search(query, scope=scope, limit=recall_limit)
+        strategies = self.relevant_strategies(
+            query,
+            scope=scope,
+            limit=2,
+        )
+        searched = self.search(
+            query,
+            scope=scope,
+            limit=max(recall_limit * 4, 20),
+        )
         recalled: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for item in [*pinned, *searched]:
+        limit = max(1, recall_limit)
+        primary = [
+            item for item in searched if item.get("kind") != "strategy"
+        ]
+        searched_strategies = [
+            item for item in searched if item.get("kind") == "strategy"
+        ]
+        reserve_pinned = 1 if pinned and limit >= 2 else 0
+        reserve_strategy = 1 if strategies and limit >= 3 else 0
+        query_slots = max(1, limit - reserve_pinned - reserve_strategy)
+        ordered = [
+            *primary[:query_slots],
+            *(pinned[:1] if reserve_pinned else []),
+            *(strategies[:1] if reserve_strategy else []),
+            *primary[query_slots:],
+            *pinned[reserve_pinned:],
+            *strategies[reserve_strategy:],
+            *searched_strategies,
+        ]
+        for item in ordered:
             memory_id = str(item.get("id") or "")
             if memory_id and memory_id in seen:
                 continue
             if memory_id:
                 seen.add(memory_id)
             recalled.append(item)
+            if len(recalled) >= limit:
+                break
         return MemoryContext(
             preferences=tuple(preferences),
             recalled=tuple(recalled),
@@ -545,6 +655,23 @@ class MemoryStore:
                 label="相关记忆",
             ),
         )
+
+    def relevant_strategies(
+        self,
+        query: str,
+        *,
+        scope: str,
+        limit: int = 2,
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(4, limit))
+        matches = [
+            item
+            for item in self.search(query, scope=scope, limit=20)
+            if item.get("kind") == "strategy"
+            and item.get("status") in {"supported", "verified"}
+            and "failed" not in str(item.get("tags") or "").split(",")
+        ][:limit]
+        return matches
 
     def recent_persistent_reviews(
         self,
@@ -969,8 +1096,8 @@ class MemoryStore:
             except sqlite3.OperationalError:
                 rows = []
         if not rows:
-            conditions = " OR ".join("content LIKE ?" for _ in tokens[:6])
-            values = [f"%{token}%" for token in tokens[:6]]
+            conditions = " OR ".join("content LIKE ?" for _ in tokens)
+            values = [f"%{token}%" for token in tokens]
             with self._lock:
                 rows = self._connection.execute(
                     f"""
@@ -1144,9 +1271,13 @@ class MemoryStore:
         with self._lock, self._connection:
             row = self._connection.execute(
                 """
-                SELECT memory_id FROM memory_evidence
-                WHERE receipt_id = ? AND evidence_kind = 'receipt'
-                ORDER BY id LIMIT 1
+                SELECT memory_evidence.memory_id
+                FROM memory_evidence
+                JOIN memories ON memories.id = memory_evidence.memory_id
+                WHERE memory_evidence.receipt_id = ?
+                  AND memory_evidence.evidence_kind = 'receipt'
+                  AND memories.kind = 'episode'
+                ORDER BY memory_evidence.id LIMIT 1
                 """,
                 (receipt_id,),
             ).fetchone()
@@ -1181,7 +1312,12 @@ class MemoryStore:
                 INSERT INTO memory_fts(memory_id, content, tags, scope)
                 VALUES (?, ?, ?, ?)
                 """,
-                (memory_id, clean, tag_text, scope),
+                (
+                    memory_id,
+                    _fts_index_text(clean),
+                    _fts_index_text(tag_text),
+                    _fts_index_text(scope),
+                ),
             )
             self._append_memory_revision(memory_id, "update")
             return memory_id
@@ -1305,7 +1441,12 @@ class MemoryStore:
                 INSERT INTO memory_fts(memory_id, content, tags, scope)
                 VALUES (?, ?, ?, ?)
                 """,
-                (memory_id, clean, tag_text, scope),
+                (
+                    memory_id,
+                    _fts_index_text(clean),
+                    _fts_index_text(tag_text),
+                    _fts_index_text(scope),
+                ),
             )
             self._append_memory_revision(memory_id, "update")
             return memory_id

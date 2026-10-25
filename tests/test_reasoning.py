@@ -3,16 +3,20 @@ from __future__ import annotations
 import unittest
 
 from sunus.reasoning import (
+    build_reasoning_plan,
     complex_task_prompt,
     conversation_thinking_prompt,
     diagnostic_protocol_prompt,
     is_complex_request,
     is_diagnostic_request,
+    is_playwright_cli_request,
     is_simple_lookup_request,
     is_status_query_request,
     lookup_query_prompt,
+    playwright_cli_prompt,
     status_query_prompt,
 )
+from sunus.scope import classify_request
 
 
 class ReasoningTests(unittest.TestCase):
@@ -87,6 +91,52 @@ class ReasoningTests(unittest.TestCase):
         prompt = lookup_query_prompt()
         self.assertIn("只读查证任务", prompt)
         self.assertIn("submit_result.details 留空", prompt)
+
+    def test_playwright_cli_has_a_fixed_environment_check_chain(self) -> None:
+        self.assertTrue(is_playwright_cli_request("用 playwright-cli 打开页面"))
+        prompt = playwright_cli_prompt()
+        self.assertIn("最多再看一次包元数据", prompt)
+        self.assertIn("禁止伪造 process.versions", prompt)
+        self.assertIn("不能复用现有 Chrome 登录态", prompt)
+        self.assertIn("出现登录页、验证码", prompt)
+
+    def test_single_reasoning_plan_selects_mode_and_stop_budget(self) -> None:
+        cases = [
+            (
+                "用 playwright-cli 处理",
+                "Playwright CLI 工具链",
+                5,
+            ),
+            (
+                "只读任务：查看当前 Chrome 标签页标题",
+                "浏览器只读查证",
+                2,
+            ),
+            (
+                "查一下本地代码有没有提交到 git",
+                "简单状态查询",
+                3,
+            ),
+            (
+                "查一下为什么上次崩溃",
+                "根因诊断",
+                6,
+            ),
+            (
+                "为什么浏览器页面打不开",
+                "根因诊断",
+                6,
+            ),
+        ]
+        for text, mode, budget in cases:
+            with self.subTest(text=text):
+                plan = build_reasoning_plan(
+                    text,
+                    classify_request(text),
+                )
+                self.assertEqual(plan.mode, mode)
+                self.assertEqual(plan.max_exploration_calls, budget)
+                self.assertIn("停止条件", plan.prompt())
 
 
 if __name__ == "__main__":

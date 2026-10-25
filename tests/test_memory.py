@@ -360,6 +360,135 @@ class MemoryTests(unittest.TestCase):
             self.assertGreater(metrics["combined"]["estimated_tokens"], 0)
             memory.close()
 
+    def test_chinese_bigram_index_matches_browser_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            memory_id = memory.add(
+                content=(
+                    "用户：上次怎么打开浏览器查看余额？\n"
+                    "Sunus：用 pw.sh 打开持久化 profile，再读取页面。"
+                ),
+                scope="/project/example",
+                kind="episode",
+                status="supported",
+                tags=("conversation",),
+            )
+
+            rows = memory.search(
+                "你还记得上次操作浏览器的过程吗",
+                scope="/project/example",
+                limit=5,
+            )
+
+            self.assertIn(memory_id, {item["id"] for item in rows})
+            memory.close()
+
+    def test_legacy_raw_fts_index_is_rebuilt_on_open(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "memory.db"
+            memory = MemoryStore(path)
+            memory_id = memory.add(
+                content="用户：上次打开浏览器读取 DeepSeek 余额",
+                scope="/project/example",
+                kind="episode",
+                status="supported",
+            )
+            with memory._connection:
+                memory._connection.execute("DELETE FROM memory_index_meta")
+                memory._connection.execute("DELETE FROM memory_fts")
+                memory._connection.execute(
+                    """
+                    INSERT INTO memory_fts(memory_id, content, tags, scope)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        memory_id,
+                        "用户：上次打开浏览器读取 DeepSeek 余额",
+                        "",
+                        "/project/example",
+                    ),
+                )
+            memory.close()
+
+            reopened = MemoryStore(path)
+            rows = reopened.search(
+                "浏览器",
+                scope="/project/example",
+                limit=5,
+            )
+
+            self.assertIn(memory_id, {item["id"] for item in rows})
+            reopened.close()
+
+    def test_legacy_overwritten_strategy_row_is_reclassified_as_episode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "memory.db"
+            memory = MemoryStore(path)
+            memory_id = memory.add(
+                content="用户：旧版浏览器操作\nSunus：回合正文覆盖了策略轨迹。",
+                scope="/project/example",
+                kind="strategy",
+                status="supported",
+                tags=("conversation", "recent"),
+                source="reasoning_trace",
+                evidence_kind="receipt",
+                receipt_id="r_legacy",
+                metadata={"turn_status": "completed"},
+            )
+            memory.close()
+
+            reopened = MemoryStore(path)
+            row = reopened.get(memory_id)
+
+            self.assertEqual(row["kind"], "episode")
+            self.assertEqual(row["source"], "turn_receipt")
+            reopened.close()
+
+    def test_context_reserves_slots_for_query_matched_episodes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            for index in range(3):
+                memory.record_explicit_review(
+                    user_input=f"固定复盘 {index}",
+                    assistant_text="不要忘记旧规则。",
+                    scope="/project/example",
+                    receipt_id=f"r_review_{index}",
+                    turn_status="completed",
+                )
+            for index in range(2):
+                memory.add(
+                    content=f"通用策略：只读查证步骤 {index}",
+                    scope="global",
+                    kind="strategy",
+                    status="supported",
+                    tags=("strategy", "successful"),
+                )
+            episode_ids = memory.record_turn(
+                user_input="上次怎么读取浏览器里的 DeepSeek 余额？",
+                assistant_text="用 pw.sh 打开持久化 profile，再 eval 页面正文。",
+                scope="/project/example",
+                receipt_id="r_browser",
+            )
+
+            context = memory.build_context(
+                scope="/project/example",
+                query="还记得之前操作浏览器查看 DeepSeek 吗",
+                recall_limit=5,
+            )
+
+            recalled_ids = [item["id"] for item in context.recalled]
+            self.assertLessEqual(len(recalled_ids), 5)
+            self.assertIn(episode_ids[0], recalled_ids)
+            self.assertEqual(
+                next(
+                    item["kind"]
+                    for item in context.recalled
+                    if item["id"] == episode_ids[0]
+                ),
+                "episode",
+            )
+            memory.close()
+
     def test_token_estimate_is_stable_and_dependency_free(self) -> None:
         metrics = text_metrics("Sunus 读取记忆 token")
         self.assertEqual(metrics["characters"], len("Sunus 读取记忆 token"))
