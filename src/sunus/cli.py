@@ -24,6 +24,8 @@ from sunus import __version__
 from sunus.agent import Agent, AgentResult
 from sunus.config import (
     ConfigError,
+    PERSONA_CONTEXT_LABELS,
+    PERSONA_STYLE_LABELS,
     RuntimeConfig,
     config_summary,
     redact_text,
@@ -35,7 +37,12 @@ from sunus.events import EventBus
 from sunus.memory import MemoryStore
 from sunus.memory_import import import_session_memory
 from sunus.model import ModelClient, ModelError, create_model_client
-from sunus.policy import CAPABILITIES, ApprovalManager, PathGuard
+from sunus.policy import (
+    CAPABILITIES,
+    ApprovalManager,
+    PathGuard,
+    command_risk,
+)
 from sunus.proactive import (
     PresenceContext,
     ProactiveScheduler,
@@ -44,6 +51,7 @@ from sunus.proactive import (
     parse_topic_ratios,
     proactive_topic_schedule,
 )
+from sunus.relationship import transition_relationship
 from sunus.storage import (
     ArtifactStore,
     SessionLogger,
@@ -584,6 +592,149 @@ def proactive_ratios_summary(config: RuntimeConfig) -> dict[str, Any]:
     }
 
 
+def _persona_metric_updates(
+    values: list[str],
+    allowed: dict[str, str],
+    label: str,
+    *,
+    allow_custom: bool = False,
+) -> dict[str, float]:
+    updates: dict[str, float] = {}
+    for item in values:
+        key, separator, raw_value = item.partition("=")
+        key = key.strip()
+        if allow_custom and not re.fullmatch(
+            r"[A-Za-z0-9_\-\u3400-\u9fff]{1,32}",
+            key,
+        ):
+            raise ValueError(
+                f"{label} 维度名无效；格式 key=0..1，键最长 32 字符"
+            )
+        if not separator or (key not in allowed and not allow_custom):
+            choices = "、".join(allowed)
+            raise ValueError(f"{label} 必须是以下键之一：{choices}，格式 key=0..1")
+        try:
+            value = float(raw_value)
+        except ValueError as error:
+            raise ValueError(f"{label}.{key} 必须是数字") from error
+        if not 0 <= value <= 1:
+            raise ValueError(f"{label}.{key} 必须在 0 到 1 之间")
+        updates[key] = value
+    return updates
+
+
+def persona_config_command(
+    config: RuntimeConfig,
+    args: argparse.Namespace,
+) -> int:
+    examples = list(args.persona_examples or [])
+    if args.clear_examples and examples:
+        raise ValueError("--example 与 --clear-examples 不能同时使用")
+    updates: dict[str, Any] = {}
+    for key in ("name", "mission", "prompt"):
+        value = getattr(args, f"persona_{key}")
+        if value is not None:
+            updates[key] = value.strip()
+    if args.persona_conversation_max_chars is not None:
+        if not 40 <= args.persona_conversation_max_chars <= 1000:
+            raise ValueError("conversation_max_chars 必须在 40 到 1000 之间")
+        updates["conversation_max_chars"] = (
+            args.persona_conversation_max_chars
+        )
+    if examples or args.clear_examples:
+        updates["examples"] = examples
+    styles = _persona_metric_updates(
+        list(args.persona_styles or []),
+        PERSONA_STYLE_LABELS,
+        "style",
+        allow_custom=True,
+    )
+    if styles:
+        updates["style"] = styles
+    contexts = _persona_metric_updates(
+        list(args.persona_contexts or []),
+        PERSONA_CONTEXT_LABELS,
+        "context",
+    )
+    if contexts:
+        updates["context_intensity"] = contexts
+    if not updates:
+        print(
+            json.dumps(
+                {
+                    "persona": config_summary(config)["persona"],
+                    "config": str(config.data_dir / "config.json"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    path = save_user_config(config.data_dir, {"persona": updates})
+    print(f"已更新人物配置：{path}")
+    print(f"字段：{', '.join(sorted(updates))}")
+    return 0
+
+
+def relationship_config_command(
+    config: RuntimeConfig,
+    args: argparse.Namespace,
+) -> int:
+    values = {
+        key: getattr(args, f"relationship_{key}")
+        for key in ("label", "sunus_role", "user_role", "address")
+    }
+    updates = {
+        key: str(value).strip()
+        for key, value in values.items()
+        if value is not None
+    }
+    if args.relationship_clear and updates:
+        raise ValueError("--clear 不能与其他人物关系参数同时使用")
+    clear_requested = bool(args.relationship_clear)
+    if not updates and not clear_requested:
+        print(
+            json.dumps(
+                {
+                    "relationship": config_summary(config)["persona"][
+                        "relationship"
+                    ],
+                    "config": str(config.data_dir / "config.json"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    transition = transition_relationship(
+        config.persona.relationship,
+        {} if clear_requested else updates,
+    )
+    if not transition.allowed:
+        print(
+            json.dumps(
+                {
+                    "error": transition.reason,
+                    "relationship": transition.relationship.to_dict(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
+    path = save_user_config(
+        config.data_dir,
+        {
+            "persona": {
+                "relationship": transition.relationship.to_dict(),
+            }
+        },
+    )
+    print(f"人物关系：{transition.reason}")
+    print(f"配置：{path}")
+    return 0
+
+
 @dataclass
 class Components:
     config: RuntimeConfig
@@ -689,12 +840,31 @@ def build_components(
     agent: Agent | None = None
     if require_model:
         model = create_model_client(config)
+        allowed_action_names = set(config.proactive.action_tools)
+        allowed_risks = {
+            "R0": {"R0"},
+            "R1": {"R0", "R1"},
+            "R2": {"R0", "R1", "R2"},
+        }[config.proactive.action_risk_ceiling]
+        action_catalog = tuple(
+            {
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": spec.parameters,
+            }
+            for spec in tools.specs()
+            if (
+                spec.name in allowed_action_names
+                and spec.risk in allowed_risks
+            )
+        )
         proactive = ProactiveService(
             model=model,
             memory=memory,
             scope=str(config.workspace),
             config=config.proactive,
             persona=config.persona,
+            action_catalog=action_catalog,
         )
         agent = Agent(
             config=config,
@@ -756,6 +926,134 @@ def _remember_proactive_delivery(
         return ""
 
 
+def _execute_proactive_action(
+    components: Components,
+    text: str,
+    meta: dict[str, Any],
+) -> None:
+    action = meta.get("action")
+    if not isinstance(action, dict) or not action:
+        return
+    if components.config.proactive.action_mode != "safe_auto":
+        meta["action_status"] = "proposed"
+        return
+    tool_name = str(action.get("tool") or "")
+    arguments = action.get("arguments")
+    spec = components.tools.registry.get(tool_name)
+    allowed = set(components.config.proactive.action_tools)
+    allowed_risks = {
+        "R0": {"R0"},
+        "R1": {"R0", "R1"},
+        "R2": {"R0", "R1", "R2"},
+    }[components.config.proactive.action_risk_ceiling]
+    if (
+        spec is None
+        or tool_name not in allowed
+        or spec.risk not in allowed_risks
+        or not isinstance(arguments, dict)
+    ):
+        meta["action_status"] = "rejected"
+        meta["action_error"] = "主动动作不在当前工具或风险白名单"
+        components.events.emit(
+            "proactive_action_rejected",
+            tool=tool_name,
+            summary=meta["action_error"],
+        )
+        return
+    target_path = None
+    if tool_name == "write_file":
+        try:
+            target_path = components.tools.path_guard.resolve(
+                str(arguments.get("path") or "")
+            )
+            components.tools.path_guard.assert_writable(target_path)
+        except Exception as error:
+            meta["action_status"] = "rejected"
+            meta["action_error"] = redact_text(str(error))[:400]
+            components.events.emit(
+                "proactive_action_rejected",
+                tool=tool_name,
+                summary=f"主动写文件路径被拒绝: {meta['action_error']}",
+            )
+            return
+        content = str(arguments.get("content") or "")
+        if target_path.exists():
+            meta["action_status"] = "rejected"
+            meta["action_error"] = "主动写文件只允许新建，禁止覆盖已有文件"
+            components.events.emit(
+                "proactive_action_rejected",
+                tool=tool_name,
+                summary=meta["action_error"],
+            )
+            return
+        if len(content.encode("utf-8")) > 64 * 1024:
+            meta["action_status"] = "rejected"
+            meta["action_error"] = "主动写文件超过 64KB 上限"
+            components.events.emit(
+                "proactive_action_rejected",
+                tool=tool_name,
+                summary=meta["action_error"],
+            )
+            return
+
+    grant_risk = components.config.proactive.action_risk_ceiling
+    if tool_name == "run_command":
+        command = str(arguments.get("command") or "")
+        risk = command_risk(command, workspace=components.config.workspace)
+        if risk not in {"R0", "R1"}:
+            meta["action_status"] = "rejected"
+            meta["action_error"] = (
+                f"主动命令需要额外授权（{risk}），不会自动执行"
+            )
+            components.events.emit(
+                "proactive_action_rejected",
+                tool=tool_name,
+                summary=meta["action_error"],
+            )
+            return
+        grant_risk = "R1"
+
+    components.approvals.begin_task(
+        risk_ceiling=grant_risk
+    )
+    action_text = (
+        f"运行命令 {str(arguments.get('command') or '')[:2000]} "
+        f"主动动作理由 {action.get('reason') or ''}"
+        if tool_name == "run_command"
+        else f"执行主动动作 {tool_name} {action.get('reason') or ''} {text}"
+    )
+    components.tools.begin_request(
+        action_text,
+        previous_assistant="",
+        previous_scope=None,
+    )
+    try:
+        result = components.tools.execute(tool_name, arguments)
+        meta["action_status"] = "completed" if result.ok else "failed"
+        meta["action_error"] = "" if result.ok else redact_text(
+            str(result.content or "")
+        )[:400]
+        meta["action_result_preview"] = redact_text(
+            str(result.content or "")
+        )[:800]
+    except Exception as error:
+        meta["action_status"] = "failed"
+        meta["action_error"] = redact_text(str(error))[:400]
+    finally:
+        components.approvals.end_task()
+    components.events.emit(
+        "proactive_action_result",
+        tool=tool_name,
+        ok=meta.get("action_status") == "completed",
+        status=meta.get("action_status"),
+        summary=(
+            f"主动动作已完成: {tool_name}"
+            if meta.get("action_status") == "completed"
+            else f"主动动作失败: {tool_name}"
+        ),
+    )
+
+
 def due_message(components: Components) -> None:
     if (
         not components.config.proactive.enabled
@@ -782,6 +1080,7 @@ def due_message(components: Components) -> None:
             sequence_index=components.scheduler.current_topic_index(),
             presence=PresenceContext(idle_seconds=idle_seconds),
         )
+        _execute_proactive_action(components, text, meta)
         message_id = components.scheduler.record_message(text)
         memory_id = _remember_proactive_delivery(
             components,
@@ -1293,6 +1592,7 @@ def handle_slash(command: str, components: Components) -> bool:
                     )
                     print("主动消息生成失败，本次未发送。")
                     return True
+                _execute_proactive_action(components, text, meta)
                 message_id = components.scheduler.record_message(text)
                 memory_id = _remember_proactive_delivery(
                     components,
@@ -1751,6 +2051,7 @@ def proactive_command(
                 )
                 print(f"主动消息生成失败，本次未发送：{error}", file=sys.stderr)
                 return 1
+            _execute_proactive_action(components, text, meta)
             message_id = components.scheduler.record_message(text)
             memory_id = _remember_proactive_delivery(
                 components,
@@ -2094,6 +2395,71 @@ def make_parser() -> argparse.ArgumentParser:
         help="Ratio updates, e.g. daily_emotion=45 work_coding=20 ...",
     )
 
+    config_parser = sub.add_parser("config", help="Manage local user configuration")
+    config_sub = config_parser.add_subparsers(dest="config_action", required=True)
+    persona_config = config_sub.add_parser(
+        "persona",
+        help="Inspect or update the configured persona",
+    )
+    persona_config.add_argument("--name", dest="persona_name")
+    persona_config.add_argument("--mission", dest="persona_mission")
+    persona_config.add_argument("--prompt", dest="persona_prompt")
+    persona_config.add_argument(
+        "--conversation-max-chars",
+        dest="persona_conversation_max_chars",
+        type=int,
+        metavar="CHARS",
+        help="Limit casual-chat replies from 40 to 1000 characters",
+    )
+    persona_config.add_argument(
+        "--example",
+        action="append",
+        dest="persona_examples",
+        help="Replace persona examples with this value; repeat for multiple examples",
+    )
+    persona_config.add_argument(
+        "--clear-examples",
+        action="store_true",
+        help="Remove all persona examples",
+    )
+    persona_config.add_argument(
+        "--style",
+        action="append",
+        dest="persona_styles",
+        metavar="KEY=VALUE",
+        help="Update a built-in or custom persona dimension from 0 to 1",
+    )
+    persona_config.add_argument(
+        "--context",
+        action="append",
+        dest="persona_contexts",
+        metavar="KEY=VALUE",
+        help="Update chat, task, or risk expression intensity from 0 to 1",
+    )
+    relationship_config = config_sub.add_parser(
+        "relationship",
+        help="Inspect, update, or clear the configured relationship",
+    )
+    relationship_config.add_argument("--label", dest="relationship_label")
+    relationship_config.add_argument(
+        "--sunus-role",
+        dest="relationship_sunus_role",
+    )
+    relationship_config.add_argument(
+        "--user-role",
+        dest="relationship_user_role",
+    )
+    relationship_config.add_argument(
+        "--address",
+        dest="relationship_address",
+        help="How Sunus should address the user",
+    )
+    relationship_config.add_argument(
+        "--clear",
+        action="store_true",
+        dest="relationship_clear",
+    )
+
     memory = sub.add_parser("memory", help="Manage Sunus memory")
     memory_sub = memory.add_subparsers(dest="memory_action", required=True)
     import_sessions = memory_sub.add_parser(
@@ -2205,6 +2571,12 @@ def main(argv: list[str] | None = None) -> int:
             return doctor(config, network=args.network)
         if args.command == "proactive":
             return proactive_command(config, args.action, args.ratio_values)
+        if args.command == "config":
+            if args.config_action == "persona":
+                return persona_config_command(config, args)
+            if args.config_action == "relationship":
+                return relationship_config_command(config, args)
+            raise ValueError(f"未知配置操作：{args.config_action}")
         if args.command == "memory":
             return memory_command(config, args)
         return run_repl(config, verbose=args.verbose)

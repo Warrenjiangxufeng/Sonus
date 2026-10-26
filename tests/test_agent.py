@@ -15,6 +15,7 @@ from sunus.memory import MemoryStore
 from sunus.model_events import ModelEvent
 from sunus.model import ModelCancelled, ModelReply
 from sunus.policy import ApprovalManager, PathGuard
+from sunus.relationship import RelationshipConfig
 from sunus.storage import ArtifactStore, SessionLogger
 from sunus.tools import ToolExecutor
 
@@ -729,6 +730,7 @@ class AgentTests(unittest.TestCase):
             events_text = events.path.read_text(encoding="utf-8")
             self.assertIn("task_grant_started", events_text)
             self.assertIn("task_grant_ended", events_text)
+            self.assertIn("thinking_operators_selected", events_text)
             self.assertIn("读取文件 · note.txt", events_text)
             self.assertIn("assistant_progress", events_text)
             self.assertIn("我先读取文件。", events_text)
@@ -737,6 +739,7 @@ class AgentTests(unittest.TestCase):
             self.assertIn("长期使命", model.last_messages[0]["content"])
             self.assertIn("结论先行", model.last_messages[0]["content"])
             self.assertIn("任务边界", model.last_messages[0]["content"])
+            self.assertIn("当前首选思维算子", model.last_messages[0]["content"])
             self.assertIn("持久任务状态", model.last_messages[0]["content"])
             self.assertIn(
                 "多个互相独立的只读检查必须在同一轮 `tool_calls` 中批量发起",
@@ -1134,7 +1137,11 @@ class AgentTests(unittest.TestCase):
                 events=events,
                 memory=memory,
             )
-            model = CapturingReplyModel("我在呢，今天过得怎么样？")
+            model = CapturingReplyModel(
+                "我在。今天先不展开分析。你想聊工作、生活还是随便说两句都可以。"
+                "如果有具体事情，我们可以从你最在意的一点开始；如果没有，"
+                "也可以先安静一会儿，等有明确话题再继续。"
+            )
             agent = Agent(
                 config=config,
                 model=model,  # type: ignore[arg-type]
@@ -1144,7 +1151,7 @@ class AgentTests(unittest.TestCase):
                 session=session,
             )
 
-            result = agent.run_turn("哈喽在干嘛")
+            result = agent.run_turn("在")
 
             self.assertEqual(result.reason, "completed")
             self.assertEqual(model.last_max_tokens, 512)
@@ -1152,15 +1159,15 @@ class AgentTests(unittest.TestCase):
             self.assertIn("模式: 关系性对话", model.last_messages[0]["content"])
             self.assertIn("不要调用任何工具", model.last_messages[0]["content"])
             self.assertIn(
-                "不使用固定昵称、括号动作或强行撒娇",
+                "回复方式由当前语义决定",
                 model.last_messages[0]["content"],
             )
             self.assertIn(
-                "不默认列点或做咨询式总结",
+                "对方明确表示不想展开",
                 model.last_messages[0]["content"],
             )
             self.assertIn(
-                "先判断对方要陪伴",
+                "只选一个主要动作",
                 model.last_messages[0]["content"],
             )
             self.assertNotIn(
@@ -1170,6 +1177,55 @@ class AgentTests(unittest.TestCase):
             self.assertIn("可演化互动习惯", model.last_messages[0]["content"])
             self.assertIn("性格温柔", model.last_messages[0]["content"])
             self.assertEqual(result.tool_traces, [])
+            self.assertLessEqual(
+                len(result.text),
+                32,
+            )
+            self.assertIn(
+                "conversation_reply_compacted",
+                events.path.read_text(encoding="utf-8"),
+            )
+
+            result = agent.run_turn("以后你是我女朋友，叫我阿峰")
+            relationship_prompt = model.last_messages[0]["content"]
+            self.assertEqual(result.reason, "completed")
+            self.assertEqual(model.tool_names, set())
+            self.assertEqual(result.tool_traces, [])
+            self.assertIn("双方关系：恋人", relationship_prompt)
+            self.assertIn("Sunus 的角色：女朋友", relationship_prompt)
+            self.assertIn("Sunus 对用户的称呼：阿峰", relationship_prompt)
+            self.assertIn("运行时会自动持久化", relationship_prompt)
+            self.assertIn("不要修改 config.json", relationship_prompt)
+            profile = memory.persona_profile(scope=str(root.resolve()))
+            by_key = {item["trait_key"]: item for item in profile}
+            self.assertIn("relationship_setting", by_key)
+            self.assertIn("恋人", by_key["relationship_setting"]["statement"])
+            self.assertEqual(
+                agent.config.persona.relationship.label,
+                "恋人",
+            )
+
+            agent.run_turn("以后你不是我女朋友了")
+            self.assertFalse(agent.config.persona.relationship.configured)
+
+            agent.run_turn("以后你是我姐姐")
+            self.assertEqual(
+                agent.config.persona.relationship.sunus_role,
+                "姐姐",
+            )
+            agent.run_turn("以后你是我妹妹")
+            self.assertEqual(
+                agent.config.persona.relationship.sunus_role,
+                "姐姐",
+            )
+            self.assertIn(
+                "人物关系已锁定",
+                model.last_messages[0]["content"],
+            )
+            self.assertIn(
+                "relationship_update_rejected",
+                events.path.read_text(encoding="utf-8"),
+            )
             memory.close()
 
     def test_dsml_protocol_output_is_intercepted_and_retried(self) -> None:
@@ -1241,6 +1297,11 @@ class AgentTests(unittest.TestCase):
                 persona=PersonaConfig(
                     name="苏诺",
                     prompt="苏诺语气甜软，会自然地撒娇，也会认真解决问题。",
+                    relationship=RelationshipConfig(
+                        label="恋人",
+                        sunus_role="女朋友",
+                        address="阿峰",
+                    ),
                     examples=("这句夸我收下啦，正事也会认真做。",),
                     style=(("sweetness", 0.9), ("playfulness", 0.8)),
                     context_intensity=(("chat", 1.0), ("task", 0.6)),
@@ -1285,7 +1346,15 @@ class AgentTests(unittest.TestCase):
             self.assertIn("语气甜软", system_prompt)
             self.assertIn("正事也会认真做", system_prompt)
             self.assertIn("甜度: 90%", system_prompt)
+            self.assertIn("「甜度」很强", system_prompt)
+            self.assertIn("「卖萌度」很强", system_prompt)
             self.assertIn("闲聊场景", system_prompt)
+            self.assertIn("双方关系：恋人", system_prompt)
+            self.assertIn("Sunus 的角色：女朋友", system_prompt)
+            self.assertIn("Sunus 对用户的称呼：阿峰", system_prompt)
+            self.assertIn("运行时核心设定", system_prompt)
+            self.assertIn("稳定、连续的拟人身体表达层", system_prompt)
+            self.assertIn("身体自主权", system_prompt)
             self.assertNotIn("Sunus 核心性别设定为男性", system_prompt)
             self.assertGreater(result.metrics["context"]["persona_config"]["characters"], 0)
             memory.close()

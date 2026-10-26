@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from sunus.context import (
+    compact_conversation_reply,
     compact_messages,
     estimate_messages_tokens,
     repair_tool_pairs,
@@ -10,6 +11,19 @@ from sunus.context import (
 
 
 class ContextTests(unittest.TestCase):
+    def test_conversation_reply_compacts_on_sentence_boundary(self) -> None:
+        text = "第一句说清楚。第二句补充一点。第三句继续展开很多没必要的内容。"
+        compacted = compact_conversation_reply(text, limit=18)
+
+        self.assertEqual(compacted, "第一句说清楚。第二句补充一点。")
+        self.assertLessEqual(len(compacted), 18)
+
+    def test_conversation_reply_keeps_short_text_unchanged(self) -> None:
+        self.assertEqual(
+            compact_conversation_reply("先这样。", limit=100),
+            "先这样。",
+        )
+
     def test_repair_inserts_missing_tool_response_before_next_user(self) -> None:
         messages = [
             {

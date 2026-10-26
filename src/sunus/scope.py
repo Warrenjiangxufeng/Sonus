@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, replace
 
+from sunus.relationship import extract_relationship_update
+
 
 _QUESTION_PREFIX = re.compile(
     r"^\s*(?:如何|怎么|怎样|为什么|为何|是否|能否|可否|可不可以|"
@@ -193,6 +195,8 @@ def conversation_hint(
     stripped = text.strip()
     if not stripped or len(stripped) > 160:
         return "task"
+    if extract_relationship_update(stripped) is not None:
+        return "casual"
     if _TECHNICAL_PATTERN.search(stripped) or _PATH_PATTERN.search(stripped):
         return "task"
     scope = classify_request(stripped)

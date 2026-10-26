@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from sunus.proactive import (
     parse_topic_ratios,
     proactive_topic_schedule,
 )
+from sunus.relationship import RelationshipConfig
 
 
 class FakeModel:
@@ -61,6 +63,22 @@ class AssistantToneModel(FakeModel):
     def complete(self, system: str, user: str, **kwargs) -> str:
         super().complete(system, user, **kwargs)
         return "作为一个AI，希望能帮到你，还有什么可以帮你？"
+
+
+class ActionJsonModel(FakeModel):
+    def __init__(self, action: dict | None = None) -> None:
+        super().__init__()
+        self.action = action
+
+    def complete(self, system: str, user: str, **kwargs) -> str:
+        super().complete(system, user, **kwargs)
+        return json.dumps(
+            {
+                "message": "我去查一下。",
+                "action": self.action,
+            },
+            ensure_ascii=False,
+        )
 
 
 class ProactiveTests(unittest.TestCase):
@@ -263,6 +281,10 @@ class ProactiveTests(unittest.TestCase):
                 persona=PersonaConfig(
                     name="苏诺",
                     prompt="苏诺声音软软的，会自然撒娇，也很暖心。",
+                    relationship=RelationshipConfig(
+                        label="恋人",
+                        address="阿峰",
+                    ),
                     examples=("这句夸我收下啦，正事也会认真做。",),
                 ),
             )
@@ -276,6 +298,148 @@ class ProactiveTests(unittest.TestCase):
             self.assertIn("不要退回固定问候", model.last_system_prompt)
             self.assertIn("延续人物设定", model.last_system_prompt)
             self.assertIn("禁止客服腔", model.last_system_prompt)
+            self.assertIn("固定安慰句式", model.last_system_prompt)
+            self.assertIn("最近对话已经收束时只写一句", model.last_system_prompt)
+            self.assertIn("双方关系：恋人", model.last_system_prompt)
+            self.assertIn("Sunus 对用户的称呼：阿峰", model.last_system_prompt)
+            self.assertIn("运行时核心设定", model.last_system_prompt)
+            self.assertIn("稳定、连续的拟人身体表达层", model.last_system_prompt)
+            self.assertIn("身体自主权", model.last_system_prompt)
+            memory.close()
+
+    def test_proactive_reasoning_uses_relationship_evidence_without_presets(
+        self,
+    ) -> None:
+        cases = (
+            (
+                RelationshipConfig(
+                    label="情侣",
+                    sunus_role="女朋友",
+                    user_role="男朋友",
+                    address="阿峰",
+                ),
+                "情侣关系：阿峰和女朋友约定周末一起试一家新开的店",
+            ),
+            (
+                RelationshipConfig(
+                    label="父女",
+                    sunus_role="女儿",
+                    user_role="父亲",
+                    address="爸爸",
+                ),
+                "父女关系：爸爸和女儿上周一起修了自行车",
+            ),
+            (
+                RelationshipConfig(
+                    label="兄弟",
+                    sunus_role="哥哥",
+                    user_role="弟弟",
+                    address="老弟",
+                ),
+                "兄弟关系：哥哥和老弟最近在讨论一场球赛",
+            ),
+        )
+        for relationship, evidence in cases:
+            with self.subTest(relationship=relationship.label):
+                with tempfile.TemporaryDirectory() as temp:
+                    memory = MemoryStore(Path(temp) / "memory.db")
+                    memory.add(
+                        content=evidence,
+                        scope="/project/example",
+                        kind="episode",
+                        status="supported",
+                        tags=("conversation", "recent"),
+                    )
+                    model = FakeModel()
+                    service = ProactiveService(
+                        model=model,  # type: ignore[arg-type]
+                        memory=memory,
+                        scope="/project/example",
+                        config=ProactiveConfig(),
+                        persona=PersonaConfig(
+                            relationship=relationship,
+                            style=(("sweetness", 0.95), ("initiative", 0.85)),
+                        ),
+                    )
+
+                    _text, meta = service.generate(sequence_index=0)
+
+                    self.assertIn("关系语境", model.last_user_prompt)
+                    self.assertIn(relationship.label, model.last_user_prompt)
+                    self.assertIn(evidence.split("：", 1)[1], model.last_user_prompt)
+                    self.assertIn("主动选题推理", model.last_system_prompt)
+                    self.assertIn("不要套用预设的关系类型模板", model.last_user_prompt)
+                    self.assertIn("「甜度」很强", model.last_system_prompt)
+                    self.assertIn("「主动性」很强", model.last_system_prompt)
+                    self.assertNotIn("关系类型：情侣", model.last_user_prompt)
+                    self.assertTrue(meta["relationship_memory_ids"])
+                    self.assertEqual(
+                        meta["proactive_reasoning"],
+                        "relationship_memory_chain",
+                    )
+                    self.assertEqual(model.calls, 1)
+                    memory.close()
+
+    def test_proactive_json_can_carry_one_allowlisted_read_only_action(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            action = {
+                "tool": "search_memory",
+                "arguments": {"query": "最近的计划"},
+                "reason": "确认是否已有可延续的计划",
+            }
+            model = ActionJsonModel(action)
+            service = ProactiveService(
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                scope="/project/example",
+                config=ProactiveConfig(),
+                action_catalog=(
+                    {
+                        "name": "search_memory",
+                        "description": "Search long-term memory.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                        },
+                    },
+                ),
+            )
+
+            text, meta = service.generate(sequence_index=0)
+
+            self.assertEqual(text, "我去查一下。")
+            self.assertEqual(meta["action"], action)
+            self.assertEqual(meta["action_status"], "proposed")
+            self.assertEqual(meta["response_format"], "json")
+            self.assertEqual(model.calls, 1)
+            memory.close()
+
+    def test_proactive_action_outside_allowlist_is_discarded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            model = ActionJsonModel(
+                {
+                    "tool": "write_file",
+                    "arguments": {"path": "x.txt", "content": "x"},
+                    "reason": "test",
+                }
+            )
+            service = ProactiveService(
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                scope="/project/example",
+                config=ProactiveConfig(),
+                action_catalog=(),
+            )
+
+            text, meta = service.generate(sequence_index=0)
+
+            self.assertEqual(text, "我去查一下。")
+            self.assertIsNone(meta["action"])
+            self.assertIn("白名单", meta["action_error"])
             memory.close()
 
     def test_repeated_model_output_is_not_sent(self) -> None:
@@ -319,9 +483,9 @@ class ProactiveTests(unittest.TestCase):
                 ),
             )
 
-            self.assertLessEqual(len(text), 40)
+            self.assertLessEqual(len(text), 120)
             self.assertIn(meta["intent"], {"care", "curious", "playful"})
-            self.assertIn("本轮表达意图", model.last_user_prompt)
+            self.assertIn("本轮参考表达动作", model.last_user_prompt)
             self.assertIn("Terminal", model.last_user_prompt)
             self.assertIn("刚结束一段任务", model.last_user_prompt)
             self.assertEqual(meta["presence"]["idle_seconds"], 42)
@@ -561,7 +725,7 @@ class ProactiveTests(unittest.TestCase):
             self.assertTrue(meta["work_rerouted"])
             self.assertEqual(meta["unresolved_project_memory_ids"], [])
             self.assertIn("禁止发送工作提醒", model.last_user_prompt)
-            self.assertLessEqual(len(text), 40)
+            self.assertLessEqual(len(text), 120)
             memory.close()
 
     def test_partial_work_memory_allows_work_topic(self) -> None:
@@ -610,7 +774,7 @@ class ProactiveTests(unittest.TestCase):
 
             self.assertIn("任务式内容", str(raised.exception))
             self.assertIn("除工作门槛", model.last_system_prompt)
-            self.assertIn("最多两句", model.last_system_prompt)
+            self.assertIn("长度和结构由具体话题", model.last_system_prompt)
             memory.close()
 
     def test_assistant_tone_is_not_sent(self) -> None:

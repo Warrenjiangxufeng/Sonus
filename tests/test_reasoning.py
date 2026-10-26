@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from sunus.conversation_style import plan_conversation_turn
 from sunus.reasoning import (
     build_reasoning_plan,
     complex_task_prompt,
@@ -73,11 +74,17 @@ class ReasoningTests(unittest.TestCase):
         self.assertIn("立即收束", prompt)
 
     def test_relational_conversation_has_a_thought_checkpoint(self) -> None:
-        prompt = conversation_thinking_prompt()
-        self.assertIn("陪伴、被理解、一个真实评价、建议", prompt)
-        self.assertIn("只选择一个主要回应动作", prompt)
-        self.assertIn("不过度心理分析", prompt)
-        self.assertIn("模板化、咨询师化、客服化", prompt)
+        turn_style = plan_conversation_turn("生活啊").prompt()
+        prompt = conversation_thinking_prompt(
+            "上一轮已经用过同一种安慰结构",
+            turn_style,
+        )
+        self.assertIn("最合适的回应动作", prompt)
+        self.assertIn("上一轮可见回复", prompt)
+        self.assertIn("不要套用泛化安慰", prompt)
+        self.assertIn("相同回应动作", prompt)
+        self.assertIn("历史记忆中的旧回复", prompt)
+        self.assertIn("用户本轮约 3 个字符", prompt)
 
     def test_read_only_lookup_requests_are_compact(self) -> None:
         self.assertTrue(

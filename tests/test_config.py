@@ -122,6 +122,19 @@ experimental_bearer_token ="sk-test-secret-value"
             self.assertEqual(config.proactive.max_idle_sec, 600)
             self.assertEqual(config.proactive.typing_chars_per_second, 28)
             self.assertEqual(config.proactive.bubble_seconds, 15)
+            self.assertEqual(config.proactive.action_mode, "safe_auto")
+            self.assertEqual(config.proactive.action_risk_ceiling, "R2")
+            self.assertEqual(
+                config.proactive.action_tools,
+                (
+                    "search_memory",
+                    "inspect_runtime_history",
+                    "inspect_environment",
+                    "inspect_browser",
+                    "write_file",
+                    "run_command",
+                ),
+            )
             self.assertEqual(config.loop_budget.profile, "standard")
             self.assertEqual(config.loop_budget.max_model_calls, 60)
             self.assertEqual(config.loop_budget.max_response_tokens, 8192)
@@ -154,10 +167,17 @@ experimental_bearer_token ="sk-test-secret-value"
                             "name": "苏诺",
                             "mission": "把主人的复杂任务可靠做成并沉淀能力",
                             "prompt": "你是苏诺，语气甜美软萌，但不影响专业判断。",
+                            "relationship": {
+                                "label": "恋人",
+                                "sunus_role": "女朋友",
+                                "user_role": "男朋友",
+                                "address": "阿峰",
+                            },
                             "examples": ["慢慢来嘛，不催你。"],
                             "style": {
                                 "sweetness": 0.9,
                                 "playfulness": 0.8,
+                                "高冷": 0.7,
                             },
                             "context_intensity": {
                                 "chat": 1,
@@ -186,15 +206,25 @@ experimental_bearer_token ="sk-test-secret-value"
                 "把主人的复杂任务可靠做成并沉淀能力",
             )
             self.assertIn("甜美软萌", config.persona.prompt)
+            self.assertEqual(
+                config.persona.relationship.to_dict(),
+                {
+                    "label": "恋人",
+                    "sunus_role": "女朋友",
+                    "user_role": "男朋友",
+                    "address": "阿峰",
+                },
+            )
             self.assertEqual(config.persona.examples, ("慢慢来嘛，不催你。",))
             self.assertEqual(
                 dict(config.persona.style),
-                {"sweetness": 0.9, "playfulness": 0.8},
+                {"sweetness": 0.9, "playfulness": 0.8, "高冷": 0.7},
             )
             context_intensity = dict(config.persona.context_intensity)
             self.assertEqual(context_intensity["chat"], 1.0)
             self.assertEqual(context_intensity["task"], 0.6)
             self.assertEqual(context_intensity["risk"], 0.3)
+            self.assertEqual(config.persona.conversation_max_chars, 260)
             self.assertFalse(config.persona.learn_from_self_share)
 
     def test_redaction_preserves_numeric_token_metrics(self) -> None:

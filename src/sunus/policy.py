@@ -4,10 +4,12 @@ import os
 import re
 import select
 import shlex
+import shutil
 import sys
 import termios
 import threading
 import tty
+import unicodedata
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Literal
@@ -401,6 +403,9 @@ _APPROVAL_OPTIONS = (
     "本会话全部允许",
     "拒绝",
 )
+_APPROVAL_SELECTED = "\x1b[1;7;36m"
+_APPROVAL_DIM = "\x1b[2m"
+_APPROVAL_RESET = "\x1b[0m"
 
 
 def _read_menu_key(descriptor: int) -> str:
@@ -441,13 +446,63 @@ def _read_choice_key() -> str:
         termios.tcsetattr(descriptor, termios.TCSADRAIN, previous)
 
 
-def _render_approval_options(selected: int, *, first: bool) -> None:
+def _approval_color_enabled() -> bool:
+    if "NO_COLOR" in os.environ or os.environ.get("TERM") == "dumb":
+        return False
+    return bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+
+def _display_width(value: str) -> int:
+    width = 0
+    for character in value:
+        if unicodedata.combining(character):
+            continue
+        width += 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+    return width
+
+
+def _approval_option_line(
+    index: int,
+    label: str,
+    *,
+    selected: bool,
+    color_enabled: bool,
+) -> str:
+    plain = f"  {'❯' if selected else ' '} {index + 1}. {label}"
+    if not color_enabled:
+        return plain
+    if not selected:
+        return f"{_APPROVAL_DIM}{plain}{_APPROVAL_RESET}"
+    columns = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns)
+    padding = " " * max(0, columns - 1 - _display_width(plain))
+    return f"{_APPROVAL_SELECTED}{plain}{padding}{_APPROVAL_RESET}"
+
+
+def _render_approval_options(
+    selected: int,
+    *,
+    first: bool,
+    color_enabled: bool | None = None,
+) -> None:
+    enabled = (
+        _approval_color_enabled()
+        if color_enabled is None
+        else color_enabled
+    )
     if not first:
         sys.stdout.write(f"\x1b[{len(_APPROVAL_OPTIONS) + 1}A")
     for index, label in enumerate(_APPROVAL_OPTIONS):
-        marker = "❯" if index == selected else " "
-        sys.stdout.write(f"\r\x1b[2K  {marker} {index + 1}. {label}\n")
-    sys.stdout.write("\r\x1b[2K  ↑/↓ 选择 · Enter 确认 · y 允许 · x 拒绝\n")
+        line = _approval_option_line(
+            index,
+            label,
+            selected=index == selected,
+            color_enabled=enabled,
+        )
+        sys.stdout.write(f"\r\x1b[2K{line}\n")
+    hint = "  ↑/↓ 选择 · Enter 确认 · y 允许 · x 拒绝"
+    if enabled:
+        hint = f"{_APPROVAL_DIM}{hint}{_APPROVAL_RESET}"
+    sys.stdout.write(f"\r\x1b[2K{hint}\n")
     sys.stdout.flush()
 
 
@@ -508,8 +563,12 @@ class ApprovalManager:
                 capability: True for capability in CAPABILITIES
             }
 
-    def begin_task(self) -> TaskGrant:
-        self.grant = self.default_grant
+    def begin_task(self, risk_ceiling: RiskLevel | None = None) -> TaskGrant:
+        self.grant = (
+            TaskGrant(risk_ceiling=risk_ceiling)
+            if risk_ceiling is not None
+            else self.default_grant
+        )
         return self.grant
 
     def end_task(self) -> None:

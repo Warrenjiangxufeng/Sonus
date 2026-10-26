@@ -3,7 +3,13 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from sunus.conversation_style import plan_conversation_turn
 from sunus.scope import RequestScope
+from sunus.thinking_operators import (
+    OPERATOR_LIBRARY,
+    OperatorSelection,
+    select_operators,
+)
 
 
 _DIAGNOSTIC_PATTERN = re.compile(
@@ -50,6 +56,11 @@ class ReasoningPlan:
     answer_style: str
     drop_details: bool = False
     strategy: str = ""
+    response_char_limit: int = 0
+
+    @property
+    def operator_selection(self) -> OperatorSelection:
+        return select_operators(mode=self.mode, complexity=self.complexity)
 
     def prompt(self) -> str:
         lines = [
@@ -64,6 +75,16 @@ class ReasoningPlan:
         ]
         if self.strategy:
             lines.append(f"- 专项策略: {self.strategy}")
+        if self.mode != "关系性对话":
+            lines.append(self.operator_selection.prompt())
+            if self.complexity == "高":
+                lines.append(
+                    f"- 备用算子: {','.join(OPERATOR_LIBRARY)}"
+                )
+        if self.response_char_limit:
+            lines.append(
+                f"- 回复长度上限: 约 {self.response_char_limit} 字"
+            )
         return "\n".join(lines)
 
 
@@ -72,10 +93,12 @@ def build_reasoning_plan(
     scope: RequestScope,
     *,
     conversation: bool = False,
+    previous_assistant: str = "",
 ) -> ReasoningPlan:
     value = str(text or "")
     capabilities = tuple(sorted(scope.required_capabilities))
     if conversation:
+        turn_plan = plan_conversation_turn(value)
         return ReasoningPlan(
             mode="关系性对话",
             complexity="低",
@@ -84,13 +107,15 @@ def build_reasoning_plan(
             max_exploration_calls=0,
             stop_condition="回应当下主要需求后立即停止，不展开成分析报告。",
             answer_style=(
-                "像正常熟人说话，通常 1-3 句；不使用固定昵称、括号动作或强行撒娇；"
-                "可以保留一点犹豫，不默认列点或做咨询式总结。"
+                "像正常熟人说话；长度和结构由当前内容决定；"
+                "自主选择回答、确认、追问、分享观察、实际帮助或收束，"
+                "不强制固定顺序，也不套用咨询式和客服式模板。"
             ),
-            strategy=(
-                "先判断对方要陪伴、理解、评价、建议还是纠正；只选一个回应动作；"
-                "只依据真实上下文，不过度心理分析。"
+            strategy=conversation_thinking_prompt(
+                previous_assistant,
+                turn_plan.prompt(),
             ),
+            response_char_limit=turn_plan.max_chars,
         )
     if is_status_query_request(value):
         return ReasoningPlan(
@@ -242,12 +267,26 @@ def complex_task_prompt() -> str:
 4. 已有证据足以回答，或两个以上候选无法区分时立即收束；如果缺少时间、对象或权限，直接询问一次。"""
 
 
-def conversation_thinking_prompt() -> str:
-    return """本轮是关系性对话，先做一次内部判断再开口：
-1. 识别对方此刻主要需要什么：陪伴、被理解、一个真实评价、建议，还是对上一句的纠正。不要把所有需求都当成分析任务。
-2. 只选择一个主要回应动作；先回应当下，不必一次解决全部问题。
-3. 判断必须基于当前对话里真实出现的信息，不虚构共同经历，也不过度心理分析。
-4. 开口前检查：像正常熟人会说的话吗？是否模板化、咨询师化、客服化，或为了亲昵而强行撒娇？如果像，重写得更直接自然。"""
+def conversation_thinking_prompt(
+    previous_assistant: str = "",
+    turn_style: str = "",
+) -> str:
+    previous = " ".join(str(previous_assistant or "").split())[-300:]
+    previous_block = (
+        "\n上一轮可见回复（只用于避免重复，不得模仿其措辞或结构）："
+        f"\n{previous}"
+        if previous
+        else ""
+    )
+    turn_block = f"\n回合长度参考：{turn_style}" if turn_style else ""
+    return f"""本轮是关系性对话，先选择一个最合适的回应动作再开口：
+1. 识别当前消息是在问事实、表达具体内容、情绪收束、明确求助还是单纯接话。
+2. 只选一个主要动作：直接回答、具体确认、问一个必要细节、分享真实观察、提供实际帮助或简短收束。
+3. 依据当前消息的具体语义回应；不要套用泛化安慰、陪伴承诺或固定收束句式来替代内容。
+4. 如果本轮也是情绪表达，避免延续上一轮的相同回应动作、开场方式或收束结构；换一种更贴合当前内容的方式。
+5. 只依据真实上下文，不虚构共同经历、场景、心理动机或长期承诺。
+6. 开口前检查：是否有新增信息？没有就保持简短；追问是否必要？不必要就不问。
+历史记忆中的旧回复只能作为风格参考，不得当作可复用模板。{turn_block}{previous_block}"""
 
 
 def status_query_prompt() -> str:

@@ -14,6 +14,7 @@ from sunus.policy import (
     TaskGrant,
     _choose_approval_option,
     _read_menu_key,
+    _render_approval_options,
     command_denial_reason,
     command_risk,
     normalize_capabilities,
@@ -175,6 +176,58 @@ class PolicyTests(unittest.TestCase):
                 _choose_approval_option(key_reader=lambda: "3"),
                 2,
             )
+
+    def test_approval_menu_highlights_only_selected_option(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            _render_approval_options(
+                0,
+                first=True,
+                color_enabled=True,
+            )
+        rendered = output.getvalue()
+        self.assertIn(
+            "\x1b[1;7;36m  ❯ 1. 允许本次",
+            rendered,
+        )
+        self.assertIn(
+            "\x1b[2m    2. 本会话全部允许\x1b[0m",
+            rendered,
+        )
+        self.assertIn(
+            "\x1b[2m    3. 拒绝\x1b[0m",
+            rendered,
+        )
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            _render_approval_options(
+                1,
+                first=True,
+                color_enabled=True,
+            )
+        rendered = output.getvalue()
+        self.assertIn(
+            "\x1b[1;7;36m  ❯ 2. 本会话全部允许",
+            rendered,
+        )
+        self.assertIn(
+            "\x1b[2m    1. 允许本次\x1b[0m",
+            rendered,
+        )
+
+    def test_approval_menu_without_color_keeps_plain_text(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            _render_approval_options(
+                0,
+                first=True,
+                color_enabled=False,
+            )
+        rendered = output.getvalue()
+        self.assertIn("  ❯ 1. 允许本次", rendered)
+        self.assertNotIn("\x1b[1;7;36m", rendered)
+        self.assertNotIn("\x1b[2m", rendered)
 
     def test_session_allow_option_persists_for_session(self) -> None:
         approvals = ApprovalManager(

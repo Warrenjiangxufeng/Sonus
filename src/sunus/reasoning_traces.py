@@ -41,6 +41,8 @@ def record_reasoning_trace(
     tool_traces: list[dict[str, Any]],
     blocker: str,
     reason: str,
+    operators: tuple[str, ...] = (),
+    contrast_checks: tuple[str, ...] = (),
 ) -> str | None:
     if not objective:
         return None
@@ -60,6 +62,8 @@ def record_reasoning_trace(
         f"模式={mode}；目标={objective[:300]}；"
         f"能力={','.join(capabilities) or '无'}；"
         f"首选={','.join(preferred_tools) or '直接回答'}；"
+        f"算子={','.join(operators) or '无'}；"
+        f"复核={','.join(contrast_checks) or '无'}；"
         f"实际动作={'→'.join(tool_names[:8]) or '无'}；"
         f"阻塞={blocker or '无'}；结果={reason}；"
         f"策略={lesson}"
@@ -84,6 +88,8 @@ def record_reasoning_trace(
             "reason": reason,
             "blocker": blocker,
             "tool_sequence": tool_names,
+            "operators": list(operators),
+            "contrast_checks": list(contrast_checks),
         },
     )
 

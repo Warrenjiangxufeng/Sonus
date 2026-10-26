@@ -542,6 +542,39 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(concise["evidence_count"], 2)
             memory.close()
 
+    def test_relationship_setting_becomes_persistent_dialogue_context(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            memory.record_turn(
+                user_input="以后你是我女朋友，叫我阿峰",
+                assistant_text="好。",
+                scope="/project/example",
+                receipt_id="r_relationship",
+            )
+
+            profile = memory.persona_profile(scope="/project/example")
+            by_key = {item["trait_key"]: item for item in profile}
+            self.assertIn("relationship_setting", by_key)
+            self.assertIn("恋人", by_key["relationship_setting"]["statement"])
+            self.assertIn("女朋友", by_key["relationship_setting"]["statement"])
+            self.assertIn("阿峰", by_key["address_user"]["statement"])
+
+            memory.record_turn(
+                user_input="以后你不是我女朋友了",
+                assistant_text="好。",
+                scope="/project/example",
+                receipt_id="r_relationship_clear",
+            )
+            profile = memory.persona_profile(scope="/project/example")
+            by_key = {item["trait_key"]: item for item in profile}
+            self.assertIn(
+                "取消",
+                by_key["relationship_setting"]["statement"],
+            )
+            memory.close()
+
     def test_explicit_sunus_identity_becomes_stable_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             memory = MemoryStore(Path(temp) / "memory.db")

@@ -13,6 +13,7 @@ from sunus.core_identity import (
     CoreIdentityState,
     ensure_core_identity,
 )
+from sunus.relationship import RelationshipConfig, relationship_from_mapping
 
 
 class ConfigError(RuntimeError):
@@ -169,6 +170,16 @@ class ProactiveConfig:
     max_idle_sec: int = 600
     typing_chars_per_second: int = 28
     bubble_seconds: int = 15
+    action_mode: str = "safe_auto"
+    action_risk_ceiling: str = "R2"
+    action_tools: tuple[str, ...] = (
+        "search_memory",
+        "inspect_runtime_history",
+        "inspect_environment",
+        "inspect_browser",
+        "write_file",
+        "run_command",
+    )
 
 
 @dataclass(frozen=True)
@@ -176,6 +187,7 @@ class PersonaConfig:
     name: str = ""
     mission: str = ""
     prompt: str = ""
+    relationship: RelationshipConfig = field(default_factory=RelationshipConfig)
     examples: tuple[str, ...] = ()
     style: tuple[tuple[str, float], ...] = ()
     context_intensity: tuple[tuple[str, float], ...] = (
@@ -183,6 +195,7 @@ class PersonaConfig:
         ("task", 0.65),
         ("risk", 0.3),
     )
+    conversation_max_chars: int = 260
     learn_from_self_share: bool = False
 
 
@@ -240,6 +253,12 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
         "name": "",
         "mission": "",
         "prompt": "",
+        "relationship": {
+            "label": "",
+            "sunus_role": "",
+            "user_role": "",
+            "address": "",
+        },
         "examples": [],
         "style": {},
         "context_intensity": {
@@ -247,6 +266,7 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
             "task": 0.65,
             "risk": 0.3,
         },
+        "conversation_max_chars": 260,
         "learn_from_self_share": False,
     },
     "proactive": {
@@ -265,6 +285,16 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
         "max_idle_sec": 600,
         "typing_chars_per_second": 28,
         "bubble_seconds": 15,
+        "action_mode": "safe_auto",
+        "action_risk_ceiling": "R2",
+        "action_tools": [
+            "search_memory",
+            "inspect_runtime_history",
+            "inspect_environment",
+            "inspect_browser",
+            "write_file",
+            "run_command",
+        ],
     },
 }
 
@@ -585,24 +615,52 @@ def resolve_config(
             int(proactive_payload.get("typing_chars_per_second", 28)),
         ),
         bubble_seconds=max(1, int(proactive_payload.get("bubble_seconds", 15))),
+        action_mode=str(
+            proactive_payload.get("action_mode", "safe_auto")
+        ).strip(),
+        action_risk_ceiling=str(
+            proactive_payload.get("action_risk_ceiling", "R2")
+        ).strip(),
+        action_tools=_string_tuple(
+            proactive_payload.get(
+                "action_tools",
+                [
+                    "search_memory",
+                    "inspect_runtime_history",
+                    "inspect_environment",
+                    "inspect_browser",
+                    "write_file",
+                    "run_command",
+                ],
+            ),
+            "proactive.action_tools",
+        ),
     )
+    if proactive.action_mode not in {"off", "safe_auto"}:
+        raise ConfigError(
+            "proactive.action_mode 必须是 off 或 safe_auto"
+        )
+    if proactive.action_risk_ceiling not in {"R0", "R1", "R2"}:
+        raise ConfigError(
+            "proactive.action_risk_ceiling 必须是 R0、R1 或 R2"
+        )
     persona_payload = user.get("persona", {})
     if not isinstance(persona_payload, dict):
         raise ConfigError("persona 必须是 JSON object")
     raw_style = persona_payload.get("style", {})
     if not isinstance(raw_style, dict):
         raise ConfigError("persona.style 必须是 JSON object")
-    unknown_style = sorted(set(raw_style) - set(PERSONA_STYLE_LABELS))
-    if unknown_style:
-        raise ConfigError(
-            "未知人物表达参数: " + ", ".join(unknown_style)
-        )
+    if len(raw_style) > 32:
+        raise ConfigError("persona.style 最多允许 32 个表达维度")
     style_values: list[tuple[str, float]] = []
-    for key in PERSONA_STYLE_LABELS:
-        if key not in raw_style:
-            continue
+    for raw_key, raw_value in raw_style.items():
+        key = str(raw_key).strip()
+        if not re.fullmatch(r"[A-Za-z0-9_\-\u3400-\u9fff]{1,32}", key):
+            raise ConfigError(
+                f"persona.style 维度名无效: {raw_key}"
+            )
         try:
-            value = float(raw_style[key])
+            value = float(raw_value)
         except (TypeError, ValueError) as error:
             raise ConfigError(f"persona.style.{key} 必须是数字") from error
         if not 0 <= value <= 1:
@@ -649,6 +707,18 @@ def resolve_config(
     )
     if not isinstance(raw_learn_from_self_share, bool):
         raise ConfigError("persona.learn_from_self_share 必须是布尔值")
+    try:
+        conversation_max_chars = int(
+            persona_payload.get("conversation_max_chars", 260)
+        )
+    except (TypeError, ValueError) as error:
+        raise ConfigError(
+            "persona.conversation_max_chars 必须是整数"
+        ) from error
+    if not 40 <= conversation_max_chars <= 1000:
+        raise ConfigError(
+            "persona.conversation_max_chars 必须在 40 到 1000 之间"
+        )
     raw_examples = persona_payload.get("examples", [])
     if not isinstance(raw_examples, list):
         raise ConfigError("persona.examples 必须是字符串数组")
@@ -657,6 +727,30 @@ def resolve_config(
         for item in raw_examples
         if str(item).strip()
     )[:20]
+    try:
+        relationship = relationship_from_mapping(
+            persona_payload.get("relationship", {})
+        )
+    except ValueError as error:
+        raise ConfigError(str(error)) from error
+    relationship = RelationshipConfig(
+        label=(
+            os.environ.get("SUNUS_RELATIONSHIP_LABEL")
+            or relationship.label
+        ).strip()[:40],
+        sunus_role=(
+            os.environ.get("SUNUS_RELATIONSHIP_SUNUS_ROLE")
+            or relationship.sunus_role
+        ).strip()[:40],
+        user_role=(
+            os.environ.get("SUNUS_RELATIONSHIP_USER_ROLE")
+            or relationship.user_role
+        ).strip()[:40],
+        address=(
+            os.environ.get("SUNUS_RELATIONSHIP_ADDRESS")
+            or relationship.address
+        ).strip()[:40],
+    )
     persona = PersonaConfig(
         name=(
             os.environ.get("SUNUS_PERSONA_NAME")
@@ -670,9 +764,11 @@ def resolve_config(
             )
         ).strip()[:4000],
         prompt=str(persona_payload.get("prompt") or "").strip()[:16_000],
+        relationship=relationship,
         examples=persona_examples,
         style=tuple(style_values),
         context_intensity=tuple(context_intensity),
+        conversation_max_chars=conversation_max_chars,
         learn_from_self_share=raw_learn_from_self_share,
     )
     runtime_payload = user.get("runtime", {})
@@ -881,6 +977,22 @@ def redact_text(text: Any, secret: str = "") -> str:
     return value
 
 
+def _string_tuple(raw: Any, label: str) -> tuple[str, ...]:
+    if isinstance(raw, str):
+        values = re.split(r"[,，\n]", raw)
+    elif isinstance(raw, (list, tuple)):
+        values = raw
+    else:
+        raise ConfigError(f"{label} 必须是字符串数组")
+    return tuple(
+        dict.fromkeys(
+            str(item).strip()
+            for item in values
+            if str(item).strip()
+        )
+    )
+
+
 def redact_value(value: Any, secret: str = "") -> Any:
     if isinstance(value, str):
         return redact_text(value, secret)
@@ -953,9 +1065,11 @@ def config_summary(config: RuntimeConfig) -> dict[str, Any]:
             "name": config.persona.name,
             "mission": config.persona.mission,
             "configured": bool(config.persona.prompt),
+            "relationship": config.persona.relationship.to_dict(),
             "example_count": len(config.persona.examples),
             "style": dict(config.persona.style),
             "context_intensity": dict(config.persona.context_intensity),
+            "conversation_max_chars": config.persona.conversation_max_chars,
             "learn_from_self_share": config.persona.learn_from_self_share,
         },
         "budget": {
@@ -990,6 +1104,11 @@ def config_summary(config: RuntimeConfig) -> dict[str, Any]:
                 config.proactive.typing_chars_per_second
             ),
             "bubble_seconds": config.proactive.bubble_seconds,
+            "action_mode": config.proactive.action_mode,
+            "action_risk_ceiling": (
+                config.proactive.action_risk_ceiling
+            ),
+            "action_tools": list(config.proactive.action_tools),
         },
     }
 

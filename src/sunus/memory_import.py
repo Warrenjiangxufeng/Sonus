@@ -61,6 +61,7 @@ def import_session_memory(
             turn_id = str(record.get("turn_id") or "")
             if content and turn_id:
                 assistant_messages.setdefault(turn_id, []).append(content)
+        previous_assistant_text = ""
         for receipt in (
             record for record in records if record.get("type") == "receipt"
         ):
@@ -83,6 +84,7 @@ def import_session_memory(
                 scope=scope,
                 receipt_id=receipt_id,
                 turn_status=reason,
+                previous_assistant_text=previous_assistant_text,
             ):
                 if memory_id not in memory_ids:
                     memory_ids.append(memory_id)
@@ -98,6 +100,7 @@ def import_session_memory(
                 if review_id not in review_ids:
                     review_ids.append(review_id)
             processed += 1
+            previous_assistant_text = final_text
     return {
         "date": date,
         "sessions": sessions,

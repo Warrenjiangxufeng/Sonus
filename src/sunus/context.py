@@ -1,10 +1,33 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from sunus.memory import estimate_tokens
+
+
+def compact_conversation_reply(text: str, *, limit: int = 100) -> str:
+    cleaned = " ".join(str(text or "").split()).strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    sentences = re.findall(r".+?(?:[。！？!?]+|$)", cleaned)
+    selected = ""
+    for sentence in sentences:
+        part = sentence.strip()
+        if len(selected) + len(part) > limit:
+            break
+        selected += part
+    if selected:
+        return selected.strip()
+    cutoff = max(
+        cleaned.rfind(mark, 0, limit + 1)
+        for mark in ("，", ",", "；", ";", " ")
+    )
+    if cutoff >= 20:
+        return cleaned[:cutoff].rstrip("，,；; ") + "。"
+    return cleaned[: max(1, limit - 1)].rstrip() + "…"
 
 
 @dataclass(frozen=True)

@@ -13,6 +13,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from sunus.config import redact_text
+from sunus.relationship import (
+    RelationshipConfig,
+    extract_relationship_update,
+    relationship_trait,
+)
 
 
 PERSONA_SIGNAL_LABELS: dict[str, tuple[str, str]] = {
@@ -619,11 +624,20 @@ class MemoryStore:
         primary = [
             item for item in searched if item.get("kind") != "strategy"
         ]
+        primary = self._expand_conversation_neighbors(
+            primary,
+            query=query,
+            neighbor_limit=2,
+            window_minutes=5,
+        )
         searched_strategies = [
             item for item in searched if item.get("kind") == "strategy"
         ]
-        reserve_pinned = 1 if pinned and limit >= 2 else 0
-        reserve_strategy = 1 if strategies and limit >= 3 else 0
+        rich_primary = len(primary) >= max(2, limit - 1)
+        reserve_pinned = 1 if pinned and limit >= 2 and not rich_primary else 0
+        reserve_strategy = (
+            1 if strategies and limit >= 3 and not rich_primary else 0
+        )
         query_slots = max(1, limit - reserve_pinned - reserve_strategy)
         ordered = [
             *primary[:query_slots],
@@ -655,6 +669,81 @@ class MemoryStore:
                 label="相关记忆",
             ),
         )
+
+    def _expand_conversation_neighbors(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        query: str,
+        neighbor_limit: int = 2,
+        window_minutes: int = 5,
+    ) -> list[dict[str, Any]]:
+        """把命中的问答片段与相邻对话合并，恢复跨轮的指代和补充信息。"""
+        tokens = tuple(_fts_tokens(query))
+        if not tokens:
+            return items
+        expanded: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        anchors = 0
+        for item in items:
+            item_id = str(item.get("id") or "")
+            if item_id and item_id not in seen:
+                expanded.append(item)
+                seen.add(item_id)
+            if item.get("kind") != "episode" or anchors >= 2:
+                continue
+            anchors += 1
+            raw_time = str(item.get("created_at") or "")
+            try:
+                center = datetime.fromisoformat(raw_time)
+            except ValueError:
+                continue
+            start = iso(center - timedelta(minutes=window_minutes))
+            end = iso(center + timedelta(minutes=window_minutes))
+            with self._lock:
+                rows = self._connection.execute(
+                    """
+                    SELECT * FROM memories
+                    WHERE kind = 'episode'
+                      AND scope = ?
+                      AND status IN ('candidate', 'supported', 'verified')
+                      AND created_at BETWEEN ? AND ?
+                    ORDER BY created_at
+                    LIMIT 40
+                    """,
+                    (item.get("scope"), start, end),
+                ).fetchall()
+            candidates: list[tuple[float, dict[str, Any]]] = []
+            for row in rows:
+                candidate = dict(row)
+                candidate_id = str(candidate.get("id") or "")
+                if not candidate_id or candidate_id in seen:
+                    continue
+                try:
+                    candidate_time = datetime.fromisoformat(
+                        str(candidate.get("created_at") or "")
+                    )
+                except ValueError:
+                    continue
+                distance = abs((candidate_time - center).total_seconds())
+                content = str(candidate.get("content") or "").lower()
+                if (
+                    not any(token in content for token in tokens)
+                    and distance > 120
+                ):
+                    continue
+                candidates.append((distance, candidate))
+            added = 0
+            for _, candidate in sorted(candidates, key=lambda pair: pair[0]):
+                candidate_id = str(candidate.get("id") or "")
+                if candidate_id in seen:
+                    continue
+                expanded.append(candidate)
+                seen.add(candidate_id)
+                added += 1
+                if added >= neighbor_limit:
+                    break
+        return expanded
 
     def relevant_strategies(
         self,
@@ -1170,10 +1259,16 @@ class MemoryStore:
         scope: str,
         receipt_id: str,
         turn_status: str = "completed",
+        previous_assistant_text: str = "",
+        allow_relationship_update: bool = True,
     ) -> list[str]:
         created: list[str] = []
+        previous = _safe_text(previous_assistant_text, limit=2400).strip()
+        if len(previous) > 1200:
+            previous = previous[-1200:]
+        previous_block = f"上一轮 Sunus：{previous}\n" if previous else ""
         episode = _safe_text(
-            f"用户：{user_input}\nSunus：{assistant_text}",
+            f"{previous_block}用户：{user_input}\nSunus：{assistant_text}",
             limit=12000,
         )
         if episode:
@@ -1197,11 +1292,27 @@ class MemoryStore:
                     scope=scope,
                     tags=tuple(tags),
                     receipt_id=receipt_id,
-                    metadata={"turn_status": turn_status},
+                    metadata={
+                        "turn_status": turn_status,
+                        "has_previous_context": bool(previous),
+                    },
                 )
             )
 
-        if self._looks_like_preference_statement(user_input):
+        relationship_update = (
+            extract_relationship_update(user_input)
+            if allow_relationship_update
+            else None
+        )
+        if (
+            self._looks_like_preference_statement(user_input)
+            and allow_relationship_update
+        ):
+            preference_text = (
+                "解除人物关系设定"
+                if relationship_update == {}
+                else user_input
+            )
             persistent = self._is_persistent_preference(user_input)
             tags = ["preference", "communication"]
             if persistent:
@@ -1213,9 +1324,11 @@ class MemoryStore:
                 for marker in ("癖好", "爱好", "收藏", "习惯", "喜欢")
             ):
                 tags.append("quirk")
+            if relationship_update is not None:
+                tags.append("relationship")
             created.append(
                 self.add(
-                    content=f"用户偏好：{_safe_text(user_input, 1500)}",
+                    content=f"用户偏好：{_safe_text(preference_text, 1500)}",
                     scope="global",
                     kind="preference",
                     status="supported",
@@ -1229,7 +1342,10 @@ class MemoryStore:
                     },
                 )
             )
-        persona_traits = self._persona_traits(user_input)
+        persona_traits = self._persona_traits(
+            user_input,
+            include_relationship=allow_relationship_update,
+        )
         for trait in persona_traits:
             trait_key, category = self._persona_trait_metadata(trait)
             created.append(
@@ -1474,6 +1590,8 @@ class MemoryStore:
         text = str(user_input or "").strip()
         if not text:
             return False
+        if extract_relationship_update(text) is not None:
+            return True
         explicit_patterns = (
             "我喜欢",
             "我不喜欢",
@@ -1547,6 +1665,8 @@ class MemoryStore:
 
     @staticmethod
     def _is_persistent_preference(user_input: str) -> bool:
+        if extract_relationship_update(user_input) is not None:
+            return True
         stable_markers = (
             "以后",
             "今后",
@@ -1590,7 +1710,11 @@ class MemoryStore:
         )
 
     @staticmethod
-    def _persona_traits(user_input: str) -> list[str]:
+    def _persona_traits(
+        user_input: str,
+        *,
+        include_relationship: bool = True,
+    ) -> list[str]:
         traits: list[str] = []
         if any(
             marker in user_input
@@ -1616,9 +1740,39 @@ class MemoryStore:
             marker in user_input for marker in ("回答", "交流", "默认")
         ):
             traits.append("默认使用中文交流")
-        match = re.search(r"称呼我(?:为|叫)?([^\s，。,.！!？?]{1,12})", user_input)
-        if match:
-            traits.append(f"称呼用户为“{match.group(1)}”")
+        relationship_update = (
+            extract_relationship_update(user_input)
+            if include_relationship
+            else None
+        )
+        if relationship_update is not None:
+            if relationship_update:
+                relationship = RelationshipConfig(
+                    label=relationship_update.get("label", ""),
+                    sunus_role=relationship_update.get("sunus_role", ""),
+                    user_role=relationship_update.get("user_role", ""),
+                    address=relationship_update.get("address", ""),
+                )
+                statement = relationship_trait(relationship)
+                if statement:
+                    traits.append(statement)
+                if relationship.address:
+                    traits.append(
+                        f"称呼用户为“{relationship.address}”"
+                    )
+            else:
+                traits.append("取消 Sunus 与用户之前的人物关系设定")
+        if include_relationship and (
+            not relationship_update
+            or not relationship_update.get("address")
+        ):
+            match = re.search(
+                r"(?:称呼我|叫我)(?:为|叫)?"
+                r"([^\s，。,.！!？?]{1,12})",
+                user_input,
+            )
+            if match:
+                traits.append(f"称呼用户为“{match.group(1)}”")
         style_rules = (
             (
                 "甜度",
@@ -1700,6 +1854,11 @@ class MemoryStore:
             ("不主动扩大范围", ("task_bounded", "communication:boundary")),
             ("必要步骤", ("structured", "communication:structure")),
             ("默认使用中文", ("chinese", "communication:language")),
+            ("人物关系设定", ("relationship_setting", "relationship:type")),
+            (
+                "取消 Sunus 与用户",
+                ("relationship_setting", "relationship:type"),
+            ),
             ("称呼用户", ("address_user", "relationship:address")),
             ("核心性别", ("gender_identity", "identity:gender")),
             ("名字是", ("sunus_name", "identity:name")),

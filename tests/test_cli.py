@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import io
+import json
+import tempfile
 import termios
 import threading
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sunus.config import PersonaConfig, RuntimeConfig
 from sunus.cli import (
     PendingTerminalInput,
     RuntimeEventRenderer,
@@ -22,14 +27,184 @@ from sunus.cli import (
     _wrap_input_lines,
     handle_slash,
     make_parser,
+    persona_config_command,
     print_banner,
     render_terminal_markdown,
+    relationship_config_command,
     residual_text,
 )
 from sunus.policy import ApprovalManager
+from sunus.relationship import relationship_from_mapping
 
 
 class CliTests(unittest.TestCase):
+    def test_relationship_config_supports_inspect_update_and_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            config = RuntimeConfig(
+                workspace=workspace,
+                data_dir=root / "data",
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+            )
+            args = make_parser().parse_args(
+                [
+                    "config",
+                    "relationship",
+                    "--label",
+                    "恋人",
+                    "--sunus-role",
+                    "女朋友",
+                    "--user-role",
+                    "男朋友",
+                    "--address",
+                    "阿峰",
+                ]
+            )
+            relationship_config_command(config, args)
+            payload = json.loads(
+                (config.data_dir / "config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                payload["persona"]["relationship"],
+                {
+                    "label": "恋人",
+                    "sunus_role": "女朋友",
+                    "user_role": "男朋友",
+                    "address": "阿峰",
+                },
+            )
+
+            clear = make_parser().parse_args(
+                ["config", "relationship", "--clear"]
+            )
+            relationship_config_command(config, clear)
+            payload = json.loads(
+                (config.data_dir / "config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                payload["persona"]["relationship"],
+                {
+                    "label": "",
+                    "sunus_role": "",
+                    "user_role": "",
+                    "address": "",
+                },
+            )
+
+            sister = make_parser().parse_args(
+                [
+                    "config",
+                    "relationship",
+                    "--label",
+                    "姐妹",
+                    "--sunus-role",
+                    "姐姐",
+                    "--user-role",
+                    "妹妹",
+                ]
+            )
+            self.assertEqual(
+                relationship_config_command(config, sister),
+                0,
+            )
+            config = replace(
+                config,
+                persona=replace(
+                    config.persona,
+                    relationship=relationship_from_mapping(
+                        {
+                            "label": "姐妹",
+                            "sunus_role": "姐姐",
+                            "user_role": "妹妹",
+                        }
+                    ),
+                ),
+            )
+            locked = make_parser().parse_args(
+                [
+                    "config",
+                    "relationship",
+                    "--label",
+                    "兄弟",
+                    "--sunus-role",
+                    "哥哥",
+                ]
+            )
+            self.assertEqual(
+                relationship_config_command(config, locked),
+                2,
+            )
+            payload = json.loads(
+                (config.data_dir / "config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                payload["persona"]["relationship"]["label"],
+                "姐妹",
+            )
+
+    def test_persona_config_is_written_through_dedicated_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            config = RuntimeConfig(
+                workspace=workspace,
+                data_dir=root / "data",
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                persona=PersonaConfig(name="旧名字"),
+            )
+            args = make_parser().parse_args(
+                [
+                    "config",
+                    "persona",
+                    "--name",
+                    "苏诺",
+                    "--prompt",
+                    "默认短答。",
+                    "--example",
+                    "行，这样理解没问题。",
+                    "--style",
+                    "sweetness=0.35",
+                    "--style",
+                    "高冷=0.9",
+                    "--conversation-max-chars",
+                    "80",
+                    "--context",
+                    "task=0.35",
+                ]
+            )
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = persona_config_command(config, args)
+
+            self.assertEqual(result, 0)
+            payload = json.loads(
+                (config.data_dir / "config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["persona"]["name"], "苏诺")
+            self.assertEqual(
+                payload["persona"]["examples"],
+                ["行，这样理解没问题。"],
+            )
+            self.assertEqual(payload["persona"]["style"]["sweetness"], 0.35)
+            self.assertEqual(payload["persona"]["style"]["高冷"], 0.9)
+            self.assertEqual(
+                payload["persona"]["conversation_max_chars"],
+                80,
+            )
+            self.assertEqual(
+                payload["persona"]["context_intensity"]["task"],
+                0.35,
+            )
+            self.assertIn("已更新人物配置", output.getvalue())
+
     def test_enable_utf8_input_sets_terminal_flag(self) -> None:
         attributes = [0, 0, 0, 0, 0, 0, []]
         with (

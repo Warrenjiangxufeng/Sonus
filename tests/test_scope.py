@@ -105,6 +105,16 @@ class RequestScopeTests(unittest.TestCase):
         self.assertEqual(conversation_hint("加点卖萌的元素"), "ambiguous")
         self.assertEqual(conversation_hint("分析当前项目架构"), "task")
 
+    def test_explicit_relationship_setting_is_casual_conversation(self) -> None:
+        for text in (
+            "以后你是我女朋友",
+            "从今天起你是我姐姐，叫我阿峰",
+            "以后你不是我女朋友了",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(conversation_hint(text), "casual")
+                self.assertFalse(classify_request(text).allows_mutation)
+
     def test_open_browser_content_requires_command_not_network(self) -> None:
         scope = classify_request("查看已打开网页的展示内容，不是让你自己算")
         self.assertTrue(scope.allows_commands)

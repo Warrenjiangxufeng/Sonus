@@ -17,8 +17,11 @@ from sunus.config import (
     ProactiveConfig,
     redact_text,
 )
+from sunus.embodiment import embodiment_prompt
 from sunus.memory import MemoryStore, memory_context_text
 from sunus.model import ModelClient, ModelError
+from sunus.persona_expression import build_persona_expression
+from sunus.relationship import relationship_prompt, relationship_stage
 
 
 Clock = Callable[[], datetime]
@@ -514,6 +517,7 @@ class ProactiveService:
         config: ProactiveConfig,
         persona: PersonaConfig | None = None,
         random_source: random.Random | None = None,
+        action_catalog: tuple[dict[str, Any], ...] = (),
     ) -> None:
         self.model = model
         self.memory = memory
@@ -521,6 +525,11 @@ class ProactiveService:
         self.config = config
         self.persona = persona or PersonaConfig()
         self.random = random_source or random.Random()
+        self.action_catalog = {
+            str(item.get("name") or ""): dict(item)
+            for item in action_catalog
+            if str(item.get("name") or "")
+        }
         self._sequence_offset = 0
         self._last_intent = ""
 
@@ -536,10 +545,39 @@ class ProactiveService:
             window_hours=self.config.recent_memory_window_hours,
             limit=self.config.recent_memory_limit,
         )[: self.config.preference_items_in_context]
-        recent = self.memory.recent(scope=self.scope, limit=8)
         unresolved_projects = self._unresolved_project_evidence()
         custom_quirks = tuple(
             self.config.custom_quirks or self.config.custom_topics
+        )
+        heat_records = self.memory.recent(scope=self.scope, limit=24)
+        recent = heat_records[:8]
+        interaction_heat = self._interaction_heat(heat_records)
+        expression_profile = build_persona_expression(
+            self.persona,
+            context="chat",
+            interaction_heat=interaction_heat,
+            relationship_stage=relationship_stage(
+                self.persona.relationship
+            ),
+        )
+        relationship_query = " ".join(
+            value
+            for value in (
+                self.persona.relationship.label,
+                self.persona.relationship.sunus_role,
+                self.persona.relationship.user_role,
+                self.persona.relationship.address,
+            )
+            if value
+        )
+        relationship_recall = (
+            self.memory.search(
+                relationship_query,
+                scope=self.scope,
+                limit=8,
+            )
+            if self.persona.relationship.configured
+            else []
         )
         schedule = proactive_topic_schedule(self.config.topic_weights)
         if sequence_index is None:
@@ -653,6 +691,10 @@ class ProactiveService:
             topic_recall,
             label=f"{TOPIC_LABELS[base_topic]}定向召回",
         )
+        relationship_recall_text = memory_context_text(
+            relationship_recall,
+            label="关系相关候选记忆",
+        )
         persona_text = memory_context_text(
             persona_memories,
             label="Sunus 性格与互动习惯",
@@ -740,8 +782,39 @@ class ProactiveService:
             else "用户尚未填写自定义癖好；从明确记忆中自行发现一个真实兴趣，"
             "没有依据时提出低压力的开放问题。"
         )
+        action_context = (
+            json.dumps(
+                [
+                    {
+                        "name": name,
+                        "description": str(
+                            item.get("description") or ""
+                        )[:240],
+                        "parameters": item.get("parameters") or {},
+                    }
+                    for name, item in self.action_catalog.items()
+                ],
+                ensure_ascii=False,
+            )
+            if self.config.action_mode != "off"
+            else "[]"
+        )
         topic_label = TOPIC_LABELS[delivery_topic]
         topic_instruction = self._topic_instruction(topic, base_topic)
+        relationship_context = (
+            "用户明确设定的关系信息："
+            f"关系={self.persona.relationship.label or '未命名'}；"
+            f"Sunus角色={self.persona.relationship.sunus_role or '未指定'}；"
+            f"用户角色={self.persona.relationship.user_role or '未指定'}；"
+            f"称呼={self.persona.relationship.address or '未指定'}。"
+            "请结合真实记忆自行判断亲疏、关注方向和合适话题，"
+            "不要套用预设的关系类型模板。"
+            if self.persona.relationship.configured
+            else (
+                "未设置人物关系；按普通朋友的尊重和边界生成，"
+                "不得自行补恋爱、亲子或手足关系。"
+            )
+        )
         work_gate_context = (
             "已确认一条最近的项目记忆仍未完成，只有在需要时才可轻提一次。"
             if unresolved_projects
@@ -751,7 +824,8 @@ class ProactiveService:
 当前时段：{daypart}
 当前工作区：{self.scope}
 陪伴情境：{' '.join(presence_lines) if presence_lines else '没有额外情境，按已有记忆自然发言。'}
-本轮表达意图：{intent_label}。{intent_instruction}
+本轮参考表达动作：{intent_label}。{intent_instruction}
+它只用于避免表达单一，不是必须执行的指令；如果关系语境和真实记忆指向更合适的方式，可自行更换。
 配置的五类记忆配比：{distribution}
 本轮可用记忆类别配比：{eligible_distribution}
 本轮计划记忆类别：{TOPIC_LABELS[scheduled_topic]}
@@ -759,15 +833,21 @@ class ProactiveService:
 实际选择记忆类别：{topic_label}
 本轮侧重：{topic_instruction}
 工作消息闸门：{work_gate_context}
+关系语境：
+{relationship_context}
 {sunus_gender_context}
 {user_gender_context}
 {custom_context}
+可用主动动作（仅限这些只读工具；无必要动作时返回 null）：
+{action_context}
 
 {preference_text or "最近记忆中没有明确偏好。"}
 
 {recent_text or "最近没有可引用的交流。"}
 
 {topic_recall_text or "本轮主题没有额外的定向记忆命中。"}
+
+{relationship_recall_text or "没有额外的共同经历候选；不得虚构共同经历。"}
 
 {persona_text or "尚未积累稳定的 Sunus 性格或互动习惯记忆。"}
 
@@ -784,25 +864,14 @@ class ProactiveService:
 
 请生成下一条主动消息。"""
         persona_name = self.persona.name or "Sunus"
-        persona_style = dict(self.persona.style)
-        style_text = "、".join(
-            f"{label} {persona_style[key]:.0%}"
-            for key, label in (
-                ("sweetness", "甜度"),
-                ("playfulness", "卖萌度"),
-                ("warmth", "温暖度"),
-                ("independence", "独立性"),
-                ("initiative", "主动性"),
-            )
-            if key in persona_style
-        )
         examples_text = "\n".join(
             f"- {example}" for example in self.persona.examples
         )
+        expression_rules = expression_profile.prompt()
         persona_rules = (
             "\n人物设定（用于语气、性格和表达习惯）：\n"
             + self.persona.prompt
-            + (f"\n表达刻度：{style_text}。\n" if style_text else "")
+            + (f"\n{expression_rules}\n" if expression_rules else "")
             + (
                 "\n语气示例（只学习语感与性格，不照抄句子）：\n"
                 + examples_text
@@ -811,18 +880,28 @@ class ProactiveService:
                 else ""
             )
             + "\n"
-            if self.persona.prompt or style_text or examples_text
+            if self.persona.prompt or expression_rules or examples_text
             else ""
         )
+        relationship_rules = relationship_prompt(self.persona.relationship)
         system_prompt = f"""你是{persona_name}的主动陪伴模块。
 {persona_rules}
+{relationship_rules}
+{embodiment_prompt()}
+生成前在内部完成一次主动选题推理，不输出推理步骤：
+1. 关系理解：从用户明确设定、称呼和历史互动中理解双方角色、亲疏、边界与表达习惯，不套社会刻板印象。
+2. 证据汇集：从最近偏好、最近交流、关系候选记忆、定向召回、稳定性格和已发消息中找出可延续的人物、事件、兴趣、计划或未闭合话题。
+3. 候选生成：形成多个具体话题候选，每个候选至少绑定一条真实记忆或当前情境；删除只有“在干嘛/吃了吗”和无依据的内容。
+4. 选择判断：比较证据强度、关系适配、时效性、回复负担、新颖度和最近重复度，自行选择最自然的一项；需要时可以组合人物、事件和当前时段。
+5. 表达：按人物关系与性格刻度写成一句，不复述推理，也不把“参考话题”当成必须逐项执行的清单。
+关系只影响亲疏、称呼、关注方向和边界，不得反过来替代事实或替用户补全经历。
 生成一条自然、简短、具体的中文主动消息，只聚焦本轮指定主题。
 消息必须真正延续人物设定中的性格、关注点、措辞和反应方式，不能只是
 机械加“呀”“嘛”之类的语气词，也不能像客服或泛化助手在完成任务。
 五类主题分别对应五类 Sunus 记忆，长期按配比从可用记忆类别中选择：
 {distribution}。不得因为某类内容更容易生成，就跨类别借用其他记忆填充。
-默认写成一句自然的生活闲聊短语，最多两句，通常不超过 30 个汉字；
-像微信里顺口发来的一句话，不要写成分析、方案、安慰模板或客服话术。
+长度和结构由具体话题、关系与记忆决定；简单内容可以一句，需要承接细节时可以自然展开，
+但不要写成分析报告、方案清单、空泛安慰模板或客服话术。
 除工作门槛明确确认“有未解决项目”外，任何主题都不得提醒工作、追问进度或给任务建议。
 工作与 coding 只允许在门槛确认后出现，轻提一次即可，不催促、不制造紧迫感。
 日常与情绪、工作与 coding 必须优先使用“定向召回”中的近期真实记忆；
@@ -843,21 +922,34 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
 禁止客服腔、助手腔和说明文式开场；不要出现“作为一个AI”“有什么可以帮你”
 “希望对你有帮助”“根据你的描述”“首先”“其次”“用户”等表达。
 禁止使用标题、列表、表格、加粗、总结段和“建议你”“你可以尝试”等咨询口吻。
-只输出一条消息正文，不要加引号或前缀。"""
-        temperature = {
+不要写泛化陪伴保证、长期承诺或固定安慰句式；不要为了显得亲近而追加安抚、邀约或问题。
+最近对话已经收束时只写一句，写完即止。
+输出严格 JSON，不要代码围栏或额外说明：
+{{"message":"给用户看的消息正文","action":null}}
+如果本轮确实需要一个动作，返回：
+{{"message":"给用户看的消息正文","action":{{"tool":"工具名","arguments":{{}},"reason":"具体理由"}}}}
+动作必须是“可用主动动作”列表中的只读工具；最多一个，不得链式执行。
+没有明确收益时返回 null。message 只表达当前话题，不得声称动作已经成功。"""
+        temperature = min(1.0, {
             "work_coding": 0.55,
             "daily_emotion": 0.85,
             "self_evolution": 0.78,
             "user_gender": 0.82,
             "user_custom": 0.82,
-        }[base_topic]
+        }[base_topic] + expression_profile.temperature_bonus)
         try:
             text = self.model.complete(
                 system_prompt,
                 user_prompt,
-                max_tokens=120,
+                max_tokens=96,
                 temperature=temperature,
             )
+            (
+                text,
+                action,
+                response_format,
+                action_error,
+            ) = self._parse_generated_output(text)
             text = text.strip().strip('"').strip()
             if not text:
                 raise ModelError("主动消息为空")
@@ -869,10 +961,7 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
                 raise ModelError("主动闲聊生成了任务式内容")
             if _AI_LIKE_PATTERN.search(text):
                 raise ModelError("主动消息出现模板化或助手腔")
-            text = self._compact_message(
-                text,
-                limit=70 if base_topic == "work_coding" else 40,
-            )
+            text = self._compact_message(text, limit=120)
             if not text:
                 raise ModelError("主动消息为空")
             sent_texts = list(recent_messages or [])
@@ -907,6 +996,7 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
                             *preferences,
                             *recent,
                             *topic_recall,
+                            *relationship_recall,
                             *persona_memories,
                     *self_share_memories,
                             *learned_gender,
@@ -925,6 +1015,10 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
             "topic_index": topic_index + 1,
             "base_topic": base_topic,
             "generation_mode": "model",
+            "response_format": response_format,
+            "action": action,
+            "action_status": "proposed" if action else "none",
+            "action_error": action_error,
             "intent": intent_key,
             "intent_label": intent_label,
             "daypart": daypart,
@@ -970,6 +1064,26 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
             "self_share_memory_ids": [
                 item["id"] for item in self_share_memories
             ],
+            "relationship_configured": (
+                self.persona.relationship.configured
+            ),
+            "relationship_label": self.persona.relationship.label,
+            "relationship_memory_ids": [
+                item["id"] for item in relationship_recall
+            ],
+            "proactive_reasoning": "relationship_memory_chain",
+            "persona_expression": {
+                "style_text": expression_profile.style_text,
+                "rules": list(expression_profile.rules),
+                "temperature_bonus": (
+                    expression_profile.temperature_bonus
+                ),
+                "interaction_heat": expression_profile.interaction_heat,
+                "dynamic_delta": expression_profile.dynamic_delta,
+                "relationship_stage": (
+                    expression_profile.relationship_stage
+                ),
+            },
             "topic_recall_count": len(topic_recall),
         }
 
@@ -1006,6 +1120,10 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
                 "topic_weight": meta.get("topic_weight"),
                 "generation_mode": str(
                     meta.get("generation_mode") or ""
+                ),
+                "action_status": str(meta.get("action_status") or "none"),
+                "action_tool": str(
+                    (meta.get("action") or {}).get("tool") or ""
                 ),
                 "workspace": self.scope,
             },
@@ -1076,6 +1194,25 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
         return [latest] if unresolved else []
 
     @staticmethod
+    def _interaction_heat(records: list[dict[str, Any]]) -> float:
+        cutoff = datetime.now(timezone.utc).timestamp() - 24 * 3600
+        recent_user_turns = 0
+        for item in records:
+            if item.get("kind") != "episode":
+                continue
+            if "用户：" not in str(item.get("content") or ""):
+                continue
+            try:
+                created = datetime.fromisoformat(
+                    str(item.get("created_at") or "")
+                ).timestamp()
+            except ValueError:
+                continue
+            if created >= cutoff:
+                recent_user_turns += 1
+        return min(1.0, recent_user_turns / 6.0)
+
+    @staticmethod
     def _compact_message(text: str, *, limit: int) -> str:
         lines = [
             re.sub(r"^\s*(?:[-*#>]+|\d+[.)])\s*", "", line).strip()
@@ -1098,6 +1235,54 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
             return selected.strip()
         return cleaned[:limit].rstrip("，,；;：: ") + "…"
 
+    def _parse_generated_output(
+        self,
+        raw: str,
+    ) -> tuple[str, dict[str, Any] | None, str, str]:
+        value = str(raw or "").strip()
+        fenced = re.fullmatch(
+            r"```(?:json)?\s*(.*?)\s*```",
+            value,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if fenced:
+            value = fenced.group(1).strip()
+        if not value.startswith("{"):
+            return value, None, "plain", ""
+        try:
+            payload = json.loads(value)
+        except json.JSONDecodeError:
+            return str(raw or "").strip(), None, "plain", ""
+        if not isinstance(payload, dict):
+            return str(raw or "").strip(), None, "plain", ""
+        message = str(payload.get("message") or "").strip()
+        if not message:
+            return str(raw or "").strip(), None, "plain", ""
+        action = payload.get("action")
+        if action in (None, "", {}):
+            return message, None, "json", ""
+        if not isinstance(action, dict):
+            return message, None, "json", "action 必须是 object 或 null"
+        tool = str(action.get("tool") or "").strip()
+        arguments = action.get("arguments") or {}
+        reason = str(action.get("reason") or "").strip()[:300]
+        if self.config.action_mode == "off":
+            return message, None, "json", "主动动作已关闭"
+        if tool not in self.action_catalog:
+            return message, None, "json", f"主动动作不在白名单: {tool}"
+        if not isinstance(arguments, dict):
+            return message, None, "json", "动作 arguments 必须是 object"
+        return (
+            message,
+            {
+                "tool": tool,
+                "arguments": arguments,
+                "reason": reason,
+            },
+            "json",
+            "",
+        )
+
     @staticmethod
     def _message_key(text: str) -> str:
         return re.sub(
@@ -1116,20 +1301,22 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
             )
         return {
             "daily_emotion": (
-                "优先从定向召回的生活节奏、身体状态或情绪线索出发，"
-                "给一句轻量关心或自然闲聊；没有依据时只问一句当前感受。"
+                "先从定向召回和生活状态中判断是否有值得延续的具体细节；"
+                "可以关心、追问一个必要细节、分享观察或自然收束。"
+                "没有记忆依据时，从当前时段、关系和已发消息中选择低负担话题，"
+                "不必固定问候，也不必先追问感受。"
             ),
             "work_coding": (
-                "只围绕已确认未完成的最近项目，用一句生活化的话轻轻提一下；"
-                "不列待办、不追问进度、不说教。"
+                "只在已确认存在未完成项目时使用真实进展；"
+                "可轻提具体细节或等待自然时机，不列待办、不查岗、不说教。"
             ),
             "self_evolution": (
-                "从逐步积累的 Sunus 性格与互动习惯记忆中选一个稳定特征表达，"
-                "写成一句轻松自然的生活短句，不要编造经历或暴露隐藏推理。"
+                "从稳定的 Sunus 性格、互动习惯和当前关系中选择一个有连续性的表达角度；"
+                "可分享观察、偏好或当下想法，不编造经历，不暴露隐藏推理。"
             ),
             "user_custom": (
-                "优先围绕用户填写的癖好，写成一句顺口闲聊；未填写时从明确记忆"
-                "提炼一个真实兴趣，没有依据时只问一句轻量问题。"
+                "优先从用户填写或明确记忆中的兴趣寻找具体切入点；"
+                "可分享联想、问一个必要细节或发起低压话题，未确认的兴趣不得编造。"
             ),
         }[topic]
 

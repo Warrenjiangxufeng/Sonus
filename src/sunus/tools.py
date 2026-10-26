@@ -320,6 +320,36 @@ def tool_schemas() -> list[dict[str, Any]]:
             [],
         ),
         fn(
+            "search_memory",
+            "Search structured long-term memory through the SQLite/FTS index. "
+            "Use this for remembered facts, preferences, episodes, reviews, and "
+            "lessons; never search or read memory.db as a text file.",
+            {
+                "query": {"type": "string"},
+                "kind": {
+                    "type": "string",
+                    "enum": [
+                        "preference",
+                        "episode",
+                        "persona",
+                        "review",
+                        "lesson",
+                        "strategy",
+                        "self_share",
+                        "semantic",
+                    ],
+                    "description": "Optional memory kind filter.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20,
+                    "default": 8,
+                },
+            },
+            ["query"],
+        ),
+        fn(
             "remember",
             "Persist an explicitly requested durable preference, review, lesson, "
             "or episode. Use only when the user asks Sunus to remember or review.",
@@ -569,6 +599,7 @@ class ToolExecutor:
             "read_file": self._read_file,
             "list_files": self._list_files,
             "search_text": self._search_text,
+            "search_memory": self._search_memory,
             "memory_context_metrics": self._memory_context_metrics,
             "remember": self._remember,
             "inspect_environment": self._inspect_environment,
@@ -587,6 +618,7 @@ class ToolExecutor:
             "read_file",
             "list_files",
             "search_text",
+            "search_memory",
             "memory_context_metrics",
             "inspect_environment",
             "inspect_runtime_history",
@@ -1104,6 +1136,44 @@ class ToolExecutor:
         return ToolResult(
             ok=not timed_out and not failure,
             content=content + "\n\n[" + "; ".join(notes) + "]",
+        )
+
+    def _search_memory(self, args: dict[str, Any]) -> ToolResult:
+        if self.memory is None:
+            return ToolResult(False, "当前运行未配置记忆库")
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return ToolResult(False, "search_memory.query 不能为空")
+        kind = str(args.get("kind") or "").strip()
+        limit = max(1, min(20, int(args.get("limit", 8))))
+        rows = self.memory.search(
+            query,
+            scope=str(self.workspace.resolve()),
+            limit=20,
+        )
+        if kind:
+            rows = [row for row in rows if row.get("kind") == kind]
+        payload = [
+            {
+                "id": str(row.get("id") or ""),
+                "kind": str(row.get("kind") or ""),
+                "scope": str(row.get("scope") or ""),
+                "tags": str(row.get("tags") or ""),
+                "created_at": str(row.get("created_at") or ""),
+                "content": redact_text(str(row.get("content") or ""))[:2000],
+            }
+            for row in rows[:limit]
+        ]
+        return ToolResult(
+            True,
+            json.dumps(
+                {
+                    "query": query,
+                    "count": len(payload),
+                    "results": payload,
+                },
+                ensure_ascii=False,
+            ),
         )
 
     def _memory_context_metrics(self, args: dict[str, Any]) -> ToolResult:

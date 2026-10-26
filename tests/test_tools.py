@@ -28,6 +28,7 @@ class ToolTests(unittest.TestCase):
         self.assertIn("submit_result", names)
         self.assertIn("write_document", names)
         self.assertIn("memory_context_metrics", names)
+        self.assertIn("search_memory", names)
         self.assertIn("remember", names)
         self.assertIn("inspect_environment", names)
         self.assertIn("inspect_browser", names)
@@ -378,6 +379,31 @@ class ToolTests(unittest.TestCase):
             self.assertTrue(result.ok)
             self.assertIn("偏好", result.content)
             self.assertIn("exact=false", result.content)
+            memory.close()
+
+    def test_search_memory_uses_structured_index_instead_of_database_file(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            memory = MemoryStore(root / ".data" / "memory.db")
+            memory.add(
+                content="用户喜欢循环的歌曲是《你瞒我瞒》",
+                scope="global",
+                kind="preference",
+                status="supported",
+            )
+            executor = self.make_executor(root, memory=memory)
+            executor.begin_request("帮我查记忆里喜欢的歌")
+
+            result = executor.execute(
+                "search_memory",
+                {"query": "循环 歌曲", "kind": "preference", "limit": 5},
+            )
+
+            self.assertTrue(result.ok)
+            self.assertIn("你瞒我瞒", result.content)
+            self.assertNotIn("memory.db", result.content)
             memory.close()
 
     def test_outside_path_is_denied(self) -> None:

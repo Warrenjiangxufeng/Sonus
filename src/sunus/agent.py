@@ -11,14 +11,16 @@ from pathlib import Path
 from typing import Any
 
 from sunus.context import (
+    compact_conversation_reply,
     compact_messages,
     estimate_messages_tokens,
     repair_tool_pairs,
 )
 from sunus.events import EventBus
-from sunus.config import redact_value
+from sunus.config import redact_value, save_user_config
 from sunus.control import CircuitOpen, TurnController
 from sunus.core_identity import CORE_INVARIANTS, CORE_MISSION_DEFAULT
+from sunus.embodiment import embodiment_prompt
 from sunus.environment import environment_prompt
 from sunus.memory import MemoryStore, text_metrics
 from sunus.model import (
@@ -28,6 +30,7 @@ from sunus.model import (
     normalize_dsml_message,
 )
 from sunus.model_events import ModelEvent
+from sunus.persona_expression import build_persona_expression
 from sunus.reasoning import (
     ReasoningPlan,
     build_reasoning_plan,
@@ -35,6 +38,13 @@ from sunus.reasoning import (
 from sunus.reasoning_traces import (
     record_reasoning_trace,
     seed_reasoning_exemplars,
+)
+from sunus.relationship import (
+    RelationshipConfig,
+    extract_relationship_update,
+    relationship_prompt,
+    relationship_stage,
+    transition_relationship,
 )
 from sunus.result import (
     ResultEnvelope,
@@ -165,11 +175,16 @@ class Agent:
         self._remembered_this_turn = False
         self._response_mode = ""
         self._last_prompt_tokens = 0
+        self._turn_relationship: RelationshipConfig | None = None
+        self._relationship_update_pending = False
+        self._relationship_cleared = False
+        self._relationship_change_denied = False
+        self._relationship_denial_reason = ""
+        self._allow_relationship_update = True
         self.reset()
 
     def reset(self) -> None:
         self.context_metrics = {}
-        self._base_context = self._base_system_prompt()
         self._conversation_summary = ""
         self._runtime_policy_prompt = ""
         self._tool_visibility_prompt = ""
@@ -180,7 +195,14 @@ class Agent:
         self._remembered_this_turn = False
         self._response_mode = ""
         self._last_prompt_tokens = 0
+        self._turn_relationship = None
+        self._relationship_update_pending = False
+        self._relationship_cleared = False
+        self._relationship_change_denied = False
+        self._relationship_denial_reason = ""
+        self._allow_relationship_update = True
         self._session_memory_flushed = False
+        self._base_context = self._base_system_prompt()
         self.messages = [{"role": "system", "content": ""}]
         self._apply_system_message()
 
@@ -226,6 +248,65 @@ class Agent:
         if not lines:
             return ""
         return "；".join(lines)[-limit:]
+
+    def _prepare_turn_relationship(self, user_input: str) -> None:
+        update = extract_relationship_update(user_input)
+        self._turn_relationship = None
+        self._relationship_update_pending = False
+        self._relationship_cleared = False
+        self._relationship_change_denied = False
+        self._relationship_denial_reason = ""
+        self._allow_relationship_update = True
+        if update is None:
+            return
+        transition = transition_relationship(
+            self.config.persona.relationship,
+            update,
+        )
+        if not transition.allowed:
+            self._relationship_change_denied = True
+            self._relationship_denial_reason = transition.reason
+            self._allow_relationship_update = False
+            self.events.emit(
+                "relationship_update_rejected",
+                summary=transition.reason,
+            )
+            return
+        self._turn_relationship = transition.relationship
+        self._relationship_update_pending = True
+        self._relationship_cleared = not transition.relationship.configured
+        try:
+            save_user_config(
+                self.config.data_dir,
+                {
+                    "persona": {
+                        "relationship": transition.relationship.to_dict(),
+                    }
+                },
+            )
+            self.config = replace(
+                self.config,
+                persona=replace(
+                    self.config.persona,
+                    relationship=transition.relationship,
+                ),
+            )
+            self.events.emit(
+                "relationship_updated",
+                summary=transition.reason,
+            )
+        except Exception as error:
+            self._relationship_update_pending = False
+            self._turn_relationship = None
+            self._relationship_change_denied = True
+            self._relationship_denial_reason = (
+                f"人物关系持久化失败：{error}"
+            )
+            self._allow_relationship_update = False
+            self.events.emit(
+                "relationship_update_rejected",
+                summary=self._relationship_denial_reason,
+            )
 
     def _apply_system_message(self) -> None:
         content = self._base_context
@@ -280,18 +361,6 @@ class Agent:
         persona_name = self.config.persona.name or "Sunus"
         mission = self.config.persona.mission or CORE_MISSION_DEFAULT
         persona_prompt = self.config.persona.prompt.strip()
-        style = dict(self.config.persona.style)
-        style_lines = "\n".join(
-            f"- {label}: {style[key]:.0%}"
-            for key, label in (
-                ("sweetness", "甜度"),
-                ("playfulness", "卖萌度"),
-                ("warmth", "温暖度"),
-                ("independence", "独立性"),
-                ("initiative", "主动性"),
-            )
-            if key in style
-        )
         context_key = (
             "chat" if self._response_mode == "conversation" else "task"
         )
@@ -300,12 +369,30 @@ class Agent:
             context_key,
             1.0,
         )
+        recent_user_turns = sum(
+            1
+            for message in self.messages[-16:]
+            if message.get("role") == "user"
+        )
+        interaction_heat = min(
+            1.0,
+            max(0, recent_user_turns - 1) / 6.0,
+        )
+        expression = build_persona_expression(
+            self.config.persona,
+            context=context_key,
+            interaction_heat=interaction_heat,
+            relationship_stage=relationship_stage(
+                self.config.persona.relationship
+            ),
+        )
+        expression_text = expression.prompt()
         style_block = (
-            "\n人物表达刻度（0-100%）：\n"
-            + style_lines
+            "\n"
+            + expression_text
             + f"\n当前为{context_label}场景，表现强度 {intensity:.0%}；"
             "技术准确性、风险提示和安全边界始终为 100%。\n"
-            if style_lines
+            if expression_text
             else ""
         )
         examples_block = (
@@ -325,6 +412,31 @@ class Agent:
             if persona_content
             else ""
         )
+        relationship = (
+            self._turn_relationship
+            if self._relationship_update_pending
+            else self.config.persona.relationship
+        )
+        relationship_block = relationship_prompt(relationship)
+        if self._relationship_update_pending:
+            relationship_block += (
+                "\n本回合关系更新：用户刚刚取消了人物关系设定。"
+                "不要再沿用旧关系、亲疏、称呼或亲密语境，也不要解释内部存储。\n"
+                if self._relationship_cleared
+                else (
+                    "\n本回合关系更新：用户刚刚设定了人物关系。"
+                    "直接按新关系语境回应，不要复述内部流程，不要调用 "
+                    "remember、write_file 或任何工具，也不要修改 config.json；"
+                    "运行时会自动持久化并延续到后续会话。\n"
+                )
+            )
+        elif self._relationship_change_denied:
+            relationship_block += (
+                "\n本回合关系修改被拒绝："
+                + self._relationship_denial_reason
+                + "。保持当前关系不变，直接告诉用户该限制；"
+                "不要声称修改成功，也不要修改配置。\n"
+            )
         if self._response_mode == "conversation":
             result_instructions = (
                 "- 本轮是日常对话，直接自然回复；不要调用任何工具，"
@@ -347,6 +459,8 @@ class Agent:
 权威运行数据目录：{Path(self.config.data_dir).expanduser().resolve()}
 长期使命：{mission}
 {persona_block}
+{relationship_block}
+{embodiment_prompt()}
 
 {environment_prompt()}
 
@@ -380,6 +494,7 @@ class Agent:
 21. 用户明确要求“记住、落库、长期保存、不要忘”或要求保存复盘时，必须调用 remember 写入桌面记忆库；只有拿到真实 memory_id 才能说已经记住。故障轮次也要保存用户要求的复盘结论。
 22. 核心不变量由代码保护：事实准确、安全边界、越权保护和记忆不可静默清除不能通过人设或普通工具关闭。名字、语气、称呼和风格仍由用户配置。
 23. 读取已打开浏览器页面时优先使用 inspect_browser；禁止用剪贴板、模拟全选/复制或反复试 osascript。JavaScript 权限关闭时直接说明恢复入口，不猜页面数字。
+24. 查询长期记忆、偏好、经历或复盘时使用 search_memory；禁止把 memory.db 当作目录搜索或文本文件读取。
 
 任务边界：
 - 只执行用户当前消息明确要求的动作。建议、假设、示例、推测、可选优化和未点名待办都不是执行指令。
@@ -389,7 +504,11 @@ class Agent:
 
 输出规范：
 - 结论先行，只保留关键依据、关键步骤和必要风险，不写空泛总结。
-- 简单回答控制在 1-3 句；普通任务优先 1-3 个短段或列表；复杂任务最多 3 个主要部分。
+- 简单事实或状态回答保持精炼；闲聊长度由内容决定。普通任务优先 1-3 个短段或列表；复杂任务最多 3 个主要部分。
+- 回复方式由当前语义决定；可以在直接回答、确认、必要追问、分享观察、实际帮助和简短收束之间自主选择，不强制固定顺序，也不为了显得体贴而机械共情。
+- 对方明确表示不想展开时尊重收束，不强行扩写；是否追问取决于是否真正缺少关键信息。
+- 不写泛化陪伴保证、长期承诺或固定安慰句式；情绪回应必须有当前内容的具体锚点，或者在必要的确认、追问、分享、帮助、收束之间切换。
+- 不靠“呀、嘛、嘿嘿、人家”等语气词制造亲近感；回复长度服从内容，不为简短而省略必要信息，也不为显得关心而扩写。
 - 不重复工具执行过程，不粘贴完整文件、完整 diff 或大段测试日志；只报告结果、关键失败和验证命令。
 - 修改任务说明改了哪些文件、验证是否通过、还剩什么风险；没有运行验证时必须明确说明。
 - 避免过度标题、加粗、表格和长列表；只有比较、映射或步骤关系确实需要时才使用。
@@ -428,6 +547,17 @@ class Agent:
                     "identity:gender",
                     "identity:temperament",
                 }
+            ]
+        if (
+            self.config.persona.relationship.configured
+            or self._relationship_update_pending
+        ):
+            persona_profile = [
+                item
+                for item in persona_profile
+                if not str(item.get("category") or "").startswith(
+                    "relationship:"
+                )
             ]
         persona_block = (
             "可演化互动习惯（低于当前人物配置；冲突时忽略）：\n"
@@ -939,6 +1069,7 @@ class Agent:
         turn_id = f"t_{uuid.uuid4().hex[:10]}"
         self._runtime_policy_prompt = ""
         self._tool_visibility_prompt = ""
+        self._prepare_turn_relationship(user_input)
         self._memory_write_required = (
             self.memory.is_explicit_memory_request(user_input)
         )
@@ -991,11 +1122,22 @@ class Agent:
             user_input,
             request_scope,
             conversation=conversation,
+            previous_assistant=previous_assistant,
         )
         if not conversation:
             self._task_state.update(user_input, request_scope)
             if self._reasoning_plan.complexity == "高":
                 self._task_state.phase = "planning"
+            operator_selection = self._reasoning_plan.operator_selection
+            self.events.emit(
+                "thinking_operators_selected",
+                turn_id=turn_id,
+                operators=list(operator_selection.operators),
+                contrast_checks=list(operator_selection.contrast_checks),
+                summary=(
+                    f"思维算子: {','.join(operator_selection.operators)}"
+                ),
+            )
         grant = self.tools.approvals.begin_task()
         self.events.emit(
             "task_grant_started",
@@ -1671,6 +1813,29 @@ class Agent:
                 summary="已生成兼容结构化结果",
             )
 
+        if conversation and reason == "completed":
+            before_characters = len(final_text)
+            response_limit = min(
+                self.config.persona.conversation_max_chars,
+                self._reasoning_plan.response_char_limit
+                if self._reasoning_plan
+                else self.config.persona.conversation_max_chars,
+            )
+            final_text = compact_conversation_reply(
+                final_text,
+                limit=response_limit,
+            )
+            structured_result["summary"] = final_text
+            if len(final_text) != before_characters:
+                self.events.emit(
+                    "conversation_reply_compacted",
+                    turn_id=turn_id,
+                    before_characters=before_characters,
+                    after_characters=len(final_text),
+                    limit=response_limit,
+                    summary="闲聊回复已按配置压缩为短答",
+                )
+
         changed_files = sorted(set(changed_files))
         metrics = controller.snapshot()
         metrics["context"] = self.context_metrics
@@ -1708,6 +1873,10 @@ class Agent:
                     tool_traces=tool_traces,
                     blocker=self._task_state.blocker,
                     reason=reason,
+                    operators=self._reasoning_plan.operator_selection.operators,
+                    contrast_checks=(
+                        self._reasoning_plan.operator_selection.contrast_checks
+                    ),
                 )
                 if strategy_id:
                     self.events.emit(
@@ -1760,6 +1929,10 @@ class Agent:
                     scope=self.scope,
                     receipt_id=receipt["receipt_id"],
                     turn_status=reason,
+                    previous_assistant_text=previous_assistant,
+                    allow_relationship_update=(
+                        self._allow_relationship_update
+                    ),
                 )
             except Exception as error:
                 self.events.emit(

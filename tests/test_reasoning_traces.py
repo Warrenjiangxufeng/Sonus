@@ -42,6 +42,8 @@ class ReasoningTraceTests(unittest.TestCase):
                 ],
                 blocker="",
                 reason="completed",
+                operators=("演绎", "批判"),
+                contrast_checks=("检查前提和边界是否成立",),
             )
 
             self.assertIsNotNone(memory_id)
@@ -49,6 +51,8 @@ class ReasoningTraceTests(unittest.TestCase):
             self.assertEqual(row["status"], "supported")
             self.assertIn("successful", row["tags"])
             self.assertIn('"tool_sequence": ["inspect_browser"]', row["metadata"])
+            self.assertIn('"operators": ["演绎", "批判"]', row["metadata"])
+            self.assertIn("复核=检查前提和边界是否成立", row["content"])
             memory.close()
 
     def test_trace_and_turn_episode_do_not_overwrite_each_other(self) -> None:
