@@ -793,13 +793,18 @@ def build_components(
     )
     approvals = ApprovalManager(
         auto_approve=config.auto_approve,
+        persistent_permissions=dict(config.permission_modes),
         interactive=interactive,
         workspace=config.workspace,
         prompt_event=approval_event,
         before_prompt=approval_before_prompt,
         after_prompt=approval_after_prompt,
     )
-    path_guard = PathGuard(config.workspace, allow_outside=config.allow_outside)
+    path_guard = PathGuard(
+        config.workspace,
+        allow_outside=config.allow_outside,
+        write_allowlist=config.write_allowlist,
+    )
     artifacts = ArtifactStore(config.workspace, config.data_dir, config.api_key)
     tools = ToolExecutor(
         workspace=config.workspace,
@@ -835,6 +840,7 @@ def build_components(
         config.proactive,
         session_name,
     )
+    tools.proactive_scheduler = scheduler
     model: ModelClient | None = None
     proactive: ProactiveService | None = None
     agent: Agent | None = None
@@ -938,6 +944,15 @@ def _execute_proactive_action(
         meta["action_status"] = "proposed"
         return
     tool_name = str(action.get("tool") or "")
+    if not _proactive_message_announces_action(text, tool_name):
+        meta["action_status"] = "skipped"
+        meta["action_error"] = "主动消息未明确表达与该工具一致的操作意图"
+        components.events.emit(
+            "proactive_action_skipped",
+            tool=tool_name,
+            summary=meta["action_error"],
+        )
+        return
     arguments = action.get("arguments")
     spec = components.tools.registry.get(tool_name)
     allowed = set(components.config.proactive.action_tools)
@@ -1054,6 +1069,95 @@ def _execute_proactive_action(
     )
 
 
+_PROACTIVE_ACTION_CLAIM = re.compile(
+    r"(?:我|让我|帮你|替你).{0,24}"
+    r"(?:查|找|搜|看(?:看|一下|一眼|下)|检查|确认|整理|记录|保存|写入|写进|"
+    r"运行|执行|测试|打开|浏览|回顾|翻看|回忆|删|覆盖)"
+)
+_PROACTIVE_TOOL_TERMS = {
+    "search_memory": re.compile(
+        r"(?:记忆|之前|上次|以前|说过|计划|安排|偏好|喜好|回忆)"
+    ),
+    "inspect_runtime_history": re.compile(
+        r"(?:运行历史|会话记录|历史记录|最近记录|执行记录|时间线)"
+    ),
+    "inspect_environment": re.compile(
+        r"(?:环境|配置|系统|设备|运行状态|项目状态)"
+    ),
+    "inspect_browser": re.compile(
+        r"(?:浏览器|网页|页面|网站)"
+    ),
+    "write_file": re.compile(
+        r"(?:文件|保存|写入|写进|整理成|新建)"
+    ),
+    "run_command": re.compile(
+        r"(?:命令|终端|脚本|运行|执行|测试|(?i:playwright)|删|覆盖|创建)"
+    ),
+}
+
+
+def _proactive_message_announces_action(text: str, tool_name: str) -> bool:
+    clean = " ".join(str(text or "").split())
+    if not clean or not _PROACTIVE_ACTION_CLAIM.search(clean):
+        return False
+    terms = _PROACTIVE_TOOL_TERMS.get(tool_name)
+    return bool(terms and terms.search(clean))
+
+
+def _proactive_status_payload(scheduler: ProactiveScheduler) -> dict[str, Any]:
+    payload = dict(scheduler.status().__dict__)
+    payload["tasks"] = [
+        {
+            "id": task.id,
+            "name": task.name,
+            "instruction": task.instruction,
+            "tool": task.tool,
+            "target_path_template": task.target_path_template,
+            "cadence": task.cadence,
+            "not_before": task.not_before,
+            "status": task.status,
+            "next_due_at": datetime.fromtimestamp(
+                task.next_due_at,
+                tz=datetime.now().astimezone().tzinfo,
+            ).isoformat(),
+            "source_memory_id": task.source_memory_id,
+        }
+        for task in scheduler.list_tasks()
+    ]
+    return payload
+
+
+def _execute_proactive_action_with_task(
+    components: Components,
+    text: str,
+    meta: dict[str, Any],
+) -> bool:
+    _execute_proactive_action(components, text, meta)
+    task = meta.get("proactive_task")
+    if not isinstance(task, dict) or not task.get("id"):
+        return True
+    task_id = str(task["id"])
+    if meta.get("action_status") == "completed":
+        components.scheduler.complete_task(task_id)
+        meta["proactive_task_status"] = "completed"
+        components.events.emit(
+            "proactive_task_completed",
+            task_id=task_id,
+            tool=str((meta.get("action") or {}).get("tool") or ""),
+            summary="主动待办已完成",
+        )
+        return True
+    components.scheduler.defer_task(task_id, 60)
+    meta["proactive_task_status"] = "deferred"
+    components.events.emit(
+        "proactive_task_deferred",
+        task_id=task_id,
+        status=str(meta.get("action_status") or "failed"),
+        summary="主动待办未完成，稍后重试",
+    )
+    return False
+
+
 def due_message(components: Components) -> None:
     if (
         not components.config.proactive.enabled
@@ -1075,12 +1179,19 @@ def due_message(components: Components) -> None:
         return
     tty = sys.stdout.isatty()
     try:
+        pending_task = components.scheduler.due_task()
         text, meta = components.proactive.generate(
             components.scheduler.recent_message_texts(5),
             sequence_index=components.scheduler.current_topic_index(),
             presence=PresenceContext(idle_seconds=idle_seconds),
+            pending_task=pending_task,
         )
-        _execute_proactive_action(components, text, meta)
+        if not _execute_proactive_action_with_task(
+            components,
+            text,
+            meta,
+        ):
+            raise RuntimeError("主动待办动作未完成")
         message_id = components.scheduler.record_message(text)
         memory_id = _remember_proactive_delivery(
             components,
@@ -1522,7 +1633,13 @@ def handle_slash(command: str, components: Components) -> bool:
     elif name == "/proactive":
         action = parts[1].lower() if len(parts) > 1 else "status"
         if action == "status":
-            print(json.dumps(components.scheduler.status().__dict__, ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    _proactive_status_payload(components.scheduler),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
         elif action == "ratios":
             try:
                 updated, path = update_proactive_ratios(
@@ -1582,6 +1699,7 @@ def handle_slash(command: str, components: Components) -> bool:
                 try:
                     text, meta = components.proactive.generate(
                         sequence_index=components.scheduler.current_topic_index(),
+                        pending_task=components.scheduler.due_task(),
                     )
                 except Exception as error:
                     components.scheduler.mark_failed()
@@ -1592,7 +1710,13 @@ def handle_slash(command: str, components: Components) -> bool:
                     )
                     print("主动消息生成失败，本次未发送。")
                     return True
-                _execute_proactive_action(components, text, meta)
+                if not _execute_proactive_action_with_task(
+                    components,
+                    text,
+                    meta,
+                ):
+                    print("主动待办动作未完成，本次未发送。")
+                    return True
                 message_id = components.scheduler.record_message(text)
                 memory_id = _remember_proactive_delivery(
                     components,
@@ -2009,7 +2133,13 @@ def proactive_command(
     )
     try:
         if action == "status":
-            print(json.dumps(components.scheduler.status().__dict__, ensure_ascii=False, indent=2))
+            print(
+                json.dumps(
+                    _proactive_status_payload(components.scheduler),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
         elif action == "pause":
             components.scheduler.pause()
             print("主动陪伴已暂停。")
@@ -2041,6 +2171,7 @@ def proactive_command(
             try:
                 text, meta = components.proactive.generate(
                     sequence_index=components.scheduler.current_topic_index(),
+                    pending_task=components.scheduler.due_task(),
                 )
             except Exception as error:
                 components.scheduler.mark_failed()
@@ -2051,7 +2182,13 @@ def proactive_command(
                 )
                 print(f"主动消息生成失败，本次未发送：{error}", file=sys.stderr)
                 return 1
-            _execute_proactive_action(components, text, meta)
+            if not _execute_proactive_action_with_task(
+                components,
+                text,
+                meta,
+            ):
+                print("主动待办动作未完成，本次未发送。", file=sys.stderr)
+                return 1
             message_id = components.scheduler.record_message(text)
             memory_id = _remember_proactive_delivery(
                 components,

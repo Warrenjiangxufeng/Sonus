@@ -67,6 +67,47 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(server.startup_timeout_sec, 7)
             self.assertEqual(server.tool_timeout_sec, 11)
 
+    def test_reads_persistent_permission_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / "data"
+            data.mkdir()
+            diary = data / "diary"
+            (data / "config.json").write_text(
+                json.dumps(
+                    {
+                        "runtime": {
+                            "permissions": {
+                                "write": "allow",
+                                "command": "deny",
+                                "network": "auto",
+                                "write_allowlist": [str(diary)],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "SUNUS_DATA_DIR": str(data),
+                    "SUNUS_API_KEY": "sk-test-env",
+                },
+                clear=False,
+            ):
+                config = resolve_config(root / "workspace")
+
+            self.assertEqual(
+                dict(config.permission_modes),
+                {
+                    "write": "allow",
+                    "command": "deny",
+                    "network": "auto",
+                },
+            )
+            self.assertEqual(config.write_allowlist, (diary.resolve(),))
+
     def test_reads_sunus_deepseek_provider(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "config.toml"

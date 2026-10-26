@@ -35,6 +35,10 @@ class ToolRegistryTests(unittest.TestCase):
             write = tools.registry.get("write_file")
             command = tools.registry.get("run_command")
             authorization = tools.registry.get("request_authorization")
+            configure_permissions = tools.registry.get("configure_permissions")
+            schedule_proactive = tools.registry.get(
+                "schedule_proactive_file_write"
+            )
             runtime_history = tools.registry.get("inspect_runtime_history")
             memory_search = tools.registry.get("search_memory")
             browser = tools.registry.get("inspect_browser")
@@ -51,6 +55,12 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertFalse(command.parallel_safe)
             self.assertFalse(authorization.read_only)
             self.assertFalse(authorization.parallel_safe)
+            self.assertFalse(configure_permissions.read_only)
+            self.assertFalse(configure_permissions.parallel_safe)
+            self.assertEqual(configure_permissions.risk, "R1")
+            self.assertFalse(schedule_proactive.read_only)
+            self.assertFalse(schedule_proactive.parallel_safe)
+            self.assertEqual(schedule_proactive.risk, "R1")
             self.assertTrue(runtime_history.read_only)
             self.assertTrue(runtime_history.parallel_safe)
             self.assertTrue(memory_search.read_only)
@@ -77,6 +87,8 @@ class ToolRegistryTests(unittest.TestCase):
                     "patch_file",
                     "run_command",
                     "request_authorization",
+                    "configure_permissions",
+                    "schedule_proactive_file_write",
                     "fetch_url",
                     "list_skills",
                     "read_skill",

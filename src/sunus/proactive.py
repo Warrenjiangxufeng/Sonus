@@ -7,7 +7,7 @@ import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -213,6 +213,20 @@ class ProactiveStatus:
     topic_index: int
 
 
+@dataclass(frozen=True)
+class ProactiveTask:
+    id: str
+    name: str
+    instruction: str
+    tool: str
+    target_path_template: str
+    cadence: str
+    not_before: str
+    status: str
+    next_due_at: float
+    source_memory_id: str
+
+
 class ProactiveScheduler:
     def __init__(
         self,
@@ -247,6 +261,21 @@ class ProactiveScheduler:
                     text TEXT NOT NULL,
                     fingerprint TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS proactive_tasks (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    instruction TEXT NOT NULL,
+                    tool TEXT NOT NULL DEFAULT 'write_file',
+                    target_path_template TEXT NOT NULL DEFAULT '',
+                    cadence TEXT NOT NULL DEFAULT 'once',
+                    not_before TEXT NOT NULL DEFAULT '20:00',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    next_due_at REAL NOT NULL,
+                    last_completed_at REAL,
+                    source_memory_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
                 """
             )
@@ -506,6 +535,219 @@ class ProactiveScheduler:
         ).fetchall()
         return [str(row["text"]) for row in rows]
 
+    @staticmethod
+    def _task_from_row(row: sqlite3.Row) -> ProactiveTask:
+        return ProactiveTask(
+            id=str(row["id"]),
+            name=str(row["name"]),
+            instruction=str(row["instruction"]),
+            tool=str(row["tool"]),
+            target_path_template=str(row["target_path_template"]),
+            cadence=str(row["cadence"]),
+            not_before=str(row["not_before"]),
+            status=str(row["status"]),
+            next_due_at=float(row["next_due_at"]),
+            source_memory_id=str(row["source_memory_id"]),
+        )
+
+    def _task_target(self, task: ProactiveTask, now: datetime) -> Path:
+        rendered = task.target_path_template.replace(
+            "{date}",
+            now.date().isoformat(),
+        )
+        target = Path(rendered).expanduser()
+        if not target.is_absolute():
+            target = self.db_path.parent / target
+        return target.resolve(strict=False)
+
+    def create_task(
+        self,
+        *,
+        name: str,
+        instruction: str,
+        target_path_template: str,
+        cadence: str = "once",
+        not_before: str = "20:00",
+        source_memory_id: str = "",
+    ) -> ProactiveTask:
+        clean_name = str(name or "").strip()
+        clean_instruction = str(instruction or "").strip()
+        clean_path = str(target_path_template or "").strip()
+        clean_cadence = str(cadence or "once").strip().lower()
+        clean_not_before = str(not_before or "20:00").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,48}", clean_name):
+            raise ValueError("待办名称只能包含字母、数字、点、横线和下划线")
+        if not clean_instruction:
+            raise ValueError("待办说明不能为空")
+        if not clean_path:
+            raise ValueError("待办目标路径不能为空")
+        if clean_cadence not in {"once", "daily"}:
+            raise ValueError("待办 cadence 必须是 once 或 daily")
+        match = re.fullmatch(r"(\d{2}):(\d{2})", clean_not_before)
+        if (
+            match is None
+            or int(match.group(1)) > 23
+            or int(match.group(2)) > 59
+        ):
+            raise ValueError("待办 not_before 必须是 HH:MM")
+
+        now_dt = self.clock().astimezone()
+        next_due = now_dt.timestamp()
+        if clean_cadence == "daily":
+            hour, minute = (
+                int(match.group(1)),
+                int(match.group(2)),
+            )
+            eligible_at = datetime.combine(
+                now_dt.date(),
+                time(hour=hour, minute=minute),
+                tzinfo=now_dt.tzinfo,
+            )
+            if now_dt < eligible_at:
+                next_due = eligible_at.timestamp()
+
+        existing = self._connection.execute(
+            "SELECT id FROM proactive_tasks WHERE name = ?",
+            (clean_name,),
+        ).fetchone()
+        task_id = (
+            str(existing["id"])
+            if existing is not None
+            else f"pt_{uuid.uuid4().hex[:12]}"
+        )
+        now_iso = datetime.fromtimestamp(
+            now_dt.timestamp(),
+            timezone.utc,
+        ).isoformat()
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO proactive_tasks(
+                    id, name, instruction, tool, target_path_template,
+                    cadence, not_before, status, next_due_at,
+                    source_memory_id, created_at, updated_at
+                ) VALUES (?, ?, ?, 'write_file', ?, ?, ?, 'active', ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                    instruction = excluded.instruction,
+                    tool = excluded.tool,
+                    target_path_template = excluded.target_path_template,
+                    cadence = excluded.cadence,
+                    not_before = excluded.not_before,
+                    status = 'active',
+                    next_due_at = excluded.next_due_at,
+                    source_memory_id = excluded.source_memory_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    task_id,
+                    clean_name,
+                    clean_instruction[:4000],
+                    clean_path,
+                    clean_cadence,
+                    clean_not_before,
+                    next_due,
+                    str(source_memory_id or "").strip(),
+                    now_iso,
+                    now_iso,
+                ),
+            )
+        row = self._connection.execute(
+            "SELECT * FROM proactive_tasks WHERE name = ?",
+            (clean_name,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("无法保存主动待办")
+        return self._task_from_row(row)
+
+    def list_tasks(self, *, status: str = "") -> list[ProactiveTask]:
+        sql = "SELECT * FROM proactive_tasks"
+        parameters: tuple[Any, ...] = ()
+        if status:
+            sql += " WHERE status = ?"
+            parameters = (status,)
+        sql += " ORDER BY next_due_at, name"
+        return [
+            self._task_from_row(row)
+            for row in self._connection.execute(sql, parameters).fetchall()
+        ]
+
+    def due_task(self) -> ProactiveTask | None:
+        now_dt = self.clock().astimezone()
+        rows = self._connection.execute(
+            """
+            SELECT * FROM proactive_tasks
+            WHERE status = 'active' AND next_due_at <= ?
+            ORDER BY next_due_at, name
+            """,
+            (now_dt.timestamp(),),
+        ).fetchall()
+        for row in rows:
+            task = self._task_from_row(row)
+            if task.tool == "write_file":
+                target = self._task_target(task, now_dt)
+                if target.exists():
+                    self.complete_task(task.id)
+                    continue
+            return task
+        return None
+
+    def complete_task(self, task_id: str) -> None:
+        row = self._connection.execute(
+            "SELECT * FROM proactive_tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return
+        task = self._task_from_row(row)
+        now_dt = self.clock().astimezone()
+        status = "completed"
+        next_due_at = task.next_due_at
+        if task.cadence == "daily":
+            hour, minute = (
+                int(task.not_before[:2]),
+                int(task.not_before[3:]),
+            )
+            next_due = datetime.combine(
+                now_dt.date() + timedelta(days=1),
+                time(hour=hour, minute=minute),
+                tzinfo=now_dt.tzinfo,
+            )
+            status = "active"
+            next_due_at = next_due.timestamp()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE proactive_tasks
+                SET status = ?, next_due_at = ?, last_completed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    next_due_at,
+                    now_dt.timestamp(),
+                    now_iso,
+                    task_id,
+                ),
+            )
+
+    def defer_task(self, task_id: str, seconds: int = 60) -> None:
+        now = self.clock().timestamp()
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE proactive_tasks
+                SET next_due_at = ?, updated_at = ?
+                WHERE id = ? AND status = 'active'
+                """,
+                (
+                    now + max(1, int(seconds)),
+                    datetime.now(timezone.utc).isoformat(),
+                    task_id,
+                ),
+            )
+
 
 class ProactiveService:
     def __init__(
@@ -539,7 +781,14 @@ class ProactiveService:
         *,
         sequence_index: int | None = None,
         presence: PresenceContext | None = None,
+        pending_task: ProactiveTask | None = None,
     ) -> tuple[str, dict[str, Any]]:
+        now = datetime.now().astimezone()
+        task_path = (
+            self._task_target(pending_task, now)
+            if pending_task is not None
+            else None
+        )
         preferences = self.memory.recent_preferences(
             scope=self.scope,
             window_hours=self.config.recent_memory_window_hours,
@@ -597,6 +846,10 @@ class ProactiveService:
         topic = eligible_schedule[topic_index % len(eligible_schedule)]
         base_topic = topic
         topic_weight = dict(eligible_weights).get(topic, 0)
+        if pending_task is not None:
+            topic = "daily_emotion"
+            base_topic = "daily_emotion"
+            topic_weight = 0
         intent_candidates = {
             "daily_emotion": ("care", "curious", "playful"),
             "work_coding": ("care", "curious"),
@@ -604,6 +857,8 @@ class ProactiveService:
             "user_gender": ("care", "playful", "share"),
             "user_custom": ("curious", "share", "care"),
         }[base_topic]
+        if pending_task is not None:
+            intent_candidates = ("share", "care")
         choices = tuple(
             key
             for key in intent_candidates
@@ -717,7 +972,6 @@ class ProactiveService:
             label="用户癖好学习证据",
         )
         history = "\n".join(f"- {item}" for item in (recent_messages or []))
-        now = datetime.now().astimezone()
         daypart = (
             "凌晨"
             if now.hour < 6
@@ -820,6 +1074,21 @@ class ProactiveService:
             if unresolved_projects
             else "本轮没有未解决项目的明确证据；禁止发送工作提醒、进度追问或任务建议。"
         )
+        task_context = (
+            f"- 待办 ID：{pending_task.id}\n"
+            f"- 名称：{pending_task.name}\n"
+            f"- 指令：{pending_task.instruction}\n"
+            f"- 唯一目标文件：{task_path}\n"
+            "- 完成判定：该文件尚不存在。"
+            if pending_task is not None and task_path is not None
+            else "本轮没有到期的主动待办。"
+        )
+        task_topic_instruction = (
+            "优先执行待执行主动待办，不要退回普通闲聊。消息必须明确写出"
+            "正在把内容写进目标文件，并返回 write_file 动作。"
+            if pending_task is not None
+            else topic_instruction
+        )
         user_prompt = f"""当前时间：{now:%Y-%m-%d %H:%M %Z}
 当前时段：{daypart}
 当前工作区：{self.scope}
@@ -831,14 +1100,16 @@ class ProactiveService:
 本轮计划记忆类别：{TOPIC_LABELS[scheduled_topic]}
 （{scheduled_topic_weight}%，序列 {topic_index + 1}）
 实际选择记忆类别：{topic_label}
-本轮侧重：{topic_instruction}
+本轮侧重：{task_topic_instruction}
 工作消息闸门：{work_gate_context}
+待执行主动待办（优先级高于普通五类话题）：
+{task_context}
 关系语境：
 {relationship_context}
 {sunus_gender_context}
 {user_gender_context}
 {custom_context}
-可用主动动作（仅限这些只读工具；无必要动作时返回 null）：
+可用主动动作（仅限这些受控工具；无必要动作时返回 null）：
 {action_context}
 
 {preference_text or "最近记忆中没有明确偏好。"}
@@ -888,12 +1159,14 @@ class ProactiveService:
 {persona_rules}
 {relationship_rules}
 {embodiment_prompt()}
-生成前在内部完成一次主动选题推理，不输出推理步骤：
+生成前快速完成一次轻量选题判断，不展开长推理，也不输出推理步骤：
 1. 关系理解：从用户明确设定、称呼和历史互动中理解双方角色、亲疏、边界与表达习惯，不套社会刻板印象。
 2. 证据汇集：从最近偏好、最近交流、关系候选记忆、定向召回、稳定性格和已发消息中找出可延续的人物、事件、兴趣、计划或未闭合话题。
 3. 候选生成：形成多个具体话题候选，每个候选至少绑定一条真实记忆或当前情境；删除只有“在干嘛/吃了吗”和无依据的内容。
 4. 选择判断：比较证据强度、关系适配、时效性、回复负担、新颖度和最近重复度，自行选择最自然的一项；需要时可以组合人物、事件和当前时段。
 5. 表达：按人物关系与性格刻度写成一句，不复述推理，也不把“参考话题”当成必须逐项执行的清单。
+如果存在“待执行主动待办”，它优先于五类话题和表达动作；必须完成该待办，
+不能改成普通关心、闲聊或只承诺以后再做。
 关系只影响亲疏、称呼、关注方向和边界，不得反过来替代事实或替用户补全经历。
 生成一条自然、简短、具体的中文主动消息，只聚焦本轮指定主题。
 消息必须真正延续人物设定中的性格、关注点、措辞和反应方式，不能只是
@@ -928,8 +1201,14 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
 {{"message":"给用户看的消息正文","action":null}}
 如果本轮确实需要一个动作，返回：
 {{"message":"给用户看的消息正文","action":{{"tool":"工具名","arguments":{{}},"reason":"具体理由"}}}}
-动作必须是“可用主动动作”列表中的只读工具；最多一个，不得链式执行。
-没有明确收益时返回 null。message 只表达当前话题，不得声称动作已经成功。"""
+默认 action 必须为 null。只有 message 本身已经明确写出 Sunus 正在或准备
+执行的具体操作，而且该操作确有收益时，才能返回同一个 action。
+没有待执行主动待办时，日常关心、情绪陪伴、性格、性别和癖好闲聊不得附加动作。
+存在待执行主动待办时，action 不得为 null：必须调用 write_file，
+path 必须使用“唯一目标文件”，content 必须满足待办指令；
+message 必须自然说明正在写进目标文件，不得声称写入已经成功。
+动作必须是“可用主动动作”列表中的工具；最多一个，不得链式执行。
+message 只表达当前话题，不得声称动作已经成功。"""
         temperature = min(1.0, {
             "work_coding": 0.55,
             "daily_emotion": 0.85,
@@ -941,7 +1220,7 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
             text = self.model.complete(
                 system_prompt,
                 user_prompt,
-                max_tokens=96,
+                max_tokens=256,
                 temperature=temperature,
             )
             (
@@ -980,6 +1259,12 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
             }
             if self._message_key(text) in sent_keys:
                 raise ModelError("主动消息与最近内容重复")
+            if pending_task is not None and task_path is not None:
+                self._validate_task_action(
+                    text,
+                    action,
+                    task_path,
+                )
         except Exception as error:
             detail = redact_text(
                 f"{type(error).__name__}: {error}",
@@ -987,22 +1272,28 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
             raise ModelError(
                 f"主动消息生成失败，本次不发送：{detail}"
             ) from error
+        task_memory_ids = (
+            [pending_task.source_memory_id]
+            if pending_task is not None and pending_task.source_memory_id
+            else []
+        )
+        related_memory_ids = [
+            item["id"]
+            for item in (
+                *preferences,
+                *recent,
+                *topic_recall,
+                *relationship_recall,
+                *persona_memories,
+                *self_share_memories,
+                *learned_gender,
+                *learned_custom,
+            )
+        ]
         return text, {
             "recent_memory_ids": list(
                 dict.fromkeys(
-                    [
-                        item["id"]
-                        for item in (
-                            *preferences,
-                            *recent,
-                            *topic_recall,
-                            *relationship_recall,
-                            *persona_memories,
-                    *self_share_memories,
-                            *learned_gender,
-                            *learned_custom,
-                        )
-                    ]
+                    [*task_memory_ids, *related_memory_ids]
                 )
             ),
             "preference_count": len(preferences),
@@ -1085,6 +1376,15 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
                 ),
             },
             "topic_recall_count": len(topic_recall),
+            "proactive_task": (
+                {
+                    "id": pending_task.id,
+                    "name": pending_task.name,
+                    "path": str(task_path),
+                }
+                if pending_task is not None and task_path is not None
+                else None
+            ),
         }
 
     def record_delivery(
@@ -1211,6 +1511,49 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
             if created >= cutoff:
                 recent_user_turns += 1
         return min(1.0, recent_user_turns / 6.0)
+
+    def _task_target(
+        self,
+        task: ProactiveTask,
+        now: datetime,
+    ) -> Path:
+        rendered = task.target_path_template.replace(
+            "{date}",
+            now.date().isoformat(),
+        )
+        target = Path(rendered).expanduser()
+        if not target.is_absolute():
+            target = Path(self.scope).expanduser() / target
+        return target.resolve(strict=False)
+
+    def _validate_task_action(
+        self,
+        text: str,
+        action: dict[str, Any] | None,
+        expected_path: Path,
+    ) -> None:
+        if not action:
+            raise ModelError("待执行主动待办没有返回动作")
+        if str(action.get("tool") or "") != "write_file":
+            raise ModelError("待执行主动待办必须使用 write_file")
+        arguments = action.get("arguments")
+        if not isinstance(arguments, dict):
+            raise ModelError("待执行主动待办缺少动作参数")
+        raw_path = str(arguments.get("path") or "").strip()
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = Path(self.scope).expanduser() / path
+        if path.resolve(strict=False) != expected_path.resolve(strict=False):
+            raise ModelError("待执行主动待办写入了错误路径")
+        if not str(arguments.get("content") or "").strip():
+            raise ModelError("待执行主动待办的文件内容为空")
+        if not re.search(
+            r"(?:写进|记进|记到|记录到|整理进|保存到).{0,8}"
+            r"(?:文件|日记|记录)"
+            r"|(?:文件|日记|记录).{0,8}(?:写|记|保存|整理)",
+            text,
+        ):
+            raise ModelError("主动消息没有明确说明正在写目标文件")
 
     @staticmethod
     def _compact_message(text: str, *, limit: int) -> str:

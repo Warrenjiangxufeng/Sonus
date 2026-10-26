@@ -226,6 +226,8 @@ class RuntimeConfig:
     request_timeout_sec: int = 120
     auto_approve: bool = False
     allow_outside: bool = False
+    permission_modes: tuple[tuple[str, str], ...] = ()
+    write_allowlist: tuple[Path, ...] = ()
     model_settings: ModelSettings = field(default_factory=ModelSettings)
     loop_budget: LoopBudgetConfig = field(default_factory=LoopBudgetConfig)
     proactive: ProactiveConfig = field(default_factory=ProactiveConfig)
@@ -247,6 +249,12 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
     "runtime": {
         "max_parallel_tools": 4,
         "streaming": True,
+        "permissions": {
+            "write": "auto",
+            "command": "auto",
+            "network": "auto",
+            "write_allowlist": [],
+        },
     },
     "mcp_servers": {},
     "persona": {
@@ -774,6 +782,35 @@ def resolve_config(
     runtime_payload = user.get("runtime", {})
     if not isinstance(runtime_payload, dict):
         raise ConfigError("runtime 必须是 JSON object")
+    permissions_payload = runtime_payload.get("permissions", {})
+    if not isinstance(permissions_payload, dict):
+        raise ConfigError("runtime.permissions 必须是 JSON object")
+    permission_modes: list[tuple[str, str]] = []
+    for capability in ("write", "command", "network"):
+        mode = str(permissions_payload.get(capability, "auto")).strip().lower()
+        if mode not in {"auto", "allow", "deny"}:
+            raise ConfigError(
+                f"runtime.permissions.{capability} 必须是 auto/allow/deny"
+            )
+        permission_modes.append((capability, mode))
+    raw_write_allowlist = permissions_payload.get("write_allowlist", [])
+    if not isinstance(raw_write_allowlist, list):
+        raise ConfigError(
+            "runtime.permissions.write_allowlist 必须是字符串数组"
+        )
+    write_allowlist: list[Path] = []
+    for raw_path in raw_write_allowlist:
+        value = str(raw_path).strip()
+        if not value:
+            continue
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = workspace / candidate
+        resolved = candidate.resolve(strict=False)
+        if resolved == Path("/"):
+            raise ConfigError("write_allowlist 不能包含文件系统根目录")
+        if resolved not in write_allowlist:
+            write_allowlist.append(resolved)
     raw_mcp_servers = user.get("mcp_servers", {})
     if not isinstance(raw_mcp_servers, dict):
         raise ConfigError("mcp_servers 必须是 JSON object")
@@ -937,6 +974,8 @@ def resolve_config(
         request_timeout_sec=max(10, int(user.get("request_timeout_sec", 120))),
         auto_approve=auto_approve,
         allow_outside=allow_outside,
+        permission_modes=tuple(permission_modes),
+        write_allowlist=tuple(write_allowlist),
         model_settings=model_settings,
         loop_budget=loop_budget,
         proactive=proactive,
@@ -1048,6 +1087,12 @@ def config_summary(config: RuntimeConfig) -> dict[str, Any]:
         "runtime": {
             "streaming": config.streaming,
             "max_parallel_tools": config.max_parallel_tools,
+            "permissions": {
+                **dict(config.permission_modes),
+                "write_allowlist": [
+                    str(path) for path in config.write_allowlist
+                ],
+            },
         },
         "mcp_servers": [
             {

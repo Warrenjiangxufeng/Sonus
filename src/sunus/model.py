@@ -505,19 +505,52 @@ class BaseModelClient:
         max_tokens: int = 512,
         temperature: float = 0.6,
     ) -> str:
-        reply = self.chat(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            tools=None,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        content = reply.message.get("content")
-        if not content:
-            raise ModelError("模型没有返回文本内容")
-        return str(content).strip()
+        requested_tokens = max(1, max_tokens)
+        reply: ModelReply | None = None
+        attempts = 3
+
+        def reasoning_token_count(value: ModelReply) -> int | None:
+            usage = value.usage if isinstance(value.usage, dict) else {}
+            details = usage.get("completion_tokens_details") or {}
+            if not isinstance(details, dict):
+                return None
+            raw = details.get("reasoning_tokens")
+            try:
+                return int(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        for attempt in range(attempts):
+            reply = self.chat(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                tools=None,
+                max_tokens=requested_tokens,
+                temperature=temperature,
+            )
+            content = str(reply.message.get("content") or "").strip()
+            if content and reply.finish_reason != "length":
+                return content
+            if attempt < attempts - 1:
+                reasoning_tokens = reasoning_token_count(reply)
+                requested_tokens = max(
+                    1024,
+                    requested_tokens * 2,
+                    (reasoning_tokens or 0) + 768,
+                )
+                requested_tokens = min(8192, requested_tokens)
+
+        if reply is None:
+            raise ModelError("模型请求未执行")
+        reasoning_tokens = reasoning_token_count(reply)
+        detail = f"finish_reason={reply.finish_reason or 'unknown'}"
+        if reasoning_tokens is not None:
+            detail += f", reasoning_tokens={reasoning_tokens}"
+        if reply.finish_reason == "length":
+            raise ModelError(f"模型输出因 token 上限被截断（{detail}）")
+        raise ModelError(f"模型没有返回文本内容（{detail}）")
 
     def classify_turn(
         self,

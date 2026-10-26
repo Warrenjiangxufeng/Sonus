@@ -34,6 +34,18 @@ CAPABILITY_ALIASES = {
     "网络": "network",
 }
 CAPABILITIES = frozenset(CAPABILITY_ALIASES.values())
+_EXPLICIT_PATH = re.compile(
+    r"(?<![\w])(?:~|\.{1,2})?/[^\s`'\"“”‘’，。！？；;：:（）()\[\]{}<>]+"
+    r"|(?<![\w])(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+"
+)
+_QUOTED_PATH = re.compile(r"`([^`]+)`|'([^']+)'|\"([^\"]+)\"|“([^”]+)”")
+_SENSITIVE_WRITE_PARTS = {
+    ".aws",
+    ".codex",
+    ".dsh",
+    ".ssh",
+    "Keychains",
+}
 
 
 def normalize_capabilities(values: Iterable[str]) -> set[str]:
@@ -55,13 +67,104 @@ class PolicyError(RuntimeError):
     pass
 
 
+def explicit_write_paths(text: str, workspace: Path) -> tuple[Path, ...]:
+    """Extract paths explicitly named in the current user request."""
+    root = workspace.expanduser().resolve()
+    candidates: list[str] = []
+    for match in _QUOTED_PATH.finditer(str(text or "")):
+        value = next((group for group in match.groups() if group), "")
+        value = value.strip()
+        if (
+            value
+            and "/" in value
+            and not value.startswith(("http://", "https://"))
+        ):
+            candidates.append(value)
+    candidates.extend(_EXPLICIT_PATH.findall(str(text or "")))
+
+    resolved_paths: list[Path] = []
+    for raw in candidates:
+        value = raw.strip().rstrip(".,;:!?，。；：！？")
+        if not value or value.startswith(("http://", "https://")):
+            continue
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = root / candidate
+        resolved = candidate.resolve(strict=False)
+        if resolved in {Path("/"), Path.home().resolve()}:
+            continue
+        if resolved not in resolved_paths:
+            resolved_paths.append(resolved)
+    return tuple(resolved_paths)
+
+
+def is_sensitive_write_path(path: Path) -> bool:
+    resolved = path.expanduser().resolve(strict=False)
+    try:
+        parts = resolved.relative_to(Path.home().resolve()).parts
+    except ValueError:
+        parts = ()
+    return any(part in _SENSITIVE_WRITE_PARTS for part in parts)
+
+
 class PathGuard:
-    def __init__(self, workspace: Path, allow_outside: bool = False) -> None:
+    def __init__(
+        self,
+        workspace: Path,
+        allow_outside: bool = False,
+        write_allowlist: Iterable[Path] = (),
+    ) -> None:
         self.workspace = workspace.expanduser().resolve()
         self.allow_outside = allow_outside
+        self.write_allowlist = tuple(
+            path.expanduser().resolve(strict=False)
+            for path in write_allowlist
+        )
+        self.request_write_paths: tuple[Path, ...] = ()
         self.workspace.mkdir(parents=True, exist_ok=True)
 
-    def resolve(self, value: str | Path, *, must_exist: bool = False) -> Path:
+    def set_write_allowlist(self, paths: Iterable[Path]) -> None:
+        self.write_allowlist = tuple(
+            path.expanduser().resolve(strict=False)
+            for path in paths
+        )
+
+    def is_write_allowlisted(self, path: Path) -> bool:
+        resolved = path.expanduser().resolve(strict=False)
+        return any(
+            resolved == root or root in resolved.parents
+            for root in self.write_allowlist
+        )
+
+    def set_request_write_paths(self, paths: Iterable[Path]) -> None:
+        self.request_write_paths = tuple(
+            path.expanduser().resolve(strict=False)
+            for path in paths
+        )
+
+    def clear_request_write_paths(self) -> None:
+        self.request_write_paths = ()
+
+    def is_request_write_path(self, path: Path) -> bool:
+        resolved = path.expanduser().resolve(strict=False)
+        return any(
+            resolved == root or root in resolved.parents
+            for root in self.request_write_paths
+        )
+
+    def is_write_permitted(self, path: Path) -> bool:
+        return (
+            self.is_write_allowlisted(path)
+            or self.is_request_write_path(path)
+        )
+
+    def resolve(
+        self,
+        value: str | Path,
+        *,
+        must_exist: bool = False,
+        for_write: bool = False,
+    ) -> Path:
         candidate = Path(value).expanduser()
         if not candidate.is_absolute():
             candidate = self.workspace / candidate
@@ -70,10 +173,12 @@ class PathGuard:
             raise PolicyError(f"路径不存在: {resolved}")
         if not self.allow_outside and not (
             resolved == self.workspace or self.workspace in resolved.parents
+        ) and not (
+            for_write and self.is_write_permitted(resolved)
         ):
             raise PolicyError(
                 f"路径越界: {resolved}；工作区为 {self.workspace}。"
-                "如确需访问外部路径，请使用 --allow-outside。"
+                "如确有需要，请在当前请求中明确指定目标路径。"
             )
         return resolved
 
@@ -85,12 +190,27 @@ class PathGuard:
 
     def assert_writable(self, path: Path) -> None:
         resolved = path.resolve(strict=False)
-        protected_parts = {".git", ".sunus", "__pycache__"}
+        if not self.allow_outside and not (
+            resolved == self.workspace or self.workspace in resolved.parents
+        ) and not self.is_write_permitted(resolved):
+            raise PolicyError(
+                f"路径越界: {resolved}；工作区为 {self.workspace}。"
+                "写文件时需在当前请求中明确指定目标路径。"
+            )
+        if is_sensitive_write_path(resolved):
+            raise PolicyError(f"敏感路径不可由文件工具修改: {resolved}")
+        protected_parts = {".git", "__pycache__"}
         try:
             relative = resolved.relative_to(self.workspace)
         except ValueError:
             relative = None
         if relative and any(part in protected_parts for part in relative.parts):
+            raise PolicyError(f"受保护路径不可修改: {resolved}")
+        if (
+            relative
+            and ".sunus" in relative.parts
+            and not self.is_write_allowlisted(resolved)
+        ):
             raise PolicyError(f"受保护路径不可修改: {resolved}")
 
 
@@ -537,6 +657,7 @@ class ApprovalManager:
         self,
         *,
         auto_approve: bool = False,
+        persistent_permissions: dict[str, str] | None = None,
         interactive: bool | None = None,
         workspace: Path | None = None,
         default_grant: TaskGrant | None = None,
@@ -558,10 +679,35 @@ class ApprovalManager:
         self.before_prompt = before_prompt
         self.after_prompt = after_prompt
         self.capability_overrides: dict[str, bool] = {}
+        for capability, mode in (persistent_permissions or {}).items():
+            if capability not in CAPABILITIES:
+                continue
+            normalized = str(mode).strip().lower()
+            if normalized == "allow":
+                self.capability_overrides[capability] = True
+            elif normalized == "deny":
+                self.capability_overrides[capability] = False
         if auto_approve:
             self.capability_overrides = {
                 capability: True for capability in CAPABILITIES
             }
+
+    def set_persistent_permission(
+        self,
+        capability: str,
+        mode: str,
+    ) -> None:
+        if capability not in CAPABILITIES:
+            raise ValueError(f"未知能力: {capability}")
+        normalized = str(mode).strip().lower()
+        if normalized == "allow":
+            self.capability_overrides[capability] = True
+        elif normalized == "deny":
+            self.capability_overrides[capability] = False
+        elif normalized == "auto":
+            self.capability_overrides.pop(capability, None)
+        else:
+            raise ValueError("权限模式必须是 auto/allow/deny")
 
     def begin_task(self, risk_ceiling: RiskLevel | None = None) -> TaskGrant:
         self.grant = (

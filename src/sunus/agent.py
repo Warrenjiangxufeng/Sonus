@@ -495,6 +495,7 @@ class Agent:
 22. 核心不变量由代码保护：事实准确、安全边界、越权保护和记忆不可静默清除不能通过人设或普通工具关闭。名字、语气、称呼和风格仍由用户配置。
 23. 读取已打开浏览器页面时优先使用 inspect_browser；禁止用剪贴板、模拟全选/复制或反复试 osascript。JavaScript 权限关闭时直接说明恢复入口，不猜页面数字。
 24. 查询长期记忆、偏好、经历或复盘时使用 search_memory；禁止把 memory.db 当作目录搜索或文本文件读取。
+25. 用户明确要求“下次/以后由主动消息写文件”时，必须调用 schedule_proactive_file_write 创建或更新结构化主动待办；remember 只保存用户偏好，不能替代待办。优先使用用户当前消息指定的路径；区分 once 与 daily，并把来源 memory_id 一并登记。
 
 任务边界：
 - 只执行用户当前消息明确要求的动作。建议、假设、示例、推测、可选优化和未点名待办都不是执行指令。
@@ -717,9 +718,15 @@ class Agent:
             "list_skills",
             "read_skill",
             "request_authorization",
+            "configure_permissions",
+            "schedule_proactive_file_write",
             "submit_result",
         }
-        if scope.allows_mutation:
+        if (
+            scope.allows_mutation
+            or self.tools.path_guard.write_allowlist
+            or self.tools.path_guard.request_write_paths
+        ):
             allowed.update({"write_file", "write_document", "patch_file"})
         if scope.allows_commands:
             allowed.add("run_command")
@@ -1725,7 +1732,13 @@ class Agent:
                         tool_traces=tool_traces,
                         changed_files=changed_files,
                     )
-                    if name == "request_authorization" and result.ok:
+                    if (
+                        name in {
+                            "request_authorization",
+                            "configure_permissions",
+                        }
+                        and result.ok
+                    ):
                         available_tool_schemas = self._request_tool_schemas(
                             all_tool_schemas,
                             self.tools.request_scope or request_scope,

@@ -9,7 +9,10 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sunus.config import PersonaConfig, ProactiveConfig
+from sunus.config import (
+    PersonaConfig,
+    ProactiveConfig,
+)
 from sunus.memory import MemoryStore
 from sunus.model import ModelError
 from sunus.proactive import (
@@ -28,6 +31,7 @@ class FakeModel:
         self.last_user_prompt = ""
         self.last_system_prompt = ""
         self.last_temperature = None
+        self.last_max_tokens = None
         self.calls = 0
 
     def complete(self, system: str, user: str, **kwargs) -> str:
@@ -35,6 +39,7 @@ class FakeModel:
         self.last_system_prompt = system
         self.last_user_prompt = user
         self.last_temperature = kwargs.get("temperature")
+        self.last_max_tokens = kwargs.get("max_tokens")
         if "咖啡" in user:
             return "刚想到咖啡，今天喝了吗？"
         return (
@@ -81,7 +86,46 @@ class ActionJsonModel(FakeModel):
         )
 
 
+class RoutineActionModel(FakeModel):
+    def __init__(self, path: Path) -> None:
+        super().__init__()
+        self.path = path
+
+    def complete(self, system: str, user: str, **kwargs) -> str:
+        super().complete(system, user, **kwargs)
+        return json.dumps(
+            {
+                "message": "我把今天写进日记。",
+                "action": {
+                    "tool": "write_file",
+                    "arguments": {
+                        "path": str(self.path),
+                        "content": "今天过得还算踏实。",
+                    },
+                    "reason": "执行到期的每日日记事项",
+                },
+            },
+            ensure_ascii=False,
+        )
+
+
 class ProactiveTests(unittest.TestCase):
+    def test_request_has_enough_tokens_for_reasoning_and_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            model = FakeModel()
+            service = ProactiveService(
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                scope="/project/example",
+                config=ProactiveConfig(),
+            )
+
+            service.generate(sequence_index=0)
+
+            self.assertEqual(model.last_max_tokens, 256)
+            memory.close()
+
     def test_default_schedule_is_five_minute_exponential(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             current = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
@@ -367,7 +411,7 @@ class ProactiveTests(unittest.TestCase):
                     self.assertIn("关系语境", model.last_user_prompt)
                     self.assertIn(relationship.label, model.last_user_prompt)
                     self.assertIn(evidence.split("：", 1)[1], model.last_user_prompt)
-                    self.assertIn("主动选题推理", model.last_system_prompt)
+                    self.assertIn("轻量选题判断", model.last_system_prompt)
                     self.assertIn("不要套用预设的关系类型模板", model.last_user_prompt)
                     self.assertIn("「甜度」很强", model.last_system_prompt)
                     self.assertIn("「主动性」很强", model.last_system_prompt)
@@ -416,6 +460,114 @@ class ProactiveTests(unittest.TestCase):
             self.assertEqual(meta["response_format"], "json")
             self.assertEqual(model.calls, 1)
             memory.close()
+
+    def test_due_task_generates_diary_message_and_write_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / f"{datetime.now().astimezone().date().isoformat()}.txt"
+            memory = MemoryStore(root / "memory.db")
+            scheduler = ProactiveScheduler(
+                root / "memory.db",
+                ProactiveConfig(),
+                "task-test",
+                clock=lambda: datetime.now().astimezone(),
+            )
+            task = scheduler.create_task(
+                name="daily_diary",
+                instruction="写今天的日记",
+                target_path_template=f"{root}/{{date}}.txt",
+                cadence="once",
+            )
+            model = RoutineActionModel(target)
+            service = ProactiveService(
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                scope=str(root),
+                config=ProactiveConfig(),
+                action_catalog=(
+                    {
+                        "name": "write_file",
+                        "description": "写入文件",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                        },
+                    },
+                ),
+            )
+
+            due_task = scheduler.due_task()
+            self.assertIsNotNone(due_task)
+            text, meta = service.generate(
+                sequence_index=0,
+                pending_task=due_task,
+            )
+
+            self.assertEqual(text, "我把今天写进日记。")
+            self.assertEqual(meta["proactive_task"]["id"], task.id)
+            self.assertEqual(meta["proactive_task"]["name"], "daily_diary")
+            self.assertEqual(
+                meta["proactive_task"]["path"],
+                str(target.resolve()),
+            )
+            self.assertEqual(meta["action"]["tool"], "write_file")
+            self.assertIn("待执行主动待办", model.last_user_prompt)
+            self.assertIn(str(target), model.last_user_prompt)
+            scheduler.complete_task(task.id)
+            self.assertEqual(
+                scheduler.list_tasks(status="completed")[0].id,
+                task.id,
+            )
+            memory.close()
+            scheduler.close()
+
+    def test_existing_daily_task_file_is_not_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / f"{datetime.now().astimezone().date().isoformat()}.txt"
+            target.write_text("already written", encoding="utf-8")
+            memory = MemoryStore(root / "memory.db")
+            scheduler = ProactiveScheduler(
+                root / "memory.db",
+                ProactiveConfig(),
+                "task-test",
+                clock=lambda: datetime.now().astimezone(),
+            )
+            scheduler.create_task(
+                name="daily_diary",
+                instruction="写今天的日记",
+                target_path_template=f"{root}/{{date}}.txt",
+                cadence="daily",
+            )
+            model = FakeModel()
+            service = ProactiveService(
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                scope=str(root),
+                config=ProactiveConfig(),
+            )
+
+            _text, meta = service.generate(
+                sequence_index=0,
+                pending_task=scheduler.due_task(),
+            )
+
+            self.assertIsNone(meta["proactive_task"])
+            self.assertEqual(
+                target.read_text(encoding="utf-8"),
+                "already written",
+            )
+            tasks = scheduler.list_tasks(status="active")
+            self.assertEqual(len(tasks), 1)
+            self.assertGreater(
+                tasks[0].next_due_at,
+                datetime.now().astimezone().timestamp(),
+            )
+            memory.close()
+            scheduler.close()
 
     def test_proactive_action_outside_allowlist_is_discarded(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

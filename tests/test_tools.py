@@ -10,9 +10,11 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from sunus.config import ProactiveConfig
 from sunus.events import EventBus
 from sunus.memory import MemoryStore
 from sunus.policy import ApprovalManager, PathGuard
+from sunus.proactive import ProactiveScheduler
 from sunus.storage import ArtifactStore
 from sunus.tools import (
     ToolExecutor,
@@ -150,6 +152,122 @@ class ToolTests(unittest.TestCase):
                 ),
                 "hello",
             )
+
+    def test_configure_permissions_persists_and_applies_write_allowlist(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / ".sunus"
+            memory = MemoryStore(data / "memory.db")
+            executor = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=EventBus(data),
+                data_dir=data,
+                memory=memory,
+            )
+            scope = executor.begin_request(
+                "我授权你以后直接写日记，修改这个权限配置"
+            )
+            self.assertTrue(scope.allows_mutation)
+            diary = data / "diary"
+
+            configured = executor.execute(
+                "configure_permissions",
+                {
+                    "write_allowlist": [str(diary)],
+                    "mode": "set",
+                    "reason": "用户授权直接写日记",
+                },
+            )
+
+            self.assertTrue(configured.ok)
+            config = json.loads((data / "config.json").read_text(encoding="utf-8"))
+            permissions = config["runtime"]["permissions"]
+            self.assertEqual(permissions["write_allowlist"], [str(diary.resolve())])
+            executor.begin_request("写今天的日记")
+            diary_file = diary / "2026-10-26.md"
+            written = executor.execute(
+                "write_file",
+                {"path": str(diary_file), "content": "今天的记录"},
+            )
+            self.assertTrue(written.ok)
+            self.assertEqual(diary_file.read_text(encoding="utf-8"), "今天的记录")
+
+            protected = executor.execute(
+                "write_file",
+                {"path": str(data / "other.txt"), "content": "blocked"},
+            )
+            self.assertFalse(protected.ok)
+            self.assertFalse((data / "other.txt").exists())
+            executor.close()
+            memory.close()
+
+    def test_schedule_proactive_file_write_persists_task_and_permission(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / ".sunus"
+            memory = MemoryStore(data / "memory.db")
+            scheduler = ProactiveScheduler(
+                data / "memory.db",
+                ProactiveConfig(),
+                "task-test",
+            )
+            executor = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=EventBus(data),
+                data_dir=data,
+                memory=memory,
+            )
+            executor.proactive_scheduler = scheduler
+            executor.begin_request("下次主动消息写日记")
+            target_template = str(data / "diary" / "{date}.txt")
+
+            result = executor.execute(
+                "schedule_proactive_file_write",
+                {
+                    "task_name": "daily_diary",
+                    "instruction": "写今天的日记",
+                    "target_path_template": target_template,
+                    "cadence": "daily",
+                    "not_before": "20:00",
+                    "source_memory_id": "m_test",
+                },
+            )
+
+            self.assertTrue(result.ok)
+            tasks = scheduler.list_tasks(status="active")
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0].name, "daily_diary")
+            self.assertEqual(tasks[0].source_memory_id, "m_test")
+            self.assertIn(
+                (data / "diary").resolve(),
+                executor.path_guard.write_allowlist,
+            )
+            config = json.loads((data / "config.json").read_text(encoding="utf-8"))
+            self.assertIn(
+                str((data / "diary").resolve()),
+                config["runtime"]["permissions"]["write_allowlist"],
+            )
+            scheduler.close()
+            executor.close()
+            memory.close()
 
     def test_authorization_request_can_expand_current_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -548,6 +666,45 @@ class ToolTests(unittest.TestCase):
                 self.assertFalse(result.ok)
                 self.assertIn("没有明确要求", result.content)
             self.assertFalse((root / "new.txt").exists())
+
+    def test_explicit_request_path_is_writable_for_that_turn_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            target = Path(temp) / "exports" / "result.md"
+            executor = self.make_executor(root)
+
+            executor.begin_request(f"把结果写到 {target}")
+            written = executor.execute(
+                "write_file",
+                {"path": str(target), "content": "结果"},
+            )
+
+            self.assertTrue(written.ok)
+            self.assertEqual(target.read_text(encoding="utf-8"), "结果")
+
+            executor.begin_request("只分析，不要写文件")
+            denied = executor.execute(
+                "write_file",
+                {"path": str(Path(temp) / "later.md"), "content": "blocked"},
+            )
+            self.assertFalse(denied.ok)
+            self.assertFalse((Path(temp) / "later.md").exists())
+
+    def test_sensitive_credential_path_stays_blocked_even_if_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            executor = self.make_executor(Path(temp))
+            target = Path.home() / ".ssh" / "sunus-test"
+
+            executor.begin_request(f"把文件写到 {target}")
+            result = executor.execute(
+                "write_file",
+                {"path": str(target), "content": "blocked"},
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("敏感路径", result.content)
+            self.assertFalse(target.exists())
 
     def test_explicit_capability_revoke_overrides_user_intent(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

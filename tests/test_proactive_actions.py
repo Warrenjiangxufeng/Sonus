@@ -5,11 +5,15 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from sunus.cli import _execute_proactive_action
+from sunus.cli import (
+    _execute_proactive_action,
+    _execute_proactive_action_with_task,
+)
 from sunus.config import ProactiveConfig, RuntimeConfig
 from sunus.events import EventBus
 from sunus.memory import MemoryStore
 from sunus.policy import ApprovalManager, PathGuard
+from sunus.proactive import ProactiveScheduler
 from sunus.storage import ArtifactStore
 from sunus.tools import ToolExecutor
 
@@ -85,6 +89,52 @@ class ProactiveActionTests(unittest.TestCase):
                 "proactive_action_result",
                 components.events.path.read_text(encoding="utf-8"),
             )
+            components.tools.close()
+            components.memory.close()
+
+    def test_casual_message_skips_unrelated_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            components = self.make_components(Path(temp))
+            meta = {
+                "action": {
+                    "tool": "search_memory",
+                    "arguments": {"query": "周末计划"},
+                    "reason": "模型误附带了无关动作",
+                }
+            }
+
+            _execute_proactive_action(
+                components,  # type: ignore[arg-type]
+                "这个点，你手边有橘子吗？",
+                meta,
+            )
+
+            self.assertEqual(meta["action_status"], "skipped")
+            self.assertIn("未明确表达", meta["action_error"])
+            event_log = components.events.path.read_text(encoding="utf-8")
+            self.assertIn("proactive_action_skipped", event_log)
+            self.assertNotIn("proactive_action_result", event_log)
+            components.tools.close()
+            components.memory.close()
+
+    def test_message_must_name_the_same_operation_as_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            components = self.make_components(Path(temp))
+            meta = {
+                "action": {
+                    "tool": "search_memory",
+                    "arguments": {"query": "周末计划"},
+                    "reason": "检查历史安排",
+                }
+            }
+
+            _execute_proactive_action(
+                components,  # type: ignore[arg-type]
+                "我看看你的环境配置。",
+                meta,
+            )
+
+            self.assertEqual(meta["action_status"], "skipped")
             components.tools.close()
             components.memory.close()
 
@@ -185,6 +235,56 @@ class ProactiveActionTests(unittest.TestCase):
                 (root / "proactive.txt").read_text(encoding="utf-8"),
                 "new content",
             )
+            components.tools.close()
+            components.memory.close()
+
+    def test_completed_proactive_file_task_is_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            components = self.make_components(root)
+            scheduler = ProactiveScheduler(
+                root / ".data" / "memory.db",
+                ProactiveConfig(),
+                "task-test",
+            )
+            components.scheduler = scheduler
+            target = root / "task-output.txt"
+            task = scheduler.create_task(
+                name="task_output",
+                instruction="写入任务结果",
+                target_path_template=str(target),
+                cadence="once",
+                source_memory_id="m_test",
+            )
+            meta = {
+                "proactive_task": {
+                    "id": task.id,
+                    "name": task.name,
+                    "path": str(target),
+                },
+                "action": {
+                    "tool": "write_file",
+                    "arguments": {
+                        "path": str(target),
+                        "content": "done",
+                    },
+                    "reason": "执行主动待办",
+                },
+            }
+
+            completed = _execute_proactive_action_with_task(
+                components,  # type: ignore[arg-type]
+                "我把结果写进这个文件。",
+                meta,
+            )
+
+            self.assertTrue(completed)
+            self.assertEqual(meta["proactive_task_status"], "completed")
+            self.assertEqual(
+                scheduler.list_tasks(status="completed")[0].id,
+                task.id,
+            )
+            scheduler.close()
             components.tools.close()
             components.memory.close()
 

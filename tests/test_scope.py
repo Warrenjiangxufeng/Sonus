@@ -38,6 +38,20 @@ class RequestScopeTests(unittest.TestCase):
                 self.assertTrue(scope.allows_mutation)
                 self.assertTrue(scope.allows_commands)
 
+    def test_permission_configuration_instruction_authorizes_mutation(self) -> None:
+        scope = classify_request(
+            "以后你根据我的授权自己改权限配置，写日记不用问我"
+        )
+        self.assertTrue(scope.allows_mutation)
+        self.assertIn("write", scope.required_capabilities)
+        self.assertFalse(classify_request("如何修改权限配置？").allows_mutation)
+        self.assertFalse(classify_request("不要改权限配置").allows_mutation)
+
+    def test_explicit_proactive_file_task_authorizes_mutation(self) -> None:
+        scope = classify_request("下次主动消息写日记到 Desktop/sunus")
+        self.assertTrue(scope.allows_mutation)
+        self.assertIn("write", scope.required_capabilities)
+
     def test_change_questions_and_negations_do_not_authorize(self) -> None:
         for text in ("改不改？", "不要直接改", "先别动手改，只分析"):
             with self.subTest(text=text):

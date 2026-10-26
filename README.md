@@ -326,6 +326,8 @@ Tab/Esc 仍只用于打断。取消下一轮输入会同时清空暂存。
 | `write_file` | 创建或完整覆盖文件。 |
 | `write_document` | 按固定模板生成带元数据和必选章节的 Markdown 文档。 |
 | `patch_file` | 替换一个文件中的精确文本。 |
+| `configure_permissions` | 在用户明确授意后持久化权限模式和写入白名单。 |
+| `schedule_proactive_file_write` | 把用户明确要求的后续文件写入保存为一次性或每日主动待办。 |
 | `run_command` | 在工作区运行 shell 命令，返回退出码和输出。 |
 | `fetch_url` | 获取 HTTP(S) 文本，属于高风险网络操作。 |
 | `list_skills` | 列出本地技能及适用场景。 |
@@ -447,10 +449,31 @@ MiniMax 使用官方 OpenAI 兼容地址 `https://api.minimax.io/v1`。工具调
 请求意图，且 `request_authorization` 不能绕过；需要恢复时使用 `reset`。
 `--yes` 和 `/approve on`（不带能力）仍会放开全部高风险操作，但不关闭硬拒绝规则。
 
+用户明确要求持久化授权时，模型可以调用 `configure_permissions` 修改
+`~/.sunus/config.json`：
+
+```json
+{
+  "runtime": {
+    "permissions": {
+      "write": "auto",
+      "command": "auto",
+      "network": "auto",
+      "write_allowlist": ["/Users/example/.sunus/diary"]
+    }
+  }
+}
+```
+
+`write_allowlist` 用于“以后都可以写”的常驻目录。仅一次的写入不需要预先加入
+白名单：只要用户在当前请求中明确指定目标路径，该路径就获得本回合写入授权。
+两种授权都不会放开 `.sunus` 的其他文件；权限模式和常驻白名单修改后立即作用
+于当前会话，并持久化供后续启动使用。
+
 ## 路径与执行边界
 
-- 文件工具默认只能访问当前工作区。
-- `.git`、`.sunus` 和运行时缓存目录禁止被文件工具修改。
+- 文件工具默认访问当前工作区；用户在当前请求中明确指定的路径可在本回合读写。
+- `.git`、运行时缓存目录和 `write_allowlist` 外的 `.sunus` 路径禁止被文件工具修改。
 - 相对路径基于启动目录解析。
 - 搜索不跟随符号链接，不读取过大的文件。
 - 命令通过独立进程组执行，超时后先终止再强制收敛。
@@ -601,6 +624,15 @@ Agent 查询长期记忆必须使用只读 `search_memory` 工具；`memory.db` 
 可用 `SUNUS_GENDER` 设置 Sunus 自身性别，用 `SUNUS_USER_GENDER` 设置用户性别，用 `SUNUS_PROACTIVE_CUSTOM_QUIRKS="摄影,散步"` 设置自定义癖好；也可以在 `~/.sunus/config.json` 的 `proactive` 块中配置。
 
 主动陪伴状态跨进程持久化；休眠或恢复不会补发消息洪峰。生成失败使用 60 秒短重试，不计入未回复次数。
+
+用户明确要求“下次/以后让主动消息写文件”时，Sunus 会创建结构化
+`proactive_tasks`，记录说明、目标路径、once/daily、到期时间、状态和来源
+记忆 ID。到期待办优先于普通五类话题；消息与写入动作必须同时完成，成功后
+一次性任务关闭，每日任务推进到次日。普通偏好记忆只提供上下文，不能替代待办。
+
+主动动作必须由这条消息本身明确表达。普通关心、情绪陪伴和闲聊即使模型误附带
+`action`，也不会执行；只有正文明确写出与工具一致的第一人称操作时才会进入
+白名单和风险检查。被拦下的动作会记录为 `proactive_action_skipped`。
 
 主动消息本身也是 Sunus 的自我分享记忆。只有实际送达或由用户手动 trigger 后，
 才会以 `kind=self_share`、`scope=global` 写入记忆库，并记录消息 ID、原记忆类别、

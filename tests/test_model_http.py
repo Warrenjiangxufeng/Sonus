@@ -97,6 +97,111 @@ class BlockingHandler(Handler):
 
 
 class ModelHttpTests(unittest.TestCase):
+    def test_complete_retries_reasoning_output_exhausted_by_length(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = RuntimeConfig(
+                workspace=Path(temp),
+                data_dir=Path(temp),
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="deepseek-flash",
+            )
+            client = DeepSeekClient(config)
+            truncated = ModelReply(
+                message={"role": "assistant", "content": None},
+                usage={
+                    "completion_tokens": 96,
+                    "completion_tokens_details": {"reasoning_tokens": 96},
+                },
+                finish_reason="length",
+            )
+            completed = ModelReply(
+                message={"role": "assistant", "content": '{"message":"好了"}'},
+                usage={"completion_tokens": 80},
+                finish_reason="stop",
+            )
+            with patch.object(
+                client,
+                "chat",
+                side_effect=[truncated, completed],
+            ) as chat:
+                result = client.complete("system", "user", max_tokens=96)
+
+            self.assertEqual(result, '{"message":"好了"}')
+            self.assertEqual(chat.call_count, 2)
+            self.assertEqual(chat.call_args_list[0].kwargs["max_tokens"], 96)
+            self.assertEqual(chat.call_args_list[1].kwargs["max_tokens"], 1024)
+
+    def test_complete_reports_finish_reason_and_reasoning_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = RuntimeConfig(
+                workspace=Path(temp),
+                data_dir=Path(temp),
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="deepseek-flash",
+            )
+            client = DeepSeekClient(config)
+            truncated = ModelReply(
+                message={"role": "assistant", "content": None},
+                usage={
+                    "completion_tokens": 512,
+                    "completion_tokens_details": {"reasoning_tokens": 512},
+                },
+                finish_reason="length",
+            )
+            with patch.object(
+                client,
+                "chat",
+                return_value=truncated,
+            ) as chat:
+                with self.assertRaisesRegex(
+                    ModelError,
+                    r"finish_reason=length.*reasoning_tokens=512",
+                ):
+                    client.complete("system", "user", max_tokens=512)
+
+            self.assertEqual(chat.call_count, 3)
+
+    def test_complete_uses_reasoning_usage_to_size_third_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = RuntimeConfig(
+                workspace=Path(temp),
+                data_dir=Path(temp),
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="deepseek-flash",
+            )
+            client = DeepSeekClient(config)
+            truncated = ModelReply(
+                message={"role": "assistant", "content": None},
+                usage={
+                    "completion_tokens": 830,
+                    "completion_tokens_details": {"reasoning_tokens": 830},
+                },
+                finish_reason="length",
+            )
+            completed = ModelReply(
+                message={"role": "assistant", "content": '{"message":"好了"}'},
+                usage={"completion_tokens": 120},
+                finish_reason="stop",
+            )
+            with patch.object(
+                client,
+                "chat",
+                side_effect=[truncated, truncated, completed],
+            ) as chat:
+                result = client.complete("system", "user", max_tokens=256)
+
+            self.assertEqual(result, '{"message":"好了"}')
+            self.assertEqual(
+                [
+                    call.kwargs["max_tokens"]
+                    for call in chat.call_args_list
+                ],
+                [256, 1598, 3196],
+            )
+
     def test_chat_stream_emits_text_usage_and_final_message(self) -> None:
         StreamingHandler.chunks = [
             {

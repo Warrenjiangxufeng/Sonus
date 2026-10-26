@@ -16,6 +16,7 @@ from sunus.model_events import ModelEvent
 from sunus.model import ModelCancelled, ModelReply
 from sunus.policy import ApprovalManager, PathGuard
 from sunus.relationship import RelationshipConfig
+from sunus.scope import classify_request
 from sunus.storage import ArtifactStore, SessionLogger
 from sunus.tools import ToolExecutor
 
@@ -676,6 +677,58 @@ class UnrequestedWriteModel:
 
 
 class AgentTests(unittest.TestCase):
+    def test_explicit_write_path_exposes_write_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            diary = data / "diary"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_test", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+            )
+            agent = Agent(
+                config=config,
+                model=CapturingReplyModel("好。"),  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            tools.begin_request(f"把文件写到 {diary / 'note.md'}")
+            schemas = agent._request_tool_schemas(
+                tools.schemas(),
+                tools.request_scope or classify_request("只是聊聊天"),
+                conversation=False,
+            )
+            names = {
+                item["function"]["name"]
+                for item in schemas
+            }
+
+            self.assertIn("write_file", names)
+            self.assertIn("configure_permissions", names)
+            self.assertIn("schedule_proactive_file_write", names)
+            memory.close()
+
     def test_tool_loop_and_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "workspace"

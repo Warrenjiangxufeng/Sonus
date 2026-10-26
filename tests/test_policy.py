@@ -38,6 +38,43 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaises(PolicyError):
                 guard.assert_writable(Path(temp) / ".sunus" / "state")
 
+    def test_path_guard_allows_only_explicit_write_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            diary = root / ".sunus" / "diary"
+            guard = PathGuard(
+                root / "workspace",
+                write_allowlist=(diary,),
+            )
+
+            resolved = guard.resolve(
+                diary / "2026-10-26.md",
+                for_write=True,
+            )
+            guard.assert_writable(resolved)
+
+            with self.assertRaises(PolicyError):
+                guard.assert_writable(root / ".sunus" / "config.json")
+            with self.assertRaises(PolicyError):
+                guard.resolve(
+                    root / ".sunus" / "other" / "file.txt",
+                    for_write=True,
+                )
+
+    def test_current_request_can_authorize_an_outside_write_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "exports" / "result.md"
+            guard = PathGuard(root / "workspace")
+            guard.set_request_write_paths((target,))
+
+            resolved = guard.resolve(target, for_write=True)
+            guard.assert_writable(resolved)
+
+            guard.clear_request_write_paths()
+            with self.assertRaises(PolicyError):
+                guard.resolve(target, for_write=True)
+
     def test_dangerous_command_rules(self) -> None:
         self.assertTrue(command_denial_reason("sudo rm file"))
         self.assertTrue(command_denial_reason("rm -rf /"))

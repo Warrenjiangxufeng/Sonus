@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from sunus.config import redact_text, make_ssl_context
+from sunus.config import redact_text, make_ssl_context, save_user_config
 from sunus.browser_inspect import inspect_browser_page
 from sunus.documents import DOCUMENT_PROFILES, render_document
 from sunus.environment import discover_environment, login_shell, shell_invocation
@@ -30,6 +30,8 @@ from sunus.policy import (
     PathGuard,
     PolicyError,
     command_denial_reason,
+    explicit_write_paths,
+    is_sensitive_write_path,
     normalize_capabilities,
 )
 from sunus.scope import RequestScope, classify_request_with_context
@@ -448,8 +450,9 @@ def tool_schemas() -> list[dict[str, Any]]:
         ),
         fn(
             "write_file",
-            "Create or fully overwrite a text file inside the workspace. "
-            "Routine writes are task-authorized.",
+            "Create or fully overwrite a text file in the workspace or at a "
+            "path explicitly authorized by the current user request. "
+            "Sensitive credential and runtime paths remain protected.",
             {
                 "path": {"type": "string"},
                 "content": {"type": "string"},
@@ -492,7 +495,8 @@ def tool_schemas() -> list[dict[str, Any]]:
         fn(
             "patch_file",
             "Replace exact text in one file. Prefer this over write_file for small edits. "
-            "Routine workspace edits are task-authorized.",
+            "The file must be in the workspace or explicitly named by the "
+            "current user request.",
             {
                 "path": {"type": "string"},
                 "old_text": {"type": "string"},
@@ -534,6 +538,78 @@ def tool_schemas() -> list[dict[str, Any]]:
                 },
             },
             ["capability", "reason"],
+        ),
+        fn(
+            "configure_permissions",
+            "Persist permission changes after an explicit user instruction. "
+            "This edits runtime.permissions in the Sunus user config and applies "
+            "safe write allowlists immediately. Never call without user intent.",
+            {
+                "permissions": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "write": {
+                            "type": "string",
+                            "enum": ["auto", "allow", "deny"],
+                        },
+                        "command": {
+                            "type": "string",
+                            "enum": ["auto", "allow", "deny"],
+                        },
+                        "network": {
+                            "type": "string",
+                            "enum": ["auto", "allow", "deny"],
+                        },
+                    },
+                },
+                "write_allowlist": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Additional or replacement paths that may be written "
+                        "without per-file approval."
+                    ),
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["add", "set", "remove"],
+                    "default": "add",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "The explicit user instruction being applied.",
+                },
+            },
+            ["reason"],
+        ),
+        fn(
+            "schedule_proactive_file_write",
+            "Create a structured proactive task to write a file later. "
+            "Use only after an explicit user request. The task source is stored "
+            "in proactive_tasks and is consumed by the proactive scheduler.",
+            {
+                "task_name": {"type": "string"},
+                "instruction": {"type": "string"},
+                "target_path_template": {
+                    "type": "string",
+                    "description": "Absolute path; may contain {date}.",
+                },
+                "cadence": {
+                    "type": "string",
+                    "enum": ["once", "daily"],
+                    "default": "once",
+                },
+                "not_before": {
+                    "type": "string",
+                    "default": "20:00",
+                },
+                "source_memory_id": {
+                    "type": "string",
+                    "default": "",
+                },
+            },
+            ["task_name", "instruction", "target_path_template"],
         ),
         fn(
             "fetch_url",
@@ -587,6 +663,7 @@ class ToolExecutor:
         self.events = events
         self.secret = secret
         self.memory = memory
+        self.proactive_scheduler: Any | None = None
         self.skills = SkillLibrary(workspace)
         self.request_scope: RequestScope | None = None
         self.max_parallel_tools = max(1, int(max_parallel_tools))
@@ -610,6 +687,10 @@ class ToolExecutor:
             "patch_file": self._patch_file,
             "run_command": self._run_command,
             "request_authorization": self._request_authorization,
+            "configure_permissions": self._configure_permissions,
+            "schedule_proactive_file_write": (
+                self._schedule_proactive_file_write
+            ),
             "fetch_url": self._fetch_url,
             "list_skills": self._list_skills,
             "read_skill": self._read_skill,
@@ -634,6 +715,8 @@ class ToolExecutor:
             "write_document": "R1",
             "patch_file": "R1",
             "run_command": "R1",
+            "configure_permissions": "R1",
+            "schedule_proactive_file_write": "R1",
         }
         for schema in tool_schemas():
             name = str(schema.get("function", {}).get("name") or "")
@@ -695,14 +778,42 @@ class ToolExecutor:
                 previous_scope=previous_scope,
             )
         )
+        if self.request_scope.allows_mutation:
+            self.path_guard.set_request_write_paths(
+                explicit_write_paths(text, self.workspace)
+            )
+        else:
+            self.path_guard.clear_request_write_paths()
         return self.request_scope
 
-    def _scope_denial(self, name: str) -> str:
+    def _scope_denial(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> str:
         scope = self.request_scope
         if scope is None:
             return ""
-        if name in {"write_file", "write_document", "patch_file"}:
+        if name in {
+            "configure_permissions",
+            "schedule_proactive_file_write",
+        }:
             allowed = scope.allows_mutation
+        elif name in {"write_file", "write_document", "patch_file"}:
+            allowed = scope.allows_mutation
+            raw_path = str(arguments.get("path") or "").strip()
+            if raw_path and self.approvals.capability_overrides.get("write") is not False:
+                try:
+                    candidate = self.path_guard.resolve(
+                        raw_path,
+                        for_write=True,
+                    )
+                except PolicyError:
+                    candidate = None
+                allowed = allowed or bool(
+                    candidate
+                    and self.path_guard.is_write_permitted(candidate)
+                )
         elif name == "run_command":
             allowed = scope.allows_commands
         elif name == "fetch_url":
@@ -717,7 +828,7 @@ class ToolExecutor:
         )
 
     def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
-        denial = self._scope_denial(name)
+        denial = self._scope_denial(name, arguments)
         if denial:
             return ToolResult(False, denial)
         spec = self.registry.get(name)
@@ -1288,7 +1399,7 @@ class ToolExecutor:
         )
 
     def _write_file(self, args: dict[str, Any]) -> ToolResult:
-        path = self.path_guard.resolve(str(args["path"]))
+        path = self.path_guard.resolve(str(args["path"]), for_write=True)
         self.path_guard.assert_writable(path)
         content = str(args["content"])
         if len(content.encode("utf-8")) > MAX_FILE_BYTES:
@@ -1308,7 +1419,7 @@ class ToolExecutor:
         )
 
     def _write_document(self, args: dict[str, Any]) -> ToolResult:
-        path = self.path_guard.resolve(str(args["path"]))
+        path = self.path_guard.resolve(str(args["path"]), for_write=True)
         self.path_guard.assert_writable(path)
         content = render_document(
             profile=str(args.get("profile") or ""),
@@ -1335,7 +1446,11 @@ class ToolExecutor:
         )
 
     def _patch_file(self, args: dict[str, Any]) -> ToolResult:
-        path = self.path_guard.resolve(str(args["path"]), must_exist=True)
+        path = self.path_guard.resolve(
+            str(args["path"]),
+            must_exist=True,
+            for_write=True,
+        )
         self.path_guard.assert_writable(path)
         if not path.is_file():
             return ToolResult(False, f"不是文件: {path}")
@@ -1484,6 +1599,171 @@ class ToolExecutor:
             True,
             f"已授权：{capability}。下一步可以使用新开放的工具；"
             "授权只在当前任务回合有效。",
+        )
+
+    def _configure_permissions(self, args: dict[str, Any]) -> ToolResult:
+        reason = str(args.get("reason") or "").strip()
+        if not reason:
+            return ToolResult(False, "权限配置缺少用户授意说明")
+        raw_modes = args.get("permissions") or {}
+        if not isinstance(raw_modes, dict):
+            return ToolResult(False, "permissions 必须是 object")
+        raw_paths = args.get("write_allowlist") or []
+        if not isinstance(raw_paths, list):
+            return ToolResult(False, "write_allowlist 必须是数组")
+        mode = str(args.get("mode") or "add").strip().lower()
+        if mode not in {"add", "set", "remove"}:
+            return ToolResult(False, "mode 必须是 add/set/remove")
+        if not raw_modes and not raw_paths:
+            return ToolResult(False, "没有需要更新的权限配置")
+
+        permission_updates: dict[str, str] = {}
+        for capability in ("write", "command", "network"):
+            if capability not in raw_modes:
+                continue
+            value = str(raw_modes.get(capability) or "").strip().lower()
+            if value not in {"auto", "allow", "deny"}:
+                return ToolResult(
+                    False,
+                    f"{capability} 必须是 auto/allow/deny",
+                )
+            permission_updates[capability] = value
+
+        current_paths = set(self.path_guard.write_allowlist)
+        requested_paths: set[Path] = set()
+        for raw_path in raw_paths:
+            value = str(raw_path).strip()
+            if not value:
+                continue
+            candidate = Path(value).expanduser().resolve(strict=False)
+            if candidate in {Path("/"), Path.home().resolve()}:
+                return ToolResult(
+                    False,
+                    f"写入白名单范围过大，拒绝配置: {candidate}",
+                )
+            requested_paths.add(candidate)
+        if len(current_paths | requested_paths) > 16:
+            return ToolResult(False, "写入白名单最多允许 16 个路径")
+        if mode == "set":
+            next_paths = requested_paths
+        elif mode == "remove":
+            next_paths = current_paths - requested_paths
+        else:
+            next_paths = current_paths | requested_paths
+
+        updates: dict[str, Any] = {
+            "runtime": {
+                "permissions": {
+                    **permission_updates,
+                    "write_allowlist": [
+                        str(path) for path in sorted(next_paths)
+                    ],
+                }
+            }
+        }
+        try:
+            path = save_user_config(self.data_dir, updates)
+        except Exception as error:
+            return ToolResult(False, f"保存权限配置失败: {error}")
+        self.path_guard.set_write_allowlist(next_paths)
+        for capability, value in permission_updates.items():
+            self.approvals.set_persistent_permission(capability, value)
+        summary = (
+            f"已更新 {path}；写入白名单 {len(next_paths)} 项"
+            + (
+                "；权限模式 "
+                + "、".join(
+                    f"{name}={value}"
+                    for name, value in sorted(permission_updates.items())
+                )
+                if permission_updates
+                else ""
+            )
+        )
+        self.events.emit(
+            "permissions_configured",
+            path=str(path),
+            write_allowlist=[str(item) for item in sorted(next_paths)],
+            permissions=permission_updates,
+            summary=summary,
+        )
+        return ToolResult(True, summary, state_changed=True)
+
+    def _schedule_proactive_file_write(
+        self,
+        args: dict[str, Any],
+    ) -> ToolResult:
+        if self.proactive_scheduler is None:
+            return ToolResult(False, "主动调度器未初始化")
+        target_template = str(
+            args.get("target_path_template") or ""
+        ).strip()
+        if not target_template:
+            return ToolResult(False, "待办目标路径不能为空")
+        cadence = str(args.get("cadence") or "once").strip().lower()
+        not_before = str(args.get("not_before") or "20:00").strip()
+        instruction = str(args.get("instruction") or "").strip()
+        task_name = str(args.get("task_name") or "").strip()
+        source_memory_id = str(
+            args.get("source_memory_id") or ""
+        ).strip()
+        if not instruction:
+            return ToolResult(False, "待办说明不能为空")
+        rendered_for_path = target_template.replace(
+            "{date}",
+            datetime.now().astimezone().date().isoformat(),
+        )
+        target = Path(rendered_for_path).expanduser()
+        if not target.is_absolute():
+            target = self.workspace / target
+        target = target.resolve(strict=False)
+        parent = target.parent if target.suffix else target
+        if parent in {Path("/"), Path.home().resolve()}:
+            return ToolResult(False, f"待办路径范围过大: {parent}")
+        if is_sensitive_write_path(parent):
+            return ToolResult(False, f"待办不能写入敏感路径: {parent}")
+        permission_result = self._configure_permissions(
+            {
+                "write_allowlist": [str(parent)],
+                "mode": "add",
+                "reason": f"为主动待办 {task_name} 持久授权目标目录",
+            }
+        )
+        if not permission_result.ok:
+            return permission_result
+        try:
+            task = self.proactive_scheduler.create_task(
+                name=task_name,
+                instruction=instruction,
+                target_path_template=target_template,
+                cadence=cadence,
+                not_before=not_before,
+                source_memory_id=source_memory_id,
+            )
+        except Exception as error:
+            return ToolResult(False, f"保存主动待办失败: {error}")
+        payload = {
+            "id": task.id,
+            "name": task.name,
+            "instruction": task.instruction,
+            "target_path_template": task.target_path_template,
+            "cadence": task.cadence,
+            "not_before": task.not_before,
+            "status": task.status,
+            "source_memory_id": task.source_memory_id,
+        }
+        self.events.emit(
+            "proactive_task_scheduled",
+            task_id=task.id,
+            name=task.name,
+            cadence=task.cadence,
+            target_path_template=task.target_path_template,
+            summary=f"已创建主动待办: {task.name}",
+        )
+        return ToolResult(
+            True,
+            json.dumps(payload, ensure_ascii=False),
+            state_changed=True,
         )
 
     def _fetch_url(self, args: dict[str, Any]) -> ToolResult:
