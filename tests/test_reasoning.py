@@ -85,6 +85,13 @@ class ReasoningTests(unittest.TestCase):
         self.assertIn("相同回应动作", prompt)
         self.assertIn("历史记忆中的旧回复", prompt)
         self.assertIn("用户本轮约 3 个字符", prompt)
+        self.assertIn("先接住那口气", prompt)
+        self.assertIn("元叙述", prompt)
+        self.assertIn("追问准备度", prompt)
+        self.assertIn("暂停追问", prompt)
+        self.assertIn("不要罗列精力、疲劳", prompt)
+        self.assertIn("不要列三条计划", prompt)
+        self.assertIn("愧疚、赌气", prompt)
 
     def test_read_only_lookup_requests_are_compact(self) -> None:
         self.assertTrue(

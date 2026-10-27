@@ -17,6 +17,7 @@ from sunus.config import (
     ProactiveConfig,
     redact_text,
 )
+from sunus.affect import SunusAffectState
 from sunus.embodiment import embodiment_prompt
 from sunus.memory import MemoryStore, memory_context_text
 from sunus.model import ModelClient, ModelError
@@ -763,6 +764,9 @@ class ProactiveService:
     ) -> None:
         self.model = model
         self.memory = memory
+        self.affect = SunusAffectState(
+            Path(memory.db_path).with_name("affect_state.json")
+        )
         self.scope = scope
         self.config = config
         self.persona = persona or PersonaConfig()
@@ -1159,6 +1163,7 @@ class ProactiveService:
 {persona_rules}
 {relationship_rules}
 {embodiment_prompt()}
+{self.affect.prompt_block()}
 生成前快速完成一次轻量选题判断，不展开长推理，也不输出推理步骤：
 1. 关系理解：从用户明确设定、称呼和历史互动中理解双方角色、亲疏、边界与表达习惯，不套社会刻板印象。
 2. 证据汇集：从最近偏好、最近交流、关系候选记忆、定向召回、稳定性格和已发消息中找出可延续的人物、事件、兴趣、计划或未闭合话题。

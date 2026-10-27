@@ -128,6 +128,26 @@ class CapturingReplyModel:
         )
 
 
+class ConversationStyleRetryModel:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.last_messages: list[dict] = []
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.calls += 1
+        self.last_messages = messages
+        text = (
+            "行，我话多了。说吧，什么事让你烦。"
+            if self.calls == 1
+            else "行，挨骂也认。你先消气，我不绕了。"
+        )
+        return ModelReply(
+            message={"role": "assistant", "content": text},
+            usage={"prompt_tokens": 10, "completion_tokens": 5},
+            finish_reason="stop",
+        )
+
+
 class TextualProtocolRecoveryModel:
     def __init__(self) -> None:
         self.calls = 0
@@ -1335,6 +1355,54 @@ class AgentTests(unittest.TestCase):
             self.assertNotIn("<｜｜DSML｜｜", events_text)
             memory.close()
 
+    def test_assistant_like_conversation_style_is_rewritten_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_style_retry", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = ConversationStyleRetryModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("你咋老爱说那么多废话，我懒得读小作文")
+
+            self.assertEqual(model.calls, 2)
+            self.assertEqual(result.text, "行，挨骂也认。你先消气，我不绕了。")
+            self.assertIn(
+                "conversation_style_retry",
+                events.path.read_text(encoding="utf-8"),
+            )
+            memory.close()
+
     def test_configured_persona_is_injected_into_system_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "workspace"
@@ -1391,7 +1459,7 @@ class AgentTests(unittest.TestCase):
                 session=session,
             )
 
-            result = agent.run_turn("哈喽在干嘛")
+            result = agent.run_turn("谢谢你，抱抱，今天真开心")
 
             system_prompt = model.last_messages[0]["content"]
             self.assertEqual(result.reason, "completed")
@@ -1406,10 +1474,16 @@ class AgentTests(unittest.TestCase):
             self.assertIn("Sunus 的角色：女朋友", system_prompt)
             self.assertIn("Sunus 对用户的称呼：阿峰", system_prompt)
             self.assertIn("运行时核心设定", system_prompt)
-            self.assertIn("稳定、连续的拟人身体表达层", system_prompt)
+            self.assertIn("稳定、连续的拟人身体与内在感受", system_prompt)
             self.assertIn("身体自主权", system_prompt)
+            self.assertIn("[Sunus 持久内在状态", system_prompt)
             self.assertNotIn("Sunus 核心性别设定为男性", system_prompt)
             self.assertGreater(result.metrics["context"]["persona_config"]["characters"], 0)
+            affect_state = json.loads(
+                (data / "affect_state.json").read_text(encoding="utf-8")
+            )
+            self.assertGreater(affect_state["body"]["closeness"], 0.50)
+            self.assertIn("亲近", affect_state["last_appraisal"]["events"])
             memory.close()
 
     def test_model_classifies_ambiguous_short_followup(self) -> None:

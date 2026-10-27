@@ -347,7 +347,7 @@ class ProactiveTests(unittest.TestCase):
             self.assertIn("双方关系：恋人", model.last_system_prompt)
             self.assertIn("Sunus 对用户的称呼：阿峰", model.last_system_prompt)
             self.assertIn("运行时核心设定", model.last_system_prompt)
-            self.assertIn("稳定、连续的拟人身体表达层", model.last_system_prompt)
+            self.assertIn("稳定、连续的拟人身体与内在感受", model.last_system_prompt)
             self.assertIn("身体自主权", model.last_system_prompt)
             memory.close()
 

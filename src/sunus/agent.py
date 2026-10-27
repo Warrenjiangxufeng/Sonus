@@ -16,6 +16,8 @@ from sunus.context import (
     estimate_messages_tokens,
     repair_tool_pairs,
 )
+from sunus.affect import SunusAffectState
+from sunus.conversation_style import conversation_repair_instruction
 from sunus.events import EventBus
 from sunus.config import redact_value, save_user_config
 from sunus.control import CircuitOpen, TurnController
@@ -154,6 +156,9 @@ class Agent:
         self.events = events
         self.session = session
         self.scope = str(Path(config.workspace).resolve())
+        self.affect = SunusAffectState(
+            Path(config.data_dir).expanduser() / "affect_state.json"
+        )
         try:
             seed_reasoning_exemplars(self.memory)
         except Exception as error:
@@ -461,6 +466,7 @@ class Agent:
 {persona_block}
 {relationship_block}
 {embodiment_prompt()}
+{self.affect.prompt_block()}
 
 {environment_prompt()}
 
@@ -1077,6 +1083,19 @@ class Agent:
         self._runtime_policy_prompt = ""
         self._tool_visibility_prompt = ""
         self._prepare_turn_relationship(user_input)
+        affect_snapshot = None
+        try:
+            affect_snapshot = self.affect.observe(user_input)
+        except Exception as error:
+            self.events.emit(
+                "affect_state_error",
+                summary=f"内感受状态更新失败: {error}",
+            )
+        questions_allowed = bool(
+            affect_snapshot is not None
+            and affect_snapshot.question_readiness >= 0.36
+            and not affect_snapshot.questions_inhibited
+        )
         self._memory_write_required = (
             self.memory.is_explicit_memory_request(user_input)
         )
@@ -1230,6 +1249,7 @@ class Agent:
         last_request_max_tokens = 0
         output_retry_used = False
         protocol_retry_used = False
+        conversation_style_retry_used = False
         structured_result: dict[str, Any] | None = None
         budget = replace(
             self.config.loop_budget,
@@ -1474,6 +1494,30 @@ class Agent:
                         summary="DSML 协议编码无法安全转换，已拦截并重试",
                     )
                     continue
+                if (
+                    conversation
+                    and not tool_calls
+                    and visible_text
+                    and not conversation_style_retry_used
+                ):
+                    repair_policy = conversation_repair_instruction(
+                        user_input,
+                        visible_text,
+                        questions_allowed=questions_allowed,
+                    )
+                    if repair_policy:
+                        conversation_style_retry_used = True
+                        self._runtime_policy_prompt = (
+                            f"{self._runtime_policy_prompt}\n{repair_policy}"
+                        ).strip()
+                        self._apply_system_message()
+                        self.events.emit(
+                            "conversation_style_retry",
+                            turn_id=turn_id,
+                            reason="assistant_like_or_overexplained",
+                            summary="上一版对话过于解释或违背不追问要求，已重写一次",
+                        )
+                        continue
                 self._record_message(
                     self._assistant_payload(message),
                     turn_id=turn_id,
