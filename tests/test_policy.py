@@ -211,9 +211,36 @@ class PolicyTests(unittest.TestCase):
                 2,
             )
             self.assertEqual(
+                _choose_approval_option(key_reader=lambda: "TAB"),
+                2,
+            )
+            self.assertEqual(
                 _choose_approval_option(key_reader=lambda: "3"),
                 2,
             )
+
+    def test_interactive_denial_is_exposed_to_the_tool_runtime(self) -> None:
+        approvals = ApprovalManager(
+            auto_approve=False,
+            interactive=True,
+            workspace=Path.cwd(),
+        )
+        approvals.begin_task("R0")
+
+        with patch("sunus.policy._choose_approval_option", return_value=2):
+            allowed = approvals.require(
+                "运行命令",
+                "printf blocked",
+                risk="R2",
+                capability="command",
+            )
+
+        self.assertFalse(allowed)
+        self.assertEqual(
+            approvals.consume_interactive_decision(),
+            "denied",
+        )
+        self.assertEqual(approvals.consume_interactive_decision(), "")
 
     def test_approval_menu_highlights_only_selected_option(self) -> None:
         output = io.StringIO()
@@ -233,7 +260,7 @@ class PolicyTests(unittest.TestCase):
             rendered,
         )
         self.assertIn(
-            "\x1b[2m    3. 拒绝（↑/↓ 选择 · 3 / x / Esc）\x1b[0m",
+            "\x1b[2m    3. 拒绝（↑/↓ 选择 · 3 / x / Esc / Tab）\x1b[0m",
             rendered,
         )
         self.assertNotIn("Enter 确认 · y 允许 · x 拒绝", rendered)

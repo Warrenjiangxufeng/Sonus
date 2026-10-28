@@ -1030,6 +1030,7 @@ class ProactiveService:
         random_source: random.Random | None = None,
         action_catalog: tuple[dict[str, Any], ...] = (),
         thoughts: ProactiveThoughtStore | None = None,
+        writable_paths: tuple[str, ...] = (),
     ) -> None:
         self.model = model
         self.memory = memory
@@ -1045,6 +1046,13 @@ class ProactiveService:
             for item in action_catalog
             if str(item.get("name") or "")
         }
+        self.writable_paths = tuple(
+            dict.fromkeys(
+                str(path)
+                for path in (writable_paths or (scope,))
+                if str(path).strip()
+            )
+        )
         self.thoughts = thoughts
         self._sequence_offset = 0
         self._last_intent = ""
@@ -1528,7 +1536,13 @@ class ProactiveService:
             f"- 唯一目标文件：{task_path}\n"
             "- 完成判定：该文件尚不存在。"
             if pending_task is not None and task_path is not None
-            else "本轮没有到期的主动待办。"
+            else (
+                "本轮没有预排待办。不要为了完成日程、打卡或某个每日习惯"
+                "而行动；只有当下确实想记录、查看或处理时才自主选择动作。"
+            )
+        )
+        writable_paths_context = "\n".join(
+            f"- {path}" for path in self.writable_paths
         )
         task_topic_instruction = (
             "优先执行待执行主动待办，不要退回普通闲聊。消息必须明确写出"
@@ -1565,6 +1579,8 @@ class ProactiveService:
 工作消息闸门：{work_gate_context}
 待执行主动待办（优先级高于普通五类话题）：
 {task_context}
+可用写入范围（不是日程，不代表必须写入）：
+{writable_paths_context}
 {thought_context}
 关系语境：
 {relationship_context}
@@ -1668,7 +1684,12 @@ Sunus 性格与成长只使用逐步积累的“Sunus 性格与互动习惯”�
 {{"message":"给用户看的消息正文","action":{{"tool":"工具名","arguments":{{}},"reason":"具体理由"}}}}
 默认 action 必须为 null。只有 message 本身已经明确写出 Sunus 正在或准备
 执行的具体操作，而且该操作确有收益时，才能返回同一个 action。
-没有待执行主动待办时，日常关心、情绪陪伴、性格、性别和癖好闲聊不得附加动作。
+没有预排待办时，动作仍然可以由她根据当下真实想法自主产生，但必须同时满足：
+当前确有想做的事、目标具体、工具可用、执行后确实带来收益。动作不是义务，
+她可以决定不做。不得因为到了某个时间、今天还没写日记、某个每日习惯或
+“应该记录”而行动；只有此刻确实有值得留存并愿意记录的内容时才写。
+她可以自然选择记录自己的感受或经历，但应先判断是否有真实内容和意愿，
+内容不足、只是走流程或为了保持连续性模板化记录时保持 action=null。
 存在待执行主动待办时，action 不得为 null：必须调用 write_file，
 path 必须使用“唯一目标文件”，content 必须满足待办指令；
 message 必须自然说明正在写进目标文件，不得声称写入已经成功。

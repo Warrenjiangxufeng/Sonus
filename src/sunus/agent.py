@@ -75,6 +75,17 @@ from sunus.thinking_operators import (
 from sunus.tools import ToolExecutor, ToolResult
 
 
+def _runtime_source_root() -> Path:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / "pyproject.toml").is_file() or (parent / ".git").exists():
+            return parent
+    return current.parent
+
+
+SOURCE_ROOT = _runtime_source_root()
+
+
 MODEL_USAGE_EVENT_KEYS = frozenset(
     {
         "prompt_tokens",
@@ -488,6 +499,7 @@ class Agent:
 当前时间：{datetime.now().astimezone():%Y-%m-%d %H:%M %Z}
 当前工作区：{self.scope}
 权威运行数据目录：{Path(self.config.data_dir).expanduser().resolve()}
+当前运行源码根目录：{SOURCE_ROOT}
 长期使命：{mission}
 {persona_block}
 {relationship_block}
@@ -523,11 +535,12 @@ class Agent:
 18. 查询“上次、刚才”的失败时先用 inspect_runtime_history 的 recent/latest_failure；需要一段时间的规律时用 trend，让运行时在本地按错误指纹和日期聚合，绝不把数百天逐条日志塞进上下文；只有确定 turn_id 后才用 mode=turn 下钻。不要用 error/crash/Traceback 等泛词搜索整个 .sunus。
 19. 一张候选清单加一次单回合下钻足以判断时立即停止；若两个以上候选都可能是“上次”且无法区分，问用户一个具体的时间或任务锚点，不要继续遍历。365 天全有错误也不等于需要看 365 天每条记录。
 20. 其他文件、源码、文档和配置也使用同一原则：搜索前先判断最便宜的路径——已知文件直接 read_file，当前代码状态用 inspect_code_state，已知仓库用精确符号搜索，未知仓库先用 list_files 锁定一层；只有这些都不够时才扩大范围，禁止一开始用泛词扫描整个工作区来碰运气。
+20.1 用户询问当前运行时自身的最新代码时，直接以“当前运行源码根目录”为仓库根，不从用户主目录猜仓库。其他项目先使用相关记忆里的项目路径证据；仍不唯一或不存在时，向用户询问一个明确路径，不扫描主目录找项目。
 21. 用户明确要求“记住、落库、长期保存、不要忘”或要求保存复盘时，必须调用 remember 写入桌面记忆库；只有拿到真实 memory_id 才能说已经记住。故障轮次也要保存用户要求的复盘结论。
 22. 核心不变量由代码保护：事实准确、安全边界、越权保护和记忆不可静默清除不能通过人设或普通工具关闭。名字、语气、称呼和风格仍由用户配置。
 23. 读取已打开浏览器页面时优先使用 inspect_browser；禁止用剪贴板、模拟全选/复制或反复试 osascript。JavaScript 权限关闭时直接说明恢复入口，不猜页面数字。
 24. 查询长期记忆、偏好、经历或复盘时使用 search_memory；禁止把 memory.db 当作目录搜索或文本文件读取。
-25. 用户明确要求“下次/以后由主动消息写文件”时，必须调用 schedule_proactive_file_write 创建或更新结构化主动待办；remember 只保存用户偏好，不能替代待办。优先使用用户当前消息指定的路径；区分 once 与 daily，并把来源 memory_id 一并登记。
+25. 只有用户明确要求“下次/以后由主动消息写文件”时，才可调用 schedule_proactive_file_write 创建或更新结构化主动待办；remember 只保存用户偏好，不能替代待办。不得把自己的日记、记录、复盘或陪伴习惯自行变成每日/周期日程。她当下想写时，应在当次思考中自主决定动作，而不是预埋固定任务。
 26. 判断“当前状态”时先识别证据域：历史记忆只证明过去说过或发生过什么；配置文件只证明声明意图；源码只证明当前实现；实际生效必须看运行时结果。任何一类证据都不能替代另一类。
 27. 低功耗是所有执行方式的第一约束：证据足够时优先单次专用工具、最小目录、最少命令、最少网络和最少模型往返；先扩大便宜范围再精确读取，不为“更全面”重复已完成检查。
 
@@ -1817,6 +1830,7 @@ class Agent:
         conversation_style_retry_used = False
         code_state_gate_retry_used = False
         structured_result: dict[str, Any] | None = None
+        user_halted = False
         budget = replace(
             self.config.loop_budget,
             max_model_calls=min(
@@ -2422,6 +2436,25 @@ class Agent:
                         tool_traces=tool_traces,
                         changed_files=changed_files,
                     )
+                    if result.halt:
+                        user_halted = True
+                        controller.finalizing = True
+                        self._runtime_policy_prompt = (
+                            f"{self._runtime_policy_prompt}\n"
+                            "用户刚刚拒绝或取消了授权。本轮剩余已排队工具调用"
+                            "全部丢弃，不得继续搜索、读取或执行。立即仅基于已有"
+                            "证据提交 partial 或 blocked 结果；没有足够证据时"
+                            "明确说明停止原因和恢复条件。"
+                        ).strip()
+                        self._apply_system_message()
+                        self.events.emit(
+                            "approval_denied",
+                            turn_id=turn_id,
+                            call_id=call_id,
+                            name=name,
+                            summary="用户拒绝授权，已终止剩余工具批次",
+                        )
+                        break
                     if (
                         name in {
                             "request_authorization",
@@ -2440,8 +2473,46 @@ class Agent:
                             self.tools.request_scope or request_scope,
                             conversation=conversation,
                         )
+                        self.events.emit(
+                            "authorization_barrier",
+                            turn_id=turn_id,
+                            call_id=call_id,
+                            name=name,
+                            ok=result.ok,
+                            summary="授权处理完成，返回模型重新决策",
+                        )
+                        break
+                    if result.approval_barrier:
+                        self.events.emit(
+                            "authorization_barrier",
+                            turn_id=turn_id,
+                            call_id=call_id,
+                            name=name,
+                            ok=result.ok,
+                            summary="人工审批完成，剩余旧计划不再执行",
+                        )
+                        break
                     invocation_index += 1
                 if submitted:
+                    break
+                if user_halted:
+                    final_text = (
+                        "已按你的选择停止本次操作，后续搜索、读取和执行都没有继续。\n\n"
+                        "被拒绝的动作没有执行；此前已经完成的只读检查和文件改动仍然有效。"
+                        "如果还要继续，请明确允许具体操作或给出新的目标。"
+                    )
+                    envelope = fallback_result(
+                        final_text,
+                        changed_files=changed_files,
+                        reason="blocked",
+                    )
+                    structured_result = envelope.to_dict()
+                    reason = "blocked"
+                    self.events.emit(
+                        "approval_denied_result",
+                        turn_id=turn_id,
+                        summary="已按用户拒绝生成确定性终态答复",
+                    )
                     break
         except KeyboardInterrupt:
             reason = "user_interrupt"

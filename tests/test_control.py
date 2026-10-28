@@ -172,6 +172,70 @@ class TurnControllerTests(unittest.TestCase):
         self.assertIsNone(controller.before_model_call())
         self.assertEqual(controller.recovery_count, 1)
 
+    def test_identical_successful_action_is_blocked_after_duplicate_evidence(
+        self,
+    ) -> None:
+        events = RecordingEvents()
+        controller = TurnController(
+            LoopBudgetConfig(
+                no_progress_soft=10,
+                no_progress_hard=20,
+            ),
+            events=events,  # type: ignore[arg-type]
+        )
+        args = {"path": "Desktop/sunus"}
+        for _ in range(2):
+            self.assertIsNone(controller.before_tool("list_files", args))
+            controller.record_tool_result(
+                "list_files",
+                args,
+                ok=True,
+                content="a.txt\nb.txt",
+                changed_files=[],
+            )
+
+        blocked = controller.before_tool("list_files", args)
+
+        self.assertIn("继续重复不会增加信息", blocked or "")
+        self.assertIn(
+            "repeat_evidence_blocked",
+            [event_type for event_type, _ in events.events],
+        )
+
+    def test_new_evidence_or_state_change_clears_duplicate_block(self) -> None:
+        controller = TurnController(
+            LoopBudgetConfig(
+                no_progress_soft=10,
+                no_progress_hard=20,
+            )
+        )
+        args = {"path": "Desktop/sunus"}
+        controller.record_tool_result(
+            "list_files",
+            args,
+            ok=True,
+            content="a.txt",
+            changed_files=[],
+        )
+        controller.record_tool_result(
+            "list_files",
+            args,
+            ok=True,
+            content="a.txt",
+            changed_files=[],
+        )
+        self.assertIsNotNone(controller.before_tool("list_files", args))
+
+        controller.record_tool_result(
+            "write_file",
+            {"path": "Desktop/sunus/new.txt", "content": "new"},
+            ok=True,
+            content="已写入",
+            changed_files=["Desktop/sunus/new.txt"],
+        )
+
+        self.assertIsNone(controller.before_tool("list_files", args))
+
     def test_failure_output_is_evidence_but_not_progress(self) -> None:
         events = RecordingEvents()
         controller = TurnController(

@@ -638,7 +638,10 @@ class MemoryStore:
         reserve_strategy = (
             1 if strategies and limit >= 3 and not rich_primary else 0
         )
-        query_slots = max(1, limit - reserve_pinned - reserve_strategy)
+        query_slots = max(
+            1,
+            limit - reserve_pinned - reserve_strategy,
+        )
         ordered = [
             *primary[:query_slots],
             *(pinned[:1] if reserve_pinned else []),

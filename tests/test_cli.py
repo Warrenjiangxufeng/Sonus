@@ -415,6 +415,54 @@ class CliTests(unittest.TestCase):
         self.assertIn("你 › 排队输入", text)
         self.assertIn("\x1b[1A", text)
 
+    def test_repeated_dock_refresh_does_not_duplicate_activity(self) -> None:
+        output = io.StringIO()
+        now = [30.0]
+        pending = PendingTerminalInput()
+        dock = TerminalInputDock(
+            "你 › ",
+            pending,
+            stream=output,
+            is_tty=True,
+            color_enabled=False,
+        )
+        renderer = RuntimeEventRenderer(
+            color_enabled=False,
+            is_tty=True,
+            activity_stream=output,
+            input_dock=dock,
+            clock=lambda: now[0],
+        )
+        renderer({"type": "model_request", "step": 1})
+        renderer(
+            {
+                "type": "tool_call",
+                "call_id": "call_1",
+                "name": "list_files",
+                "summary": "查看目录 · Desktop/sunus",
+            }
+        )
+        renderer(
+            {
+                "type": "tool_result",
+                "call_id": "call_1",
+                "name": "list_files",
+                "ok": True,
+                "preview": "发现 6 项",
+            }
+        )
+
+        for _ in range(18):
+            now[0] += 1
+            dock.refresh()
+
+        screen = [
+            line
+            for line in _ansi_screen_lines(output.getvalue())
+            if "查看目录 · Desktop/sunus" in line
+        ]
+        self.assertEqual(len(screen), 1)
+
     def test_parses_core_commands(self) -> None:
         parser = make_parser()
         self.assertEqual(parser.parse_args([]).command, None)
@@ -617,11 +665,13 @@ class CliTests(unittest.TestCase):
         now[0] += 12
         renderer._refresh_activity()
         active_lines = dock._activity.splitlines()
-        self.assertIn("先检查当前问题", active_lines[0])
-        self.assertIn("读取文件", active_lines[1])
-        self.assertIn("已读取 1 行", active_lines[2])
-        self.assertIn("思考中", active_lines[-1])
-        self.assertIn("12秒", active_lines[-1])
+        self.assertEqual(len(active_lines), 1)
+        self.assertIn("思考中", active_lines[0])
+        self.assertIn("12秒", active_lines[0])
+        pending_output = output.getvalue()
+        self.assertEqual(pending_output.count("先检查当前问题"), 1)
+        self.assertEqual(pending_output.count("读取文件 · note.txt"), 1)
+        self.assertEqual(pending_output.count("已读取 1 行"), 1)
 
         renderer({"type": "turn_end", "reason": "completed"})
         renderer.commit_turn()

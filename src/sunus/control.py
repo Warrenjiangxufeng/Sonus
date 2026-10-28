@@ -45,7 +45,6 @@ _RUNTIME_COMPATIBILITY_PATTERN = re.compile(
     r")"
 )
 
-
 class TurnController:
     def __init__(
         self,
@@ -77,6 +76,7 @@ class TurnController:
         self.failed_tool_signatures: set[str] = set()
         self.failed_tool_labels: dict[str, str] = {}
         self.recovery_blocked_signatures: set[str] = set()
+        self.duplicate_evidence_signatures: set[str] = set()
         self.search_calls = 0
         self.search_checkpoint_sent = False
         self._warned: set[str] = set()
@@ -115,6 +115,9 @@ class TurnController:
             "consecutive_failures": self.consecutive_failures,
             "recovery_count": self.recovery_count,
             "blocked_tools": len(self.blocked_tool_signatures),
+            "duplicate_evidence_actions": len(
+                self.duplicate_evidence_signatures
+            ),
             "search_calls": self.search_calls,
             "error_fingerprints": len(self.errors),
             "failure_strategies": len(self.failure_strategies),
@@ -274,6 +277,17 @@ class TurnController:
                 summary=reason,
             )
             return reason
+        if signature in self.duplicate_evidence_signatures:
+            reason = (
+                "相同动作已经返回过完全相同的证据，继续重复不会增加信息。"
+                "请改变参数、改变证据来源，或基于已有证据回答。"
+            )
+            self._emit(
+                "repeat_evidence_blocked",
+                name=name,
+                summary=reason,
+            )
+            return reason
         return None
 
     def record_tool_result(
@@ -299,6 +313,9 @@ class TurnController:
         new_evidence = evidence not in self.evidence_seen
         if new_evidence:
             self.evidence_seen.add(evidence)
+            self.duplicate_evidence_signatures.discard(signature)
+        elif ok and not changed_files and not state_changed:
+            self.duplicate_evidence_signatures.add(signature)
 
         if ok and new_evidence:
             self.round_has_progress = True
@@ -397,6 +414,7 @@ class TurnController:
         self.failed_tool_signatures.clear()
         self.failed_tool_labels.clear()
         self.recovery_blocked_signatures.clear()
+        self.duplicate_evidence_signatures.clear()
         if had_failures:
             self._emit(
                 "failure_state_reset",

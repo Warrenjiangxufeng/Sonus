@@ -642,6 +642,65 @@ class ProactiveTests(unittest.TestCase):
             self.assertEqual(model.calls, 1)
             memory.close()
 
+    def test_self_directed_write_is_optional_without_a_scheduled_task(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / "diary" / "today.txt"
+            memory = MemoryStore(root / "memory.db")
+            model = ActionJsonModel(
+                {
+                    "tool": "write_file",
+                    "arguments": {
+                        "path": str(target),
+                        "content": "今天这件事值得留下来。",
+                    },
+                    "reason": "此刻确有想记住的内容",
+                }
+            )
+            service = ProactiveService(
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                scope=str(root),
+                config=ProactiveConfig(),
+                action_catalog=(
+                    {
+                        "name": "write_file",
+                        "description": "Write a new file.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content": {"type": "string"},
+                            },
+                        },
+                    },
+                ),
+                writable_paths=(str(root / "diary"),),
+            )
+
+            _text, meta = service.generate(sequence_index=0)
+
+            self.assertIsNone(meta["proactive_task"])
+            self.assertEqual(meta["action"]["tool"], "write_file")
+            self.assertIn("不是日程", model.last_user_prompt)
+            self.assertIn(str(root / "diary"), model.last_user_prompt)
+            self.assertIn("动作不是义务", model.last_system_prompt)
+            self.assertIn("今天还没写日记", model.last_system_prompt)
+            memory.close()
+
+    def test_scheduler_does_not_seed_a_fixed_diary_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            scheduler = ProactiveScheduler(
+                Path(temp) / "state.db",
+                ProactiveConfig(),
+                "no_fixed_diary",
+            )
+
+            self.assertEqual(scheduler.list_tasks(), [])
+            scheduler.close()
+
     def test_due_task_generates_diary_message_and_write_action(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

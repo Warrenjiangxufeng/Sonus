@@ -897,6 +897,76 @@ class AuthorizationThenResultModel:
         )
 
 
+class AuthorizationBatchThenSearchModel:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.second_tool_names: set[str] = set()
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.calls += 1
+        if self.calls == 1:
+            tool_calls = [
+                {
+                    "id": "call_auth_batch",
+                    "type": "function",
+                    "function": {
+                        "name": "request_authorization",
+                        "arguments": json.dumps(
+                            {
+                                "capability": "network",
+                                "reason": "需要访问外部页面继续检查",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                },
+                {
+                    "id": "call_stale_search",
+                    "type": "function",
+                    "function": {
+                        "name": "search_text",
+                        "arguments": json.dumps(
+                            {
+                                "path": ".",
+                                "query": "stale-search-after-approval",
+                            }
+                        ),
+                    },
+                },
+            ]
+        else:
+            self.second_tool_names = {
+                item["function"]["name"] for item in tools or []
+            }
+            tool_calls = [
+                {
+                    "id": "call_auth_blocked",
+                    "type": "function",
+                    "function": {
+                        "name": "submit_result",
+                        "arguments": json.dumps(
+                            {
+                                "kind": "blocked",
+                                "status": "blocked",
+                                "summary": "已按你的选择停止，没有继续搜索。",
+                                "next_action": "需要时再明确授权网络访问。",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                }
+            ]
+        return ModelReply(
+            message={
+                "role": "assistant",
+                "content": None,
+                "tool_calls": tool_calls,
+            },
+            usage={"total_tokens": 5},
+            finish_reason="tool_calls",
+        )
+
+
 class CommandAuthorizationThenRunModel:
     def __init__(self) -> None:
         self.calls = 0
@@ -1325,6 +1395,62 @@ class AgentTests(unittest.TestCase):
             self.assertNotIn("patch_file", model.tool_name_sets[0])
             self.assertIn("patch_file", model.tool_name_sets[1])
             self.assertIn("run_command", model.tool_name_sets[1])
+            memory.close()
+
+    def test_denied_authorization_stops_the_rest_of_the_tool_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_authorize_batch", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=True,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+            )
+            model = AuthorizationBatchThenSearchModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            with (
+                patch("sunus.policy._choose_approval_option", return_value=2),
+                patch("sunus.policy.sys.stdin.isatty", return_value=True),
+            ):
+                result = agent.run_turn("检查本机状态")
+
+            self.assertEqual(result.reason, "blocked")
+            self.assertEqual(model.calls, 1)
+            self.assertEqual(model.second_tool_names, set())
+            self.assertEqual(
+                [trace["name"] for trace in result.tool_traces],
+                ["request_authorization"],
+            )
+            events_text = events.path.read_text(encoding="utf-8")
+            self.assertIn('"type":"approval_denied"', events_text)
+            self.assertIn('"type":"approval_denied_result"', events_text)
+            self.assertNotIn('"name":"search_text"', events_text)
             memory.close()
 
     def test_command_authorization_does_not_circuit_on_network_request(self) -> None:
@@ -2339,6 +2465,11 @@ class AgentTests(unittest.TestCase):
             self.assertNotIn("write_file", model.tool_names)
             system_prompt = model.last_messages[0]["content"]
             self.assertIn(f"权威运行数据目录：{data.resolve()}", system_prompt)
+            self.assertIn(
+                f"当前运行源码根目录：{Path(__file__).resolve().parents[1]}",
+                system_prompt,
+            )
+            self.assertIn("仍不唯一或不存在时，向用户询问一个明确路径", system_prompt)
             self.assertIn("本轮未注入某项工具", system_prompt)
             self.assertIn("不代表 Sunus 永久没有该能力", system_prompt)
             self.assertIn("未开放: fetch_url, patch_file, run_command", system_prompt)

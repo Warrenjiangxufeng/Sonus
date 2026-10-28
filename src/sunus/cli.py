@@ -411,7 +411,12 @@ class RuntimeEventRenderer:
 
     def _refresh_activity(self) -> None:
         if self.input_dock is not None:
-            self.input_dock.set_activity("\n".join(self._render_chain()))
+            live_lines = (
+                [color(self._thinking_line(), DIM, self.color_enabled)]
+                if self._thinking_active
+                else []
+            )
+            self.input_dock.set_activity("\n".join(live_lines))
             self._line_active = bool(self._chain_lines or self._thinking_active)
             return
         if not self.is_tty:
@@ -431,15 +436,17 @@ class RuntimeEventRenderer:
         with self._activity_lock:
             self._chain_lines.append((clean, code))
             if self.input_dock is not None:
-                self._refresh_activity()
+                self.input_dock.clear()
+            elif not self.is_tty:
                 return
+            elif self._line_active:
+                self.activity_stream.write("\r\x1b[2K")
+                self.activity_stream.flush()
             if not self.is_tty:
                 return
-            if self._line_active:
-                self.activity_stream.write("\r\x1b[2K")
             print(
                 color(clean, code, self.color_enabled),
-                file=self.activity_stream,
+                file=self.completion_stream,
                 flush=True,
             )
             self._line_active = False
@@ -503,9 +510,8 @@ class RuntimeEventRenderer:
                 self.activity_stream.flush()
             self._line_active = False
             if pending is not None and self.is_tty:
-                self._chain_lines.append(pending)
                 print(
-                    "\n".join(self._render_chain()),
+                    color(pending[0], pending[1], self.color_enabled),
                     file=self.completion_stream,
                     flush=True,
                 )
@@ -1035,6 +1041,10 @@ def build_components(
             persona=config.persona,
             action_catalog=action_catalog,
             thoughts=scheduler.thoughts,
+            writable_paths=(
+                str(config.workspace.resolve()),
+                *(str(path) for path in config.write_allowlist),
+            ),
         )
         agent = Agent(
             config=config,

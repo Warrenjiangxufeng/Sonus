@@ -8,6 +8,7 @@ from sunus.thinking_operators import (
     COGNITIVE_INVARIANTS,
     OPERATOR_ACTIONS,
     OPERATOR_LIBRARY,
+    REASONING_LOOP,
     cognitive_protocol_prompt,
 )
 
@@ -26,10 +27,24 @@ class ThinkingOperatorTests(unittest.TestCase):
         self.assertIn("演绎", prompt)
         self.assertIn("心理理论", prompt)
         self.assertIn("反向复核", prompt)
+        self.assertIn("工具只是取证手段", prompt)
+        self.assertIn("不按工具类型或固定步数", prompt)
+        self.assertIn("消除未知、改变假设或缩小范围", prompt)
         for invariant in COGNITIVE_INVARIANTS:
             self.assertIn(invariant, prompt)
         self.assertNotIn("当前首选思维算子", prompt)
         self.assertNotIn("修改交付=", prompt)
+
+    def test_protocol_contains_generic_reasoning_loop(self) -> None:
+        prompt = cognitive_protocol_prompt()
+
+        self.assertEqual(len(REASONING_LOOP), 7)
+        self.assertIn("先判断当前究竟要理解", prompt)
+        self.assertIn("什么结果会支持、反驳或区分候选", prompt)
+        self.assertIn("无法指出仍缺的具体事实", prompt)
+        self.assertIn("证据足够就回答", prompt)
+        self.assertIn("缺少用户才能提供的信息就提问", prompt)
+        self.assertIn("资源上限只作最后安全边界", prompt)
 
     def test_task_prompts_expose_cognition_but_model_chooses_lenses(self) -> None:
         texts = [

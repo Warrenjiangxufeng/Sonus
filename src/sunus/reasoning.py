@@ -21,7 +21,10 @@ _DIAGNOSTIC_PATTERN = re.compile(
 _STATUS_QUERY_PATTERN = re.compile(
     r"(?:git\s+status|ahead|behind|"
     r"(?:有没有|是否|看看|检查|查看|确认).{0,30}"
-    r"(?:提交|推送|同步|状态|干净|改动)|"
+    r"(?:提交|推送|同步|状态|干净|改动|优化|改好|修好|生效|完成|更新|"
+    r"实现|存在|保留)|"
+    r"(?:看看|检查|查看|确认).{0,30}"
+    r"(?:有没有|是否).{0,30}(?:优化|改好|修好|生效|完成|更新|实现|存在|保留)|"
     r"(?:提交|推送|同步).{0,16}(?:没有|没|吗|状态|完成))",
     re.IGNORECASE,
 )
@@ -59,7 +62,6 @@ class ReasoningPlan:
     complexity: str
     capabilities: tuple[str, ...]
     preferred_tools: tuple[str, ...]
-    max_exploration_calls: int
     stop_condition: str
     answer_style: str
     drop_details: bool = False
@@ -74,7 +76,6 @@ class ReasoningPlan:
             f"- 复杂度: {self.complexity}",
             f"- 必需能力: {', '.join(self.capabilities) or '无副作用'}",
             f"- 首选路径: {', '.join(self.preferred_tools) or '直接回答'}",
-            f"- 探索上限: {self.max_exploration_calls} 个动作",
             f"- 停止条件: {self.stop_condition}",
             f"- 表达: {self.answer_style}",
         ]
@@ -115,7 +116,6 @@ def _build_reasoning_plan(
             complexity="低",
             capabilities=(),
             preferred_tools=(),
-            max_exploration_calls=0,
             stop_condition="回应当下主要需求后立即停止，不展开成分析报告。",
             answer_style=(
                 "像正常熟人说话；长度和结构由当前内容决定；"
@@ -134,7 +134,6 @@ def _build_reasoning_plan(
             complexity="低",
             capabilities=capabilities,
             preferred_tools=("最小只读检查", "直接回答"),
-            max_exploration_calls=3,
             stop_condition="拿到状态和关键标识即停止，不扩展未点名对象。",
             answer_style="首句给结论，1-3 句；details 留空，不复述工具日志。",
             drop_details=True,
@@ -145,7 +144,6 @@ def _build_reasoning_plan(
             complexity="高",
             capabilities=capabilities,
             preferred_tools=("inspect_code_state", "submit_result"),
-            max_exploration_calls=4,
             stop_condition=(
                 "取得当前 HEAD、精确符号命中、命中上下文和 Git 归属后停止。"
             ),
@@ -162,7 +160,6 @@ def _build_reasoning_plan(
             complexity="中",
             capabilities=capabilities or ("command",),
             preferred_tools=("inspect_environment", "playwright-cli", "inspect_browser"),
-            max_exploration_calls=5,
             stop_condition=(
                 "版本不兼容、登录页、验证码或现有 Chrome 状态无法复用时立即停止并说明下一步。"
             ),
@@ -183,7 +180,6 @@ def _build_reasoning_plan(
             complexity="高",
             capabilities=capabilities,
             preferred_tools=tools,
-            max_exploration_calls=6,
             stop_condition=(
                 "证据足以区分假设后停止；两个以上候选无法区分时询问一个时间或对象锚点。"
             ),
@@ -200,7 +196,6 @@ def _build_reasoning_plan(
             complexity="低",
             capabilities=capabilities or ("command",),
             preferred_tools=("inspect_browser", "submit_result"),
-            max_exploration_calls=2,
             stop_condition=(
                 "拿到页面标题、URL或正文即停止；权限关闭时说明一个恢复入口，不猜内容。"
             ),
@@ -214,7 +209,6 @@ def _build_reasoning_plan(
             complexity="低",
             capabilities=capabilities,
             preferred_tools=("list_files", "search_text", "read_file"),
-            max_exploration_calls=4,
             stop_condition="拿到点名对象的结果即停止，不扩大目录。",
             answer_style="直接结果，1-3 句；details 留空。",
             drop_details=True,
@@ -225,7 +219,6 @@ def _build_reasoning_plan(
             complexity="中",
             capabilities=capabilities or ("write", "command"),
             preferred_tools=("read_file", "patch_file", "run_command", "submit_result"),
-            max_exploration_calls=8,
             stop_condition="改动验证完成或出现明确阻塞即停止。",
             answer_style="简要说明改动、验证结果和剩余风险。",
             strategy="先读后改；修改后运行最相关验证。",
@@ -235,7 +228,6 @@ def _build_reasoning_plan(
         complexity="低",
         capabilities=capabilities,
         preferred_tools=("按需使用最小只读工具",),
-        max_exploration_calls=4,
         stop_condition="足以回答时立即停止。",
         answer_style="结论先行，最长 3 个短段。",
     )

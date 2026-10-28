@@ -521,7 +521,7 @@ def command_denial_reason(command: str) -> str:
 _APPROVAL_OPTIONS = (
     "允许本次（↑/↓ 选择 · Enter / y）",
     "本会话全部允许（↑/↓ 选择 · 2 / a）",
-    "拒绝（↑/↓ 选择 · 3 / x / Esc）",
+    "拒绝（↑/↓ 选择 · 3 / x / Esc / Tab）",
 )
 _APPROVAL_SELECTED = "\x1b[1;7;36m"
 _APPROVAL_DIM = "\x1b[2m"
@@ -535,6 +535,8 @@ def _read_menu_key(descriptor: int) -> str:
     character = read_character()
     if character == "":
         return "EOF"
+    if character == "\t":
+        return "TAB"
     if character in {"\r", "\n"}:
         return "ENTER"
     if character == "\x1b":
@@ -669,7 +671,7 @@ def _choose_approval_option(*, key_reader=None) -> int:
             if rendered:
                 _clear_approval_options()
             return 1
-        elif key in {"3", "x", "n", "ESC", "EOF"}:
+        elif key in {"3", "x", "n", "ESC", "EOF", "TAB"}:
             if rendered:
                 _clear_approval_options()
             return 2
@@ -701,6 +703,7 @@ class ApprovalManager:
         self.prompt_event = prompt_event
         self.before_prompt = before_prompt
         self.after_prompt = after_prompt
+        self._interactive_decision = ""
         self.capability_overrides: dict[str, bool] = {}
         for capability, mode in (persistent_permissions or {}).items():
             if capability not in CAPABILITIES:
@@ -824,6 +827,7 @@ class ApprovalManager:
                 file=sys.stderr,
             )
             return False
+        self._interactive_decision = ""
         try:
             if self.prompt_event is not None:
                 self.prompt_event.set()
@@ -835,6 +839,7 @@ class ApprovalManager:
                 choice = _choose_approval_option()
             except (EOFError, KeyboardInterrupt):
                 print()
+                self._interactive_decision = "cancelled"
                 return False
         finally:
             if self.after_prompt is not None:
@@ -843,8 +848,17 @@ class ApprovalManager:
                 self.prompt_event.clear()
         if choice == 1:
             self.session_allow = True
+            self._interactive_decision = "session_approved"
             return True
+        self._interactive_decision = (
+            "approved" if choice == 0 else "denied"
+        )
         return choice == 0
+
+    def consume_interactive_decision(self) -> str:
+        decision = self._interactive_decision
+        self._interactive_decision = ""
+        return decision
 
     def require_command(self, command: str) -> bool:
         denial = command_denial_reason(command)

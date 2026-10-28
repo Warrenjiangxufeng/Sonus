@@ -23,6 +23,14 @@ from sunus.scope import classify_request
 
 
 class ReasoningTests(unittest.TestCase):
+    def test_read_only_optimization_check_uses_status_plan(self) -> None:
+        plan = build_reasoning_plan(
+            "你再去看看写日记的固定任务有没有优化",
+            classify_request("你再去看看写日记的固定任务有没有优化"),
+        )
+
+        self.assertEqual(plan.mode, "简单状态查询")
+
     def test_diagnostic_requests_are_detected(self) -> None:
         for text in (
             "为什么它查错了目录？",
@@ -145,42 +153,37 @@ class ReasoningTests(unittest.TestCase):
         self.assertIn("不能复用现有 Chrome 登录态", prompt)
         self.assertIn("出现登录页、验证码", prompt)
 
-    def test_single_reasoning_plan_selects_mode_and_stop_budget(self) -> None:
+    def test_single_reasoning_plan_selects_mode_without_tool_step_budget(self) -> None:
         cases = [
             (
                 "用 playwright-cli 处理",
                 "Playwright CLI 工具链",
-                5,
             ),
             (
                 "只读任务：查看当前 Chrome 标签页标题",
                 "浏览器只读查证",
-                2,
             ),
             (
                 "查一下本地代码有没有提交到 git",
                 "简单状态查询",
-                3,
             ),
             (
                 "查一下为什么上次崩溃",
                 "根因诊断",
-                6,
             ),
             (
                 "为什么浏览器页面打不开",
                 "根因诊断",
-                6,
             ),
         ]
-        for text, mode, budget in cases:
+        for text, mode in cases:
             with self.subTest(text=text):
                 plan = build_reasoning_plan(
                     text,
                     classify_request(text),
                 )
                 self.assertEqual(plan.mode, mode)
-                self.assertEqual(plan.max_exploration_calls, budget)
+                self.assertNotIn("探索上限", plan.prompt())
                 self.assertIn("停止条件", plan.prompt())
 
 

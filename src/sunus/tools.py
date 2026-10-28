@@ -220,6 +220,8 @@ class ToolResult:
     changed_files: list[str] = field(default_factory=list)
     artifact: str | None = None
     state_changed: bool = False
+    approval_barrier: bool = False
+    halt: bool = False
 
     def as_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"ok": self.ok, "content": self.content}
@@ -229,6 +231,10 @@ class ToolResult:
             payload["artifact"] = self.artifact
         if self.state_changed:
             payload["state_changed"] = True
+        if self.approval_barrier:
+            payload["approval_barrier"] = True
+        if self.halt:
+            payload["halt"] = True
         return payload
 
 
@@ -640,8 +646,10 @@ def tool_schemas() -> list[dict[str, Any]]:
         fn(
             "schedule_proactive_file_write",
             "Create a structured proactive task to write a file later. "
-            "Use only after an explicit user request. The task source is stored "
-            "in proactive_tasks and is consumed by the proactive scheduler.",
+            "Use only after an explicit user request for a future or recurring "
+            "write. Never use it to turn Sunus's own diary, reflection, or care "
+            "habits into a scheduled obligation. The task is stored in "
+            "proactive_tasks and consumed by the proactive scheduler.",
             {
                 "task_name": {"type": "string"},
                 "instruction": {"type": "string"},
@@ -977,7 +985,9 @@ class ToolExecutor:
                 f"{name}\n{json.dumps(arguments, ensure_ascii=False)[:2000]}",
                 risk=spec.risk,
             ):
-                return ToolResult(False, f"用户拒绝 MCP 工具: {name}")
+                return self._attach_approval_decision(
+                    ToolResult(False, f"用户拒绝 MCP 工具: {name}")
+                )
         if spec.source == "mcp" and spec.timeout_sec > 0:
             try:
                 timeout_sec = int(
@@ -1006,11 +1016,26 @@ class ToolExecutor:
                     f"full output: {artifact}]"
                 )
                 result.artifact = artifact
-            return result
+            return self._attach_approval_decision(result)
         except (PolicyError, OSError, ValueError) as error:
-            return ToolResult(False, f"{type(error).__name__}: {error}")
+            return self._attach_approval_decision(
+                ToolResult(False, f"{type(error).__name__}: {error}")
+            )
         except Exception as error:
-            return ToolResult(False, f"工具异常 {type(error).__name__}: {error}")
+            return self._attach_approval_decision(
+                ToolResult(
+                    False,
+                    f"工具异常 {type(error).__name__}: {error}",
+                )
+            )
+
+    def _attach_approval_decision(self, result: ToolResult) -> ToolResult:
+        decision = self.approvals.consume_interactive_decision()
+        if not decision:
+            return result
+        result.approval_barrier = True
+        result.halt = decision in {"denied", "cancelled"}
+        return result
 
     def _truncate(self, value: str, *, prefix: str) -> tuple[str, str | None]:
         value = redact_text(value, self.secret)
