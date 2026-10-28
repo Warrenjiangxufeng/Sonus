@@ -5,6 +5,7 @@ import json
 import random
 import re
 import sqlite3
+import time as monotonic_time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
@@ -22,6 +23,13 @@ from sunus.embodiment import embodiment_prompt
 from sunus.memory import MemoryStore, memory_context_text
 from sunus.model import ModelClient, ModelError
 from sunus.persona_expression import build_persona_expression
+from sunus.proactive_thinking import (
+    ProactiveThought,
+    ProactiveThoughtStore,
+    ThoughtDecision,
+    ThoughtSeed,
+    classify_response_text,
+)
 from sunus.relationship import relationship_prompt, relationship_stage
 
 
@@ -89,6 +97,8 @@ class PresenceContext:
     idle_seconds: float | None = None
     foreground_app: str = ""
     activity: str = ""
+    long_absence: bool = False
+    daypart: str = ""
 
 
 def _now() -> datetime:
@@ -212,6 +222,34 @@ class ProactiveStatus:
     unanswered_streak: int
     next_delay_sec: int
     topic_index: int
+    stored_unanswered_streak: int = 0
+    daypart: str = ""
+    daypart_changed: bool = False
+
+
+@dataclass(frozen=True)
+class ScheduleState:
+    daypart: str
+    last_daypart: str
+    stored_streak: int
+    effective_streak: int
+    daypart_changed: bool
+    delay: int
+    next_due_at: float
+
+
+RESET_DAYPARTS = frozenset({"morning", "afternoon", "evening"})
+
+
+def proactive_daypart(value: datetime) -> str:
+    local = value.astimezone()
+    if 6 <= local.hour < 12:
+        return "morning"
+    if 12 <= local.hour < 18:
+        return "afternoon"
+    if 18 <= local.hour < 23:
+        return "evening"
+    return "night"
 
 
 @dataclass(frozen=True)
@@ -254,6 +292,7 @@ class ProactiveScheduler:
                     last_user_at REAL,
                     unanswered_streak INTEGER NOT NULL DEFAULT 0,
                     topic_index INTEGER NOT NULL DEFAULT 0,
+                    last_daypart TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS proactive_messages (
@@ -261,6 +300,10 @@ class ProactiveScheduler:
                     session_id TEXT NOT NULL,
                     text TEXT NOT NULL,
                     fingerprint TEXT NOT NULL,
+                    channel TEXT NOT NULL DEFAULT 'social',
+                    thought_id TEXT NOT NULL DEFAULT '',
+                    response_outcome TEXT NOT NULL DEFAULT '',
+                    responded_at REAL,
                     created_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS proactive_tasks (
@@ -274,6 +317,7 @@ class ProactiveScheduler:
                     status TEXT NOT NULL DEFAULT 'active',
                     next_due_at REAL NOT NULL,
                     last_completed_at REAL,
+                    lease_until REAL,
                     source_memory_id TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -291,7 +335,54 @@ class ProactiveScheduler:
                     "ALTER TABLE proactive_state ADD COLUMN "
                     "topic_index INTEGER NOT NULL DEFAULT 0"
                 )
+            if "last_daypart" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE proactive_state ADD COLUMN "
+                    "last_daypart TEXT NOT NULL DEFAULT ''"
+                )
+            message_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(proactive_messages)"
+                ).fetchall()
+            }
+            if "channel" not in message_columns:
+                self._connection.execute(
+                    "ALTER TABLE proactive_messages ADD COLUMN "
+                    "channel TEXT NOT NULL DEFAULT 'social'"
+                )
+            if "thought_id" not in message_columns:
+                self._connection.execute(
+                    "ALTER TABLE proactive_messages ADD COLUMN "
+                    "thought_id TEXT NOT NULL DEFAULT ''"
+                )
+            if "response_outcome" not in message_columns:
+                self._connection.execute(
+                    "ALTER TABLE proactive_messages ADD COLUMN "
+                    "response_outcome TEXT NOT NULL DEFAULT ''"
+                )
+            if "responded_at" not in message_columns:
+                self._connection.execute(
+                    "ALTER TABLE proactive_messages ADD COLUMN "
+                    "responded_at REAL"
+                )
+            task_columns = {
+                str(row["name"])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(proactive_tasks)"
+                ).fetchall()
+            }
+            if "lease_until" not in task_columns:
+                self._connection.execute(
+                    "ALTER TABLE proactive_tasks ADD COLUMN lease_until REAL"
+                )
         self.start()
+        self.thoughts = ProactiveThoughtStore(
+            self._connection,
+            session_id,
+            config,
+            clock=clock,
+        )
 
     def close(self) -> None:
         self._connection.close()
@@ -301,19 +392,46 @@ class ProactiveScheduler:
 
     def start(self) -> None:
         now = self._timestamp()
+        current_daypart = proactive_daypart(self.clock())
         with self._connection:
             self._connection.execute(
                 """
                 INSERT OR IGNORE INTO proactive_state(
-                    session_id, paused, next_due_at, unanswered_streak, updated_at
-                ) VALUES (?, 0, ?, 0, ?)
+                    session_id, paused, next_due_at, unanswered_streak,
+                    last_daypart, updated_at
+                ) VALUES (?, 0, ?, 0, ?, ?)
                 """,
                 (
                     self.session_id,
                     now + self.config.base_interval_sec,
+                    current_daypart,
                     datetime.fromtimestamp(now, timezone.utc).isoformat(),
                 ),
             )
+            rows = self._connection.execute(
+                """
+                SELECT session_id, last_daypart, last_sent_at, last_user_at
+                FROM proactive_state
+                WHERE session_id = ?
+                """,
+                (self.session_id,),
+            ).fetchall()
+            for row in rows:
+                if str(row["last_daypart"] or "").strip():
+                    continue
+                anchor_value = row["last_sent_at"] or row["last_user_at"] or now
+                anchor = datetime.fromtimestamp(
+                    float(anchor_value),
+                    timezone.utc,
+                ).astimezone()
+                self._connection.execute(
+                    """
+                    UPDATE proactive_state
+                    SET last_daypart = ?
+                    WHERE session_id = ?
+                    """,
+                    (proactive_daypart(anchor), self.session_id),
+                )
 
     def _row(self) -> sqlite3.Row:
         row = self._connection.execute(
@@ -330,26 +448,71 @@ class ProactiveScheduler:
             raise RuntimeError("无法初始化主动陪伴状态")
         return row
 
+    def _compute_delay(self, streak: int) -> int:
+        safe_streak = min(32, max(0, int(streak)))
+        raw = (
+            self.config.base_interval_sec
+            * self.config.backoff_factor**safe_streak
+        )
+        ceiling = max(
+            self.config.base_interval_sec,
+            self.config.max_interval_sec,
+        )
+        return int(min(ceiling, raw))
+
+    def _schedule_state(self, now: float | None = None) -> ScheduleState:
+        current_ts = self._timestamp() if now is None else float(now)
+        row = self._row()
+        daypart = proactive_daypart(
+            datetime.fromtimestamp(current_ts, timezone.utc).astimezone()
+        )
+        last_daypart = str(row["last_daypart"] or "")
+        stored_streak = int(row["unanswered_streak"])
+        daypart_changed = bool(
+            daypart in RESET_DAYPARTS and last_daypart != daypart
+        )
+        effective_streak = 0 if daypart_changed else stored_streak
+        delay = self._compute_delay(effective_streak)
+        if daypart_changed:
+            anchor = (
+                float(row["last_sent_at"])
+                if row["last_sent_at"] is not None
+                else float(row["last_user_at"])
+                if row["last_user_at"] is not None
+                else current_ts
+            )
+            next_due_at = anchor + self.config.base_interval_sec
+        else:
+            next_due_at = float(row["next_due_at"])
+        return ScheduleState(
+            daypart=daypart,
+            last_daypart=last_daypart,
+            stored_streak=stored_streak,
+            effective_streak=effective_streak,
+            daypart_changed=daypart_changed,
+            delay=delay,
+            next_due_at=next_due_at,
+        )
+
     def status(self) -> ProactiveStatus:
         row = self._row()
-        streak = int(row["unanswered_streak"])
-        delay = min(
-            2**31 - 1,
-            self.config.base_interval_sec * self.config.backoff_factor**streak,
-        )
+        schedule = self._schedule_state()
         return ProactiveStatus(
             session_id=self.session_id,
             paused=bool(row["paused"]),
-            next_due_at=float(row["next_due_at"]),
+            next_due_at=schedule.next_due_at,
             last_sent_at=(
                 float(row["last_sent_at"]) if row["last_sent_at"] is not None else None
             ),
             last_user_at=(
                 float(row["last_user_at"]) if row["last_user_at"] is not None else None
             ),
-            unanswered_streak=streak,
-            next_delay_sec=delay,
+            unanswered_streak=schedule.effective_streak,
+            next_delay_sec=schedule.delay,
             topic_index=int(row["topic_index"]),
+            stored_unanswered_streak=schedule.stored_streak,
+            daypart=schedule.daypart,
+            daypart_changed=schedule.daypart_changed,
         )
 
     def current_topic_index(self) -> int:
@@ -371,10 +534,7 @@ class ProactiveScheduler:
         idle = self.idle_seconds()
         if idle is None:
             return True, None
-        return (
-            self.config.min_idle_sec <= idle <= self.config.max_idle_sec,
-            idle,
-        )
+        return idle >= self.config.min_idle_sec, idle
 
     def defer(self, seconds: int = 30) -> int:
         delay = max(1, int(seconds))
@@ -394,44 +554,69 @@ class ProactiveScheduler:
             )
         return delay
 
-    def user_activity(self) -> None:
+    def user_activity(self, *, text: str = "") -> None:
         now = self._timestamp()
+        daypart = proactive_daypart(self.clock())
+        if text and self.thoughts is not None:
+            outcome = classify_response_text(text)
+            self.thoughts.observe_response(outcome)
         with self._connection:
             self._connection.execute(
                 """
                 UPDATE proactive_state
                 SET last_user_at = ?, unanswered_streak = 0,
-                    next_due_at = ?, updated_at = ?
+                    next_due_at = ?, last_daypart = ?, updated_at = ?
                 WHERE session_id = ?
                 """,
                 (
                     now,
                     now + self.config.base_interval_sec,
+                    daypart,
                     datetime.fromtimestamp(now, timezone.utc).isoformat(),
                     self.session_id,
                 ),
             )
 
-    def mark_sent(self) -> int:
+    def acknowledge_daypart(self) -> None:
         now = self._timestamp()
-        current = int(self._row()["unanswered_streak"])
-        streak = current + 1
-        delay = min(
-            2**31 - 1,
-            self.config.base_interval_sec * self.config.backoff_factor**streak,
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE proactive_state
+                SET last_daypart = ?, updated_at = ?
+                WHERE session_id = ?
+                """,
+                (
+                    proactive_daypart(self.clock()),
+                    datetime.fromtimestamp(now, timezone.utc).isoformat(),
+                    self.session_id,
+                ),
+            )
+
+    def mark_sent(self, *, channel: str = "social") -> int:
+        if channel != "social":
+            return 0
+        now = self._timestamp()
+        schedule = self._schedule_state(now)
+        streak = (
+            1
+            if schedule.daypart_changed
+            else schedule.stored_streak + 1
         )
+        delay = self._compute_delay(streak)
         with self._connection:
             self._connection.execute(
                 """
                 UPDATE proactive_state
                 SET last_sent_at = ?, unanswered_streak = ?,
-                    next_due_at = ?, updated_at = ?
+                    next_due_at = ?, last_daypart = ?, updated_at = ?
                 WHERE session_id = ?
                 """,
                 (
                     now,
                     streak,
                     now + delay,
+                    schedule.daypart,
                     datetime.fromtimestamp(now, timezone.utc).isoformat(),
                     self.session_id,
                 ),
@@ -465,16 +650,18 @@ class ProactiveScheduler:
 
     def resume(self) -> None:
         now = self._timestamp()
+        daypart = proactive_daypart(self.clock())
         with self._connection:
             self._connection.execute(
                 """
                 UPDATE proactive_state
                 SET paused = 0, unanswered_streak = 0,
-                    next_due_at = ?, updated_at = ?
+                    next_due_at = ?, last_daypart = ?, updated_at = ?
                 WHERE session_id = ?
                 """,
                 (
                     now + self.config.base_interval_sec,
+                    daypart,
                     datetime.fromtimestamp(now, timezone.utc).isoformat(),
                     self.session_id,
                 ),
@@ -482,57 +669,77 @@ class ProactiveScheduler:
 
     def reset(self) -> None:
         now = self._timestamp()
+        daypart = proactive_daypart(self.clock())
         with self._connection:
             self._connection.execute(
                 """
                 UPDATE proactive_state
                 SET unanswered_streak = 0, topic_index = 0,
-                    next_due_at = ?, updated_at = ?
+                    next_due_at = ?, last_daypart = ?, updated_at = ?
                 WHERE session_id = ?
                 """,
                 (
                     now + self.config.base_interval_sec,
+                    daypart,
                     datetime.fromtimestamp(now, timezone.utc).isoformat(),
                     self.session_id,
                 ),
             )
 
-    def record_message(self, text: str) -> str:
+    def record_message(
+        self,
+        text: str,
+        *,
+        channel: str = "social",
+        thought_id: str = "",
+    ) -> str:
         message_id = f"p_{uuid.uuid4().hex[:12]}"
         fingerprint = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
         with self._connection:
             self._connection.execute(
                 """
-                INSERT INTO proactive_messages(id, session_id, text, fingerprint, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO proactive_messages(
+                    id, session_id, text, fingerprint,
+                    channel, thought_id, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message_id,
                     self.session_id,
                     redact_text(text),
                     fingerprint,
+                    channel,
+                    thought_id,
                     self.clock().isoformat(),
                 ),
             )
-            self._connection.execute(
-                """
-                UPDATE proactive_state
-                SET topic_index = topic_index + 1
-                WHERE session_id = ?
-                """,
-                (self.session_id,),
-            )
+            if channel == "social":
+                self._connection.execute(
+                    """
+                    UPDATE proactive_state
+                    SET topic_index = topic_index + 1
+                    WHERE session_id = ?
+                    """,
+                    (self.session_id,),
+                )
         return message_id
 
-    def recent_message_texts(self, limit: int = 5) -> list[str]:
+    def recent_message_texts(
+        self,
+        limit: int = 5,
+        *,
+        channel: str = "social",
+    ) -> list[str]:
         rows = self._connection.execute(
             """
             SELECT text FROM proactive_messages
             WHERE session_id = ?
+              AND channel = ?
             ORDER BY created_at DESC
             LIMIT ?
             """,
-            (self.session_id, limit),
+            (self.session_id, channel, limit),
         ).fetchall()
         return [str(row["text"]) for row in rows]
 
@@ -677,10 +884,12 @@ class ProactiveScheduler:
         rows = self._connection.execute(
             """
             SELECT * FROM proactive_tasks
-            WHERE status = 'active' AND next_due_at <= ?
+            WHERE status = 'active'
+              AND next_due_at <= ?
+              AND (lease_until IS NULL OR lease_until <= ?)
             ORDER BY next_due_at, name
             """,
-            (now_dt.timestamp(),),
+            (now_dt.timestamp(), now_dt.timestamp()),
         ).fetchall()
         for row in rows:
             task = self._task_from_row(row)
@@ -691,6 +900,65 @@ class ProactiveScheduler:
                     continue
             return task
         return None
+
+    def has_due_task(self) -> bool:
+        now = self.clock().timestamp()
+        row = self._connection.execute(
+            """
+            SELECT 1 FROM proactive_tasks
+            WHERE status = 'active'
+              AND next_due_at <= ?
+              AND (lease_until IS NULL OR lease_until <= ?)
+            LIMIT 1
+            """,
+            (now, now),
+        ).fetchone()
+        return row is not None
+
+    def claim_due_task(self, *, lease_seconds: int = 300) -> ProactiveTask | None:
+        now = self.clock().timestamp()
+        completed_existing: list[str] = []
+        claimed_task: ProactiveTask | None = None
+        with self._connection:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM proactive_tasks
+                WHERE status = 'active'
+                  AND next_due_at <= ?
+                  AND (lease_until IS NULL OR lease_until <= ?)
+                ORDER BY next_due_at, name
+                """,
+                (now, now),
+            ).fetchall()
+            for row in rows:
+                task = self._task_from_row(row)
+                if task.tool == "write_file":
+                    target = self._task_target(task, self.clock().astimezone())
+                    if target.exists():
+                        completed_existing.append(task.id)
+                        continue
+                claimed = self._connection.execute(
+                    """
+                    UPDATE proactive_tasks
+                    SET lease_until = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND status = 'active'
+                      AND (lease_until IS NULL OR lease_until <= ?)
+                    """,
+                    (
+                        now + max(30, int(lease_seconds)),
+                        datetime.now(timezone.utc).isoformat(),
+                        task.id,
+                        now,
+                    ),
+                )
+                if claimed.rowcount == 1:
+                    claimed_task = task
+                    break
+        for task_id in completed_existing:
+            self.complete_task(task_id)
+        return claimed_task
 
     def complete_task(self, task_id: str) -> None:
         row = self._connection.execute(
@@ -721,7 +989,7 @@ class ProactiveScheduler:
                 """
                 UPDATE proactive_tasks
                 SET status = ?, next_due_at = ?, last_completed_at = ?,
-                    updated_at = ?
+                    lease_until = NULL, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -739,7 +1007,7 @@ class ProactiveScheduler:
             self._connection.execute(
                 """
                 UPDATE proactive_tasks
-                SET next_due_at = ?, updated_at = ?
+                SET next_due_at = ?, lease_until = NULL, updated_at = ?
                 WHERE id = ? AND status = 'active'
                 """,
                 (
@@ -761,6 +1029,7 @@ class ProactiveService:
         persona: PersonaConfig | None = None,
         random_source: random.Random | None = None,
         action_catalog: tuple[dict[str, Any], ...] = (),
+        thoughts: ProactiveThoughtStore | None = None,
     ) -> None:
         self.model = model
         self.memory = memory
@@ -776,8 +1045,161 @@ class ProactiveService:
             for item in action_catalog
             if str(item.get("name") or "")
         }
+        self.thoughts = thoughts
         self._sequence_offset = 0
         self._last_intent = ""
+        self._last_thought_refresh_at = 0.0
+
+    def _seed_thoughts(
+        self,
+        *,
+        daypart_changed: bool,
+    ) -> None:
+        if self.thoughts is None:
+            return
+        now = datetime.now().astimezone()
+        if daypart_changed:
+            daypart = proactive_daypart(now)
+            self.thoughts.upsert(
+                ThoughtSeed(
+                    question=(
+                        f"{daypart} 时段复盘：检查未闭合事项、过期议题"
+                        "和上一时段主动表达效果"
+                    ),
+                    source_kind="daypart_review",
+                    source_ref=f"{now.date().isoformat()}:{daypart}",
+                    confidence=1.0,
+                    importance=0.42,
+                    action_hint="review",
+                    prediction="仅做内部复盘，不要求用户回复",
+                    expires_in_sec=12 * 3600,
+                )
+            )
+
+        unresolved = self._unresolved_project_evidence()
+        for index, item in enumerate(unresolved[:4]):
+            content = " ".join(str(item.get("content") or "").split())[:220]
+            if not content:
+                continue
+            self.thoughts.upsert(
+                ThoughtSeed(
+                    question=f"跟进未闭合事项：{content}",
+                    source_kind="project",
+                    source_ref=str(item.get("id") or f"project:{index}"),
+                    confidence=0.72,
+                    importance=0.78,
+                    action_hint="message",
+                    prediction="用户可能愿意继续一个具体、未闭合的问题",
+                    evidence_refs=(str(item.get("id") or ""),),
+                )
+            )
+
+        recent = self.memory.recent(scope=self.scope, limit=24)
+        seeded = 0
+        for item in recent:
+            content = " ".join(str(item.get("content") or "").split())
+            if not content:
+                continue
+            tags = str(item.get("tags") or "")
+            unresolved_marker = bool(
+                re.search(
+                    r"(?:还没|待续|未完成|下次|计划|准备|不确定|"
+                    r"想知道|需要确认|失败|报错|问题)",
+                    content,
+                )
+                or "failed" in tags
+                or "pending" in tags
+            )
+            interest_marker = bool(
+                re.search(r"(?:喜欢|兴趣|好奇|想了解|关注|期待)", content)
+            )
+            if not unresolved_marker and not interest_marker:
+                continue
+            action = "verify" if "失败" in content or "报错" in content else "message"
+            self.thoughts.upsert(
+                ThoughtSeed(
+                    question=f"回顾并判断是否值得继续：{content[:180]}",
+                    source_kind="curiosity" if interest_marker else "memory_gap",
+                    source_ref=str(item.get("id") or ""),
+                    confidence=0.55,
+                    importance=0.64 if unresolved_marker else 0.55,
+                    action_hint=action,
+                    prediction=(
+                        "先确认证据是否变化，低负担地继续"
+                        if action == "verify"
+                        else "用户可能愿意分享这条真实兴趣或进展"
+                    ),
+                    evidence_refs=(str(item.get("id") or ""),),
+                )
+            )
+            seeded += 1
+            if seeded >= 6:
+                break
+
+        if seeded == 0 and recent:
+            latest = " ".join(
+                str(recent[0].get("content") or "").split()
+            )[:220]
+            if latest:
+                self.thoughts.upsert(
+                    ThoughtSeed(
+                        question=f"从最近交流里找一个可自然延续的真实点：{latest}",
+                        source_kind="curiosity",
+                        source_ref=str(recent[0].get("id") or ""),
+                        confidence=0.48,
+                        importance=0.58,
+                        action_hint="message",
+                        prediction="低负担延续最近交流，不要求用户解释或回复",
+                        evidence_refs=(str(recent[0].get("id") or ""),),
+                    )
+                )
+
+        feedback = set(self.affect.snapshot().response_feedback[-4:])
+        if feedback & {"回应被纠正", "对方仍不安", "对方拉开距离"}:
+            daypart = proactive_daypart(now)
+            self.thoughts.upsert(
+                ThoughtSeed(
+                    question="上一轮关系回应可能没有被接住，先判断是否适合修复",
+                    source_kind="repair",
+                    source_ref=f"{now.date().isoformat()}:{daypart}",
+                    confidence=0.82,
+                    importance=0.9,
+                    action_hint="message",
+                    prediction="上一轮回应没有被接住，本次应短并留空间",
+                    evidence_refs=tuple(sorted(feedback)),
+                    expires_in_sec=36 * 3600,
+                )
+            )
+
+    def think(
+        self,
+        *,
+        daypart_changed: bool = False,
+    ) -> ThoughtDecision | None:
+        if self.thoughts is None:
+            return None
+        self._seed_thoughts(daypart_changed=daypart_changed)
+        return self.thoughts.select(daypart_changed=daypart_changed)
+
+    def refresh_thoughts(
+        self,
+        *,
+        daypart_changed: bool = False,
+        force: bool = False,
+    ) -> bool:
+        if self.thoughts is None:
+            return False
+        now = monotonic_time.monotonic()
+        if (
+            not force
+            and not daypart_changed
+            and now - self._last_thought_refresh_at
+            < self.config.thought_review_interval_sec
+        ):
+            return False
+        self._last_thought_refresh_at = now
+        self._seed_thoughts(daypart_changed=daypart_changed)
+        return True
 
     def generate(
         self,
@@ -786,6 +1208,8 @@ class ProactiveService:
         sequence_index: int | None = None,
         presence: PresenceContext | None = None,
         pending_task: ProactiveTask | None = None,
+        thought: ProactiveThought | None = None,
+        thought_score: float = 0.0,
     ) -> tuple[str, dict[str, Any]]:
         now = datetime.now().astimezone()
         task_path = (
@@ -850,6 +1274,21 @@ class ProactiveService:
         topic = eligible_schedule[topic_index % len(eligible_schedule)]
         base_topic = topic
         topic_weight = dict(eligible_weights).get(topic, 0)
+        if thought is not None:
+            thought_topic = {
+                "project": "work_coding",
+                "repair": "daily_emotion",
+                "curiosity": "user_custom",
+                "memory_gap": "self_evolution",
+                "daypart_review": "daily_emotion",
+            }.get(thought.source_kind, base_topic)
+            if thought_topic in dict(self.config.topic_weights):
+                base_topic = thought_topic
+                topic = thought_topic
+                topic_weight = dict(self.config.topic_weights).get(
+                    thought_topic,
+                    0,
+                )
         if pending_task is not None:
             topic = "daily_emotion"
             base_topic = "daily_emotion"
@@ -995,6 +1434,10 @@ class ProactiveService:
                 presence_lines.append(
                     f"用户最近一次明确交互距今约 {int(presence.idle_seconds)} 秒。"
                 )
+            if presence.long_absence:
+                presence_lines.append(
+                    "这是一次长空闲后的低压力开口机会；不要追问为什么没回复。"
+                )
             if presence.foreground_app:
                 presence_lines.append(
                     f"当前可能在前台使用：{presence.foreground_app[:80]}。"
@@ -1093,6 +1536,20 @@ class ProactiveService:
             if pending_task is not None
             else topic_instruction
         )
+        thought_context = (
+            f"""本轮持久议题：
+- 议题 ID：{thought.id}
+- 问题：{thought.question}
+- 来源：{thought.source_kind}
+- 来源引用：{thought.source_ref}
+- 置信度：{thought.confidence:.2f}
+- 行动倾向：{thought.action_hint}
+- 发送预期：{thought.prediction or '未记录'}
+- 证据引用：{', '.join(thought.evidence_refs) or '无'}
+先核对证据是否仍然成立。若证据已失效，应让消息自然收束，不强行延续旧议题。"""
+            if thought is not None
+            else "本轮没有持久议题；不要凭空制造需要长期追问的问题。"
+        )
         user_prompt = f"""当前时间：{now:%Y-%m-%d %H:%M %Z}
 当前时段：{daypart}
 当前工作区：{self.scope}
@@ -1108,6 +1565,7 @@ class ProactiveService:
 工作消息闸门：{work_gate_context}
 待执行主动待办（优先级高于普通五类话题）：
 {task_context}
+{thought_context}
 关系语境：
 {relationship_context}
 {sunus_gender_context}
@@ -1162,14 +1620,16 @@ class ProactiveService:
         system_prompt = f"""你是{persona_name}的主动陪伴模块。
 {persona_rules}
 {relationship_rules}
-{embodiment_prompt()}
-{self.affect.prompt_block()}
+{embodiment_prompt(stage_directions=self.persona.stage_directions)}
+{self.affect.prompt_block(relationship_stage=relationship_stage(self.persona.relationship))}
 生成前快速完成一次轻量选题判断，不展开长推理，也不输出推理步骤：
 1. 关系理解：从用户明确设定、称呼和历史互动中理解双方角色、亲疏、边界与表达习惯，不套社会刻板印象。
 2. 证据汇集：从最近偏好、最近交流、关系候选记忆、定向召回、稳定性格和已发消息中找出可延续的人物、事件、兴趣、计划或未闭合话题。
 3. 候选生成：形成多个具体话题候选，每个候选至少绑定一条真实记忆或当前情境；删除只有“在干嘛/吃了吗”和无依据的内容。
 4. 选择判断：比较证据强度、关系适配、时效性、回复负担、新颖度和最近重复度，自行选择最自然的一项；需要时可以组合人物、事件和当前时段。
 5. 表达：按人物关系与性格刻度写成一句，不复述推理，也不把“参考话题”当成必须逐项执行的清单。
+如果提供了“本轮持久议题”，先核对其中证据是否仍成立；议题只提供思考连续性，
+不等于必须追问或展开。证据失效时应改为当下更自然的内容，不能硬接着旧问题说。
 如果存在“待执行主动待办”，它优先于五类话题和表达动作；必须完成该待办，
 不能改成普通关心、闲聊或只承诺以后再做。
 关系只影响亲疏、称呼、关注方向和边界，不得反过来替代事实或替用户补全经历。
@@ -1335,6 +1795,8 @@ message 只表达当前话题，不得声称动作已经成功。"""
                 ),
                 "bubble_seconds": self.config.bubble_seconds,
             },
+            "thought": thought.to_dict() if thought is not None else None,
+            "thought_score": round(float(thought_score), 3),
             "work_rerouted": work_rerouted,
             "unresolved_project_memory_ids": [
                 item["id"] for item in unresolved_projects

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import tempfile
 import termios
 import threading
@@ -35,6 +36,50 @@ from sunus.cli import (
 )
 from sunus.policy import ApprovalManager
 from sunus.relationship import relationship_from_mapping
+
+
+def _ansi_screen_lines(value: str) -> list[str]:
+    lines = [""]
+    row = 0
+    column = 0
+    index = 0
+    while index < len(value):
+        if value[index] == "\x1b":
+            match = re.match(r"\x1b\[([0-9;?]*)([A-Za-z])", value[index:])
+            if match:
+                parameters, command = match.groups()
+                if command == "A":
+                    amount = int(parameters) if parameters.isdigit() else 1
+                    row = max(0, row - amount)
+                elif command == "C":
+                    amount = int(parameters) if parameters.isdigit() else 1
+                    column += amount
+                elif command == "K":
+                    while len(lines) <= row:
+                        lines.append("")
+                    lines[row] = ""
+                index += len(match.group(0))
+                continue
+            index += 1
+            continue
+        character = value[index]
+        if character == "\r":
+            column = 0
+        elif character == "\n":
+            row += 1
+            column = 0
+            while len(lines) <= row:
+                lines.append("")
+        elif character >= " ":
+            while len(lines) <= row:
+                lines.append("")
+            line = lines[row]
+            if len(line) < column:
+                line += " " * (column - len(line))
+            lines[row] = line[:column] + character + line[column + 1 :]
+            column += 1
+        index += 1
+    return [line.rstrip() for line in lines]
 
 
 class CliTests(unittest.TestCase):
@@ -175,6 +220,7 @@ class CliTests(unittest.TestCase):
                     "高冷=0.9",
                     "--conversation-max-chars",
                     "80",
+                    "--stage-directions",
                     "--context",
                     "task=0.35",
                 ]
@@ -199,6 +245,7 @@ class CliTests(unittest.TestCase):
                 payload["persona"]["conversation_max_chars"],
                 80,
             )
+            self.assertTrue(payload["persona"]["stage_directions"])
             self.assertEqual(
                 payload["persona"]["context_intensity"]["task"],
                 0.35,
@@ -267,6 +314,46 @@ class CliTests(unittest.TestCase):
         set_cbreak.assert_called_once_with(0, when=termios.TCSADRAIN)
         self.assertIn("\x1b[?2004l", output.getvalue())
 
+    def test_proactive_message_leaves_no_empty_prompt_above_it(self) -> None:
+        output = io.StringIO()
+
+        def on_idle(clear_input) -> bool:
+            clear_input()
+            print("Sunus 主动待办\n今天的日记已经写好。")
+            return True
+
+        with (
+            patch("sunus.cli.sys.stdin.isatty", return_value=True),
+            patch("sunus.cli.sys.stdin.fileno", return_value=0),
+            patch(
+                "sunus.cli.termios.tcgetattr",
+                return_value=[0, 0, 0, 0, 0, 0, []],
+            ),
+            patch("sunus.cli.termios.tcsetattr"),
+            patch("sunus.cli.tty.setcbreak"),
+            patch(
+                "sunus.cli.select.select",
+                side_effect=[([], [], []), ([0], [], [])],
+            ),
+            patch("sunus.cli.os.read", return_value=b"\n"),
+            redirect_stdout(output),
+        ):
+            result = _input_with_initial(
+                "你 › ",
+                "",
+                on_idle=on_idle,
+            )
+
+        self.assertEqual(result, "")
+        screen = [
+            line
+            for line in _ansi_screen_lines(output.getvalue())
+            if line
+        ]
+        message_row = screen.index("Sunus 主动待办")
+        self.assertNotIn("你 ›", screen[:message_row])
+        self.assertIn("你 ›", screen[message_row + 1 :])
+
     def test_bracketed_paste_marker_is_not_queued_as_text(self) -> None:
         marker = b"\x1b[200~"
         with (
@@ -296,7 +383,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(action, expected)
 
     def test_wrapped_input_keeps_all_characters(self) -> None:
-        text = "前面输入的完整内容不能缩略"
+        text = "前面输入的完整内容不能缩略" * 20 + "\n最后一行"
         lines, cursor_row, _ = _wrap_input_lines("你 › ", text, len(text), 16)
 
         self.assertGreater(len(lines), 1)
@@ -304,7 +391,8 @@ class CliTests(unittest.TestCase):
             line.replace("你 › ", "", 1).strip()
             for line in lines
         )
-        self.assertEqual(restored, text)
+        self.assertEqual(restored, text.replace("\n", ""))
+        self.assertNotIn("…", "".join(lines))
         self.assertEqual(cursor_row, len(lines) - 1)
 
     def test_input_dock_redraws_activity_and_input_together(self) -> None:
@@ -325,6 +413,7 @@ class CliTests(unittest.TestCase):
         text = output.getvalue()
         self.assertIn("思考中", text)
         self.assertIn("你 › 排队输入", text)
+        self.assertIn("\x1b[1A", text)
 
     def test_parses_core_commands(self) -> None:
         parser = make_parser()
@@ -469,13 +558,222 @@ class CliTests(unittest.TestCase):
             }
         )
         renderer({"type": "turn_end", "reason": "completed"})
+        renderer.commit_turn()
+        renderer.activity_stream.write("最终回答。\n")
         text = output.getvalue()
         self.assertIn("思考中…", text)
         self.assertIn("先检查说明文件", text)
         self.assertIn("读取文件 · note.txt", text)
         self.assertIn("✓ 已读取 12 行", text)
         self.assertIn("✓ 完成 · 1 次分析 · 1 个动作 · 读取 1", text)
+        self.assertNotIn("用时", text)
+        self.assertLess(text.index("✓ 完成"), text.index("最终回答。"))
         self.assertNotIn("sunus test", text)
+
+    def test_runtime_renderer_keeps_thinking_at_bottom_with_elapsed_time(
+        self,
+    ) -> None:
+        output = io.StringIO()
+        now = [100.0]
+        pending = PendingTerminalInput()
+        dock = TerminalInputDock(
+            "你 › ",
+            pending,
+            stream=output,
+            is_tty=True,
+            color_enabled=False,
+        )
+        renderer = RuntimeEventRenderer(
+            color_enabled=False,
+            is_tty=True,
+            activity_stream=output,
+            input_dock=dock,
+            clock=lambda: now[0],
+        )
+        renderer({"type": "model_request", "step": 1})
+        renderer(
+            {
+                "type": "assistant_progress",
+                "summary": "先检查当前问题。",
+            }
+        )
+        renderer(
+            {
+                "type": "tool_call",
+                "call_id": "call_1",
+                "name": "read_file",
+                "summary": "读取文件 · note.txt",
+            }
+        )
+        renderer(
+            {
+                "type": "tool_result",
+                "call_id": "call_1",
+                "name": "read_file",
+                "ok": True,
+                "preview": "已读取 1 行",
+            }
+        )
+        now[0] += 12
+        renderer._refresh_activity()
+        active_lines = dock._activity.splitlines()
+        self.assertIn("先检查当前问题", active_lines[0])
+        self.assertIn("读取文件", active_lines[1])
+        self.assertIn("已读取 1 行", active_lines[2])
+        self.assertIn("思考中", active_lines[-1])
+        self.assertIn("12秒", active_lines[-1])
+
+        renderer({"type": "turn_end", "reason": "completed"})
+        renderer.commit_turn()
+        final_text = output.getvalue()
+        self.assertNotIn("思考中", final_text.splitlines()[-1])
+        self.assertIn("✓ 完成", final_text)
+        self.assertNotIn("用时", final_text)
+
+    def test_thinking_timer_starts_when_turn_starts_before_model_request(
+        self,
+    ) -> None:
+        output = io.StringIO()
+        now = [40.0]
+        pending = PendingTerminalInput()
+        dock = TerminalInputDock(
+            "你 › ",
+            pending,
+            stream=output,
+            is_tty=True,
+            color_enabled=False,
+        )
+        renderer = RuntimeEventRenderer(
+            color_enabled=False,
+            is_tty=True,
+            activity_stream=output,
+            input_dock=dock,
+            clock=lambda: now[0],
+        )
+
+        renderer({"type": "turn_started"})
+        now[0] += 4
+        renderer._refresh_activity()
+        self.assertIn("思考中", dock._activity.splitlines()[-1])
+        self.assertIn("4秒", dock._activity.splitlines()[-1])
+
+        renderer({"type": "model_request", "step": 1})
+        now[0] += 2
+        renderer._refresh_activity()
+        self.assertEqual(
+            sum("思考中" in line for line in dock._activity.splitlines()),
+            1,
+        )
+        self.assertIn("6秒", dock._activity.splitlines()[-1])
+
+    def test_preprocessing_thinking_hides_for_conversation(self) -> None:
+        output = io.StringIO()
+        renderer = RuntimeEventRenderer(
+            color_enabled=False,
+            is_tty=True,
+            activity_stream=output,
+        )
+        renderer({"type": "turn_started"})
+        self.assertTrue(renderer._thinking_active)
+
+        renderer({"type": "response_mode", "mode": "conversation"})
+        self.assertFalse(renderer._thinking_active)
+        self.assertEqual(renderer._chain_lines, [])
+
+    def test_terminal_screen_has_single_bottom_thinking_line(self) -> None:
+        output = io.StringIO()
+        now = [20.0]
+        renderer = RuntimeEventRenderer(
+            color_enabled=False,
+            is_tty=True,
+            activity_stream=output,
+            clock=lambda: now[0],
+        )
+        renderer({"type": "model_request", "step": 1})
+        renderer(
+            {
+                "type": "assistant_progress",
+                "summary": "先检查目录。",
+            }
+        )
+        renderer(
+            {
+                "type": "tool_call",
+                "call_id": "call_1",
+                "name": "list_files",
+                "summary": "查看目录 · Desktop/sunus",
+            }
+        )
+        renderer(
+            {
+                "type": "tool_result",
+                "call_id": "call_1",
+                "name": "list_files",
+                "ok": True,
+                "preview": "发现 5 项",
+            }
+        )
+        now[0] += 3
+        renderer._refresh_activity()
+
+        active_screen = [
+            line
+            for line in _ansi_screen_lines(output.getvalue())
+            if line
+        ]
+        self.assertEqual(
+            sum("思考中" in line for line in active_screen),
+            1,
+        )
+        self.assertIn("思考中", active_screen[-1])
+        self.assertIn("3秒", active_screen[-1])
+
+        renderer({"type": "turn_end", "reason": "completed"})
+        renderer.commit_turn()
+        output.write("最终回答正文\n")
+        final_screen = [
+            line
+            for line in _ansi_screen_lines(output.getvalue())
+            if line
+        ]
+        self.assertNotIn("思考中", "\n".join(final_screen))
+        self.assertIn("✓ 完成", final_screen[-2])
+        self.assertNotIn("用时", "\n".join(final_screen))
+        self.assertEqual(final_screen[-1], "最终回答正文")
+
+    def test_turn_summary_and_answer_use_one_ordered_output_stream(
+        self,
+    ) -> None:
+        activity_output = io.StringIO()
+        completion_output = io.StringIO()
+        renderer = RuntimeEventRenderer(
+            color_enabled=False,
+            is_tty=True,
+            activity_stream=activity_output,
+            completion_stream=completion_output,
+        )
+        renderer({"type": "model_request", "step": 1})
+        renderer(
+            {
+                "type": "tool_call",
+                "call_id": "call_1",
+                "name": "read_file",
+                "summary": "读取文件 · note.txt",
+            }
+        )
+        renderer({"type": "turn_end", "reason": "completed"})
+        renderer.commit_turn()
+
+        self.assertNotIn("✓ 完成", activity_output.getvalue())
+        completion_output.write("最终回答正文\n")
+        final_screen = [
+            line
+            for line in _ansi_screen_lines(completion_output.getvalue())
+            if line
+        ]
+        self.assertEqual(final_screen[-1], "最终回答正文")
+        self.assertIn("✓ 完成", final_screen[-2])
+        self.assertNotIn("用时", "\n".join(final_screen))
 
     def test_runtime_renderer_tracks_assistant_delta(self) -> None:
         output = io.StringIO()
@@ -488,10 +786,27 @@ class CliTests(unittest.TestCase):
         renderer({"type": "assistant_delta", "text": "你好"})
         renderer({"type": "assistant_delta", "text": "，世界。"})
         renderer({"type": "turn_end", "reason": "completed"})
+        renderer.commit_turn()
         text = output.getvalue()
-        self.assertEqual(renderer.streamed_text, "你好，世界。")
+        self.assertEqual(renderer.streamed_text, "")
         self.assertNotIn("你好，世界。", text)
         self.assertIn("✓ 完成", text)
+
+    def test_runtime_renderer_hides_status_for_conversation(self) -> None:
+        output = io.StringIO()
+        renderer = RuntimeEventRenderer(
+            color_enabled=False,
+            is_tty=True,
+            activity_stream=output,
+        )
+
+        renderer({"type": "response_mode", "mode": "conversation"})
+        renderer({"type": "model_request", "step": 1})
+        renderer({"type": "assistant_delta", "text": "好，我在。"})
+        renderer({"type": "turn_end", "reason": "completed"})
+        renderer.commit_turn()
+
+        self.assertEqual(output.getvalue(), "")
 
     def test_runtime_renderer_is_silent_without_tty(self) -> None:
         output = io.StringIO()
@@ -519,6 +834,7 @@ class CliTests(unittest.TestCase):
             }
         )
         renderer({"type": "turn_end", "reason": "completed"})
+        renderer.commit_turn()
         text = output.getvalue()
         self.assertEqual(text, "")
 
@@ -549,6 +865,8 @@ class CliTests(unittest.TestCase):
     def test_thinking_state_observer(self) -> None:
         event = threading.Event()
         observer = ThinkingStateObserver(event)
+        observer({"type": "turn_started"})
+        self.assertTrue(event.is_set())
         observer({"type": "model_request"})
         self.assertTrue(event.is_set())
         observer({"type": "tool_call"})

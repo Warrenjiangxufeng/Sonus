@@ -9,11 +9,13 @@ from sunus.reasoning import (
     conversation_thinking_prompt,
     diagnostic_protocol_prompt,
     is_complex_request,
+    is_code_state_query,
     is_diagnostic_request,
     is_playwright_cli_request,
     is_simple_lookup_request,
     is_status_query_request,
     lookup_query_prompt,
+    reasoning_memory_query,
     playwright_cli_prompt,
     status_query_prompt,
 )
@@ -48,6 +50,35 @@ class ReasoningTests(unittest.TestCase):
         text = "查一下为什么代码没有提交到 git"
         self.assertTrue(is_diagnostic_request(text))
         self.assertFalse(is_status_query_request(text))
+
+    def test_latest_code_state_uses_evidence_plan(self) -> None:
+        for text in (
+            "这块不是已经改过了么",
+            "为什么 Sunus 没理解最新的改动",
+            "当前代码里有没有独立预算",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_code_state_query(text))
+                plan = build_reasoning_plan(
+                    text,
+                    classify_request(text),
+                )
+                self.assertEqual(plan.mode, "当前代码状态核验")
+                self.assertTrue(plan.requires_code_state_evidence)
+                self.assertIn("inspect_code_state", plan.prompt())
+                self.assertIn("第一约束: 低功耗", plan.prompt())
+                self.assertIn("一次取得所需证据", plan.prompt())
+
+    def test_memory_recall_adds_routing_lessons_for_code_state(self) -> None:
+        text = "这块代码不是已经改过了么"
+        plan = build_reasoning_plan(text, classify_request(text))
+        query = reasoning_memory_query(text, plan)
+        self.assertIn("代码状态", query)
+        self.assertIn("调用上下文", query)
+        self.assertIn("提交", query)
+        self.assertIn("教训", query)
+        self.assertNotIn("当前首选思维算子", plan.prompt())
+        self.assertIn("认知自主契约", plan.prompt())
 
     def test_protocol_requires_competing_hypotheses_and_evidence_gates(self) -> None:
         prompt = diagnostic_protocol_prompt()

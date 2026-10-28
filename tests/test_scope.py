@@ -119,6 +119,21 @@ class RequestScopeTests(unittest.TestCase):
         self.assertEqual(conversation_hint("加点卖萌的元素"), "ambiguous")
         self.assertEqual(conversation_hint("分析当前项目架构"), "task")
 
+    def test_configured_relationship_prefers_short_casual_turns(self) -> None:
+        self.assertEqual(conversation_hint("靠近一点"), "ambiguous")
+        self.assertEqual(
+            conversation_hint("靠近一点", relationship_configured=True),
+            "casual",
+        )
+        self.assertEqual(
+            conversation_hint("今天想吃什么", relationship_configured=True),
+            "casual",
+        )
+        self.assertEqual(
+            conversation_hint("分析当前项目架构", relationship_configured=True),
+            "task",
+        )
+
     def test_explicit_relationship_setting_is_casual_conversation(self) -> None:
         for text in (
             "以后你是我女朋友",

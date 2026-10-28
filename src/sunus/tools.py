@@ -8,9 +8,12 @@ import re
 import selectors
 import shutil
 import signal
+import socket
+import ssl
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
@@ -49,6 +52,18 @@ MAX_SEARCH_LINE_CHARS = 500
 SEARCH_TIMEOUT_SEC = 15
 SEARCH_MAX_FILES = 20_000
 SEARCH_MAX_LINE_BYTES = 1024 * 1024
+_BROAD_SEARCH_ROOTS = {
+    Path.home().resolve(),
+    (Path.home() / "Documents").resolve(),
+    (Path.home() / "Desktop").resolve(),
+}
+
+
+def _is_broad_search_root(path: Path) -> bool:
+    try:
+        return path.resolve() in _BROAD_SEARCH_ROOTS
+    except OSError:
+        return False
 
 
 def _command_output_text(value: str | bytes | None) -> str:
@@ -272,7 +287,9 @@ def tool_schemas() -> list[dict[str, Any]]:
             "search_text",
             "Preferred bounded literal-text search inside workspace files. Uses ripgrep with "
             "sensitive/cache exclusions and a hard timeout when available; use this before "
-            "shell-level recursive grep or rg. Batch independent searches in one model turn.",
+            "shell-level recursive grep or rg. Broad roots default to a bounded file summary; "
+            "first try a known file, inspect_code_state, or a known repository; "
+            "set allow_broad=true only after deciding a global line search is necessary.",
             {
                 "query": {"type": "string"},
                 "path": {"type": "string", "default": "."},
@@ -293,8 +310,45 @@ def tool_schemas() -> list[dict[str, Any]]:
                     "maximum": 30,
                     "default": SEARCH_TIMEOUT_SEC,
                 },
+                "allow_broad": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Allow line-level search from home/Documents/Desktop. "
+                        "Default false returns a bounded file summary first."
+                    ),
+                },
             },
             ["query"],
+        ),
+        fn(
+            "inspect_code_state",
+            "Inspect current code state needed for version claims: exact symbol "
+            "matches, surrounding source lines, current Git HEAD/branch, and "
+            "the commit that last changed the target file or symbol. Read-only.",
+            {
+                "path": {
+                    "type": "string",
+                    "description": "Source file or directory to inspect.",
+                },
+                "symbol": {
+                    "type": "string",
+                    "description": "Exact code/configuration symbol to locate.",
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 40,
+                    "default": 12,
+                },
+                "max_matches": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8,
+                    "default": 4,
+                },
+            },
+            ["path", "symbol"],
         ),
         fn(
             "memory_context_metrics",
@@ -617,6 +671,12 @@ def tool_schemas() -> list[dict[str, Any]]:
             {
                 "url": {"type": "string"},
                 "max_chars": {"type": "integer", "minimum": 1000, "maximum": 100000, "default": 30000},
+                "timeout_sec": {
+                    "type": "integer",
+                    "minimum": 3,
+                    "maximum": 30,
+                    "default": 15,
+                },
             },
             ["url"],
         ),
@@ -676,6 +736,7 @@ class ToolExecutor:
             "read_file": self._read_file,
             "list_files": self._list_files,
             "search_text": self._search_text,
+            "inspect_code_state": self._inspect_code_state,
             "search_memory": self._search_memory,
             "memory_context_metrics": self._memory_context_metrics,
             "remember": self._remember,
@@ -699,6 +760,7 @@ class ToolExecutor:
             "read_file",
             "list_files",
             "search_text",
+            "inspect_code_state",
             "search_memory",
             "memory_context_metrics",
             "inspect_environment",
@@ -718,6 +780,75 @@ class ToolExecutor:
             "configure_permissions": "R1",
             "schedule_proactive_file_write": "R1",
         }
+        capabilities = {
+            "read_file": "workspace_text",
+            "list_files": "workspace_inventory",
+            "search_text": "workspace_text_search",
+            "inspect_code_state": "code_state",
+            "search_memory": "memory_recall",
+            "memory_context_metrics": "memory_instrumentation",
+            "remember": "memory_write",
+            "inspect_environment": "runtime_environment",
+            "inspect_runtime_history": "session_history",
+            "inspect_browser": "browser_state",
+            "write_file": "workspace_write",
+            "write_document": "document_write",
+            "patch_file": "workspace_edit",
+            "run_command": "command_execution",
+            "request_authorization": "permission_request",
+            "configure_permissions": "permission_config",
+            "schedule_proactive_file_write": "proactive_schedule",
+            "fetch_url": "remote_http",
+            "list_skills": "skill_inventory",
+            "read_skill": "skill_instructions",
+            "submit_result": "terminal_result",
+        }
+        evidence_kinds = {
+            "read_file": "file_content",
+            "list_files": "file_inventory",
+            "search_text": "text_matches",
+            "inspect_code_state": "code_provenance",
+            "search_memory": "memory_evidence",
+            "memory_context_metrics": "context_metrics",
+            "remember": "persistent_memory",
+            "inspect_environment": "environment_facts",
+            "inspect_runtime_history": "runtime_events",
+            "inspect_browser": "browser_page",
+            "write_file": "file_change",
+            "write_document": "document_change",
+            "patch_file": "file_change",
+            "run_command": "command_output",
+            "request_authorization": "authorization_state",
+            "configure_permissions": "permission_state",
+            "schedule_proactive_file_write": "scheduled_task",
+            "fetch_url": "remote_page",
+            "list_skills": "skill_catalog",
+            "read_skill": "skill_instructions",
+            "submit_result": "final_result",
+        }
+        preconditions = {
+            "inspect_browser": (
+                "目标浏览器正在运行",
+                "目标页面可从当前浏览器状态读取",
+            ),
+            "fetch_url": (
+                "用户明确请求外部网页读取",
+                "当前请求具有网络能力",
+            ),
+            "run_command": ("当前请求允许本地命令",),
+            "write_file": ("当前请求允许写入",),
+            "write_document": ("当前请求允许写入",),
+            "patch_file": ("当前请求允许修改",),
+            "search_memory": ("本地记忆库可用",),
+        }
+        failure_modes = {
+            "inspect_browser": ("浏览器未运行", "页面权限或脚本限制"),
+            "fetch_url": ("DNS 失败", "TLS 失败", "网络超时", "HTTP 错误"),
+            "run_command": ("命令不存在", "依赖缺失", "权限拒绝", "非零退出"),
+            "read_file": ("路径不存在", "编码或文件大小限制"),
+            "search_text": ("路径错误", "超时或结果过宽"),
+            "search_memory": ("索引不可用", "无相关记忆"),
+        }
         for schema in tool_schemas():
             name = str(schema.get("function", {}).get("name") or "")
             handler = handlers.get(
@@ -734,6 +865,10 @@ class ToolExecutor:
                 read_only=name in read_only,
                 parallel_safe=name in parallel_safe,
                 approval_mode="approve" if name == "submit_result" else "ask",
+                capability=capabilities.get(name, "general"),
+                evidence_kind=evidence_kinds.get(name, "observation"),
+                preconditions=preconditions.get(name, ()),
+                failure_modes=failure_modes.get(name, ()),
             )
         if mcp_servers:
             from sunus.mcp import MCPManager
@@ -1200,6 +1335,11 @@ class ToolExecutor:
         output = str(args.get("output") or "lines")
         if output not in {"lines", "files"}:
             return ToolResult(False, "output 必须是 lines 或 files")
+        allow_broad = bool(args.get("allow_broad", False))
+        broad_limited = _is_broad_search_root(root) and not allow_broad
+        if broad_limited:
+            output = "files"
+            limit = min(limit, 50)
         search_limit = min(5000, max(limit, limit * 20)) if output == "files" else limit
         timeout_sec = min(
             30,
@@ -1244,10 +1384,254 @@ class ToolExecutor:
             content = "\n".join(lines) or "(no matches)"
         if failure:
             notes.append(failure)
+        if broad_limited:
+            notes.append(
+                "broad_root=metadata_first; use a listed repository path next, "
+                "or allow_broad=true only for an explicit global line search"
+            )
         return ToolResult(
             ok=not timed_out and not failure,
             content=content + "\n\n[" + "; ".join(notes) + "]",
         )
+
+    def _inspect_code_state(self, args: dict[str, Any]) -> ToolResult:
+        target = self.path_guard.resolve(
+            str(args.get("path") or "."),
+            must_exist=True,
+        )
+        symbol = str(args.get("symbol") or "").strip()
+        if not symbol:
+            return ToolResult(False, "symbol 不能为空")
+        context_lines = min(
+            40,
+            max(1, int(args.get("context_lines", 12))),
+        )
+        max_matches = min(
+            8,
+            max(1, int(args.get("max_matches", 4))),
+        )
+
+        matches: list[dict[str, Any]] = []
+        if target.is_file():
+            candidates = [(target, self._workspace_relative(target))]
+        elif target.is_dir():
+            searched = self._search_text(
+                {
+                    "query": symbol,
+                    "path": str(target),
+                    "max_results": max_matches * 8,
+                    "timeout_sec": SEARCH_TIMEOUT_SEC,
+                    "allow_broad": True,
+                }
+            )
+            if not searched.ok and not matches:
+                return ToolResult(False, searched.content)
+            candidates = []
+            for line in searched.content.splitlines():
+                if not line or line.startswith("["):
+                    continue
+                relative, separator, rest = line.partition(":")
+                number, number_separator, _ = rest.partition(":")
+                if not separator or not number_separator or not number.isdigit():
+                    continue
+                path = (target / relative).resolve()
+                if path.is_file():
+                    candidates.append((path, self._workspace_relative(path)))
+                    if len(candidates) >= max_matches:
+                        break
+        else:
+            return ToolResult(False, f"不是文件或目录: {target}")
+
+        seen: set[tuple[str, int]] = set()
+        for path, relative in candidates:
+            try:
+                lines = path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                ).splitlines()
+            except OSError:
+                continue
+            for index, line in enumerate(lines, start=1):
+                if symbol not in line:
+                    continue
+                key = (relative, index)
+                if key in seen:
+                    continue
+                seen.add(key)
+                start = max(1, index - context_lines)
+                end = min(len(lines), index + context_lines)
+                matches.append(
+                    {
+                        "path": relative,
+                        "line": index,
+                        "text": line.strip()[:500],
+                        "context": [
+                            f"{number}: {lines[number - 1]}"
+                            for number in range(start, end + 1)
+                        ],
+                    }
+                )
+                if len(matches) >= max_matches:
+                    break
+            if len(matches) >= max_matches:
+                break
+
+        search_root = target if target.is_dir() else target.parent
+        repo_root = self._git_value(
+            search_root,
+            ["rev-parse", "--show-toplevel"],
+        )
+        head = self._git_value(search_root, ["rev-parse", "HEAD"])
+        branch = self._git_value(
+            search_root,
+            ["rev-parse", "--abbrev-ref", "HEAD"],
+        )
+        file_commit: dict[str, str] = {}
+        symbol_commit: dict[str, str] = {}
+        line_commits: dict[str, dict[str, str]] = {}
+        if repo_root:
+            repo_path = Path(str(repo_root)).resolve()
+            try:
+                relative_git = target.resolve().relative_to(
+                    repo_path
+                ).as_posix()
+            except ValueError:
+                relative_git = ""
+            if relative_git:
+                file_commit = self._git_commit(
+                    repo_path,
+                    ["log", "-1", "--format=%H%x09%aI%x09%s", "--", relative_git],
+                )
+                symbol_commit = self._git_commit(
+                    repo_path,
+                    [
+                        "log",
+                        "-S",
+                        symbol,
+                        "-1",
+                        "--format=%H%x09%aI%x09%s",
+                        "--",
+                        relative_git,
+                    ],
+                )
+                for match in matches:
+                    match_path = (
+                        Path(self.workspace) / str(match["path"])
+                    ).resolve()
+                    try:
+                        match_relative = match_path.relative_to(
+                            repo_path
+                        ).as_posix()
+                    except ValueError:
+                        continue
+                    line_commits[str(match["line"])] = self._git_line_commit(
+                        repo_path,
+                        match_relative,
+                        int(match["line"]),
+                    )
+
+        target_exists = target.exists()
+        version_verified = bool(
+            head and target_exists and (line_commits or file_commit)
+        )
+        payload = {
+            "target": self._workspace_relative(target),
+            "target_exists": target_exists,
+            "symbol": symbol,
+            "matches": matches,
+            "not_found": not matches,
+            "repo_root": str(repo_root or ""),
+            "branch": branch,
+            "head": head,
+            "file_commit": file_commit,
+            "symbol_commit": symbol_commit,
+            "line_commits": line_commits,
+            "version_verified": version_verified,
+        }
+        return ToolResult(
+            True,
+            json.dumps(payload, ensure_ascii=False, indent=2),
+        )
+
+    def _workspace_relative(self, path: Path) -> str:
+        try:
+            return path.resolve().relative_to(
+                Path(self.workspace).resolve()
+            ).as_posix()
+        except ValueError:
+            return path.resolve().as_posix()
+
+    def _git_value(self, cwd: Path, arguments: list[str]) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(cwd), *arguments],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip()
+
+    def _git_commit(
+        self,
+        cwd: Path,
+        arguments: list[str],
+    ) -> dict[str, str]:
+        value = self._git_value(cwd, arguments)
+        commit, separator, detail = value.partition("\t")
+        if not separator:
+            return {}
+        timestamp, separator, subject = detail.partition("\t")
+        return {
+            "commit": commit,
+            "timestamp": timestamp,
+            "subject": subject if separator else "",
+        }
+
+    def _git_line_commit(
+        self,
+        cwd: Path,
+        path: str,
+        line: int,
+    ) -> dict[str, str]:
+        value = self._git_value(
+            cwd,
+            [
+                "blame",
+                "-L",
+                f"{line},{line}",
+                "--porcelain",
+                "--",
+                path,
+            ],
+        )
+        if not value:
+            return {}
+        rows = value.splitlines()
+        commit = rows[0].split(" ", 1)[0] if rows else ""
+        author_time = ""
+        subject = ""
+        for row in rows[1:]:
+            if row.startswith("author-time "):
+                try:
+                    author_time = datetime.fromtimestamp(
+                        int(row.removeprefix("author-time "))
+                    ).astimezone().isoformat()
+                except ValueError:
+                    author_time = ""
+            elif row.startswith("summary "):
+                subject = row.removeprefix("summary ")
+            elif not row.startswith("\t") and author_time and subject:
+                break
+        return {
+            "commit": commit,
+            "timestamp": author_time,
+            "subject": subject,
+        }
 
     def _search_memory(self, args: dict[str, Any]) -> ToolResult:
         if self.memory is None:
@@ -1779,17 +2163,105 @@ class ToolExecutor:
         ):
             return ToolResult(False, "用户拒绝访问网络")
         max_chars = min(100000, max(1000, int(args.get("max_chars", 30000))))
+        timeout_sec = min(
+            30,
+            max(3, int(args.get("timeout_sec", 15))),
+        )
         request = urllib.request.Request(
             url,
             headers={"User-Agent": "Sunus/0.1"},
         )
-        with urllib.request.urlopen(
-            request,
-            timeout=30,
-            context=make_ssl_context(),
-        ) as response:
-            charset = response.headers.get_content_charset() or "utf-8"
-            raw = response.read(2 * 1024 * 1024)
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=timeout_sec,
+                context=make_ssl_context(),
+            ) as response:
+                charset = response.headers.get_content_charset() or "utf-8"
+                raw = response.read(2 * 1024 * 1024)
+        except urllib.error.HTTPError as error:
+            return ToolResult(
+                False,
+                json.dumps(
+                    {
+                        "error": "http_error",
+                        "status": int(error.code),
+                        "detail": redact_text(str(error.reason)),
+                        "host": parsed.netloc,
+                        "retryable": error.code in {408, 425, 429, 500, 502, 503, 504},
+                        "suggestion": "读取状态码后再决定是否换来源，不要原样重试。",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        except urllib.error.URLError as error:
+            reason = error.reason
+            detail = redact_text(str(reason))
+            lowered = detail.lower()
+            if isinstance(reason, socket.gaierror):
+                code = "dns_error"
+                suggestion = "检查域名和网络后换来源；不要继续轮换同一站点的路径。"
+            elif isinstance(reason, ssl.SSLError) or "ssl" in lowered or "certificate" in lowered:
+                code = "tls_error"
+                suggestion = "TLS/证书握手失败；停止重试同一站点，改用已有资料或其他来源。"
+            elif (
+                isinstance(reason, (TimeoutError, socket.timeout))
+                or "timed out" in lowered
+                or "timeout" in lowered
+            ):
+                code = "network_timeout"
+                suggestion = "本轮网络请求超时；不要连续请求同类网页，改用已有资料或结束等待。"
+            else:
+                code = "network_error"
+                suggestion = "网络不可用；先说明能力边界，不要反复重试。"
+            return ToolResult(
+                False,
+                json.dumps(
+                    {
+                        "error": code,
+                        "detail": detail,
+                        "host": parsed.netloc,
+                        "timeout_sec": timeout_sec,
+                        "retryable": code in {"network_timeout", "dns_error"},
+                        "suggestion": suggestion,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        except (TimeoutError, socket.timeout) as error:
+            return ToolResult(
+                False,
+                json.dumps(
+                    {
+                        "error": "network_timeout",
+                        "detail": redact_text(str(error)),
+                        "host": parsed.netloc,
+                        "timeout_sec": timeout_sec,
+                        "retryable": True,
+                        "suggestion": "本轮网络请求超时；停止连续访问同类网页，改用已有资料。",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        except (ssl.SSLError, OSError) as error:
+            code = (
+                "tls_error"
+                if isinstance(error, ssl.SSLError)
+                else "network_error"
+            )
+            return ToolResult(
+                False,
+                json.dumps(
+                    {
+                        "error": code,
+                        "detail": redact_text(str(error)),
+                        "host": parsed.netloc,
+                        "retryable": False,
+                        "suggestion": "网络连接失败；停止重试并基于已有证据回答。",
+                    },
+                    ensure_ascii=False,
+                ),
+            )
         text = raw.decode(charset, errors="replace")[:max_chars]
         content, artifact = self._truncate(text, prefix="fetch")
         return ToolResult(True, content, artifact=artifact)

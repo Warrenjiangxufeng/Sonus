@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import threading
 import time
@@ -10,15 +11,16 @@ from unittest.mock import patch
 
 from sunus.agent import Agent
 from sunus.config import LoopBudgetConfig, PersonaConfig, RuntimeConfig
+from sunus.control import CircuitOpen
 from sunus.events import EventBus
 from sunus.memory import MemoryStore
 from sunus.model_events import ModelEvent
-from sunus.model import ModelCancelled, ModelReply
+from sunus.model import ModelCancelled, ModelError, ModelReply
 from sunus.policy import ApprovalManager, PathGuard
 from sunus.relationship import RelationshipConfig
 from sunus.scope import classify_request
 from sunus.storage import ArtifactStore, SessionLogger
-from sunus.tools import ToolExecutor
+from sunus.tools import ToolExecutor, ToolResult
 
 
 class FakeAgentModel:
@@ -128,6 +130,78 @@ class CapturingReplyModel:
         )
 
 
+class SemanticAffectModel(CapturingReplyModel):
+    def __init__(self) -> None:
+        super().__init__("好，我先听你说。")
+        self.affect_calls = 0
+
+    def complete(
+        self,
+        system,
+        user,
+        *,
+        max_tokens=512,
+        temperature=0.6,
+    ):
+        self.affect_calls += 1
+        return '{"events":["安抚"],"confidence":0.92}'
+
+
+class StructuredPerceptionModel(CapturingReplyModel):
+    def __init__(self) -> None:
+        super().__init__("已完成。")
+        self.perception_calls = 0
+        self.perception_inputs: list[str] = []
+
+    def complete_with_usage(
+        self,
+        system,
+        user,
+        *,
+        max_tokens=512,
+        temperature=0.6,
+    ):
+        self.perception_calls += 1
+        self.perception_inputs.append(user)
+        if "对了" in user:
+            payload = {
+                "observed_cues": ["确认完成"],
+                "inferred_user_state": {
+                    "distress": 0.0,
+                    "fatigue": 0.0,
+                    "warmth": 0.4,
+                    "boundary": 0.0,
+                    "engagement": 0.8,
+                },
+                "alternative_explanations": ["也可能只是礼貌确认"],
+                "relationship_signal": "warm",
+                "affect_events": ["亲近"],
+                "response_feedback": ["回应被接纳", "对方缓和"],
+                "confidence": 0.93,
+            }
+        else:
+            payload = {
+                "observed_cues": ["继续处理任务"],
+                "inferred_user_state": {
+                    "distress": 0.1,
+                    "fatigue": 0.2,
+                    "warmth": 0.2,
+                    "boundary": 0.0,
+                    "engagement": 0.7,
+                },
+                "alternative_explanations": ["也可能只是简短指令"],
+                "relationship_signal": "neutral",
+                "affect_events": ["探索"],
+                "response_feedback": [],
+                "confidence": 0.81,
+            }
+        return json.dumps(payload, ensure_ascii=False), {
+            "prompt_tokens": 17,
+            "completion_tokens": 9,
+            "total_tokens": 26,
+        }
+
+
 class ConversationStyleRetryModel:
     def __init__(self) -> None:
         self.calls = 0
@@ -145,6 +219,82 @@ class ConversationStyleRetryModel:
             message={"role": "assistant", "content": text},
             usage={"prompt_tokens": 10, "completion_tokens": 5},
             finish_reason="stop",
+        )
+
+
+class CodeStateClaimModel:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.last_messages: list[dict] = []
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.calls += 1
+        self.last_messages = messages
+        return ModelReply(
+            message={"role": "assistant", "content": "当前代码已经修复，配置也可调。"},
+            usage={"prompt_tokens": 10, "completion_tokens": 5},
+            finish_reason="stop",
+        )
+
+
+class CodeStateVerifiedModel:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.last_messages: list[dict] = []
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.calls += 1
+        self.last_messages = messages
+        if self.calls == 1:
+            return ModelReply(
+                message={
+                    "role": "assistant",
+                    "content": "我先核对当前代码。",
+                    "tool_calls": [
+                        {
+                            "id": "call_code_state",
+                            "type": "function",
+                            "function": {
+                                "name": "inspect_code_state",
+                                "arguments": json.dumps(
+                                    {
+                                        "path": "src/app.py",
+                                        "symbol": "max_tokens",
+                                    }
+                                ),
+                            },
+                        }
+                    ],
+                },
+                usage={"prompt_tokens": 10, "completion_tokens": 5},
+                finish_reason="tool_calls",
+            )
+        return ModelReply(
+            message={
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_result",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_result",
+                            "arguments": json.dumps(
+                                {
+                                    "kind": "answer",
+                                    "status": "completed",
+                                    "summary": (
+                                        "当前代码中 max_tokens=256，"
+                                        "已实现但不可通过配置项调整。"
+                                    ),
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ]
+            },
+            usage={"prompt_tokens": 10, "completion_tokens": 5},
+            finish_reason="tool_calls",
         )
 
 
@@ -216,6 +366,59 @@ class ClassifyingReplyModel(CapturingReplyModel):
         return self.mode, {"prompt_tokens": 20, "completion_tokens": 1}
 
 
+class FailingClassifierReplyModel(CapturingReplyModel):
+    def __init__(self) -> None:
+        super().__init__("（抬眼看你，手停了一下）过来一点。")
+        self.classification_calls = 0
+
+    def classify_turn(self, user_input, *, previous_assistant=""):
+        self.classification_calls += 1
+        raise ModelError("classifier returned no label")
+
+
+class NaturalReplyThenSubmitModel:
+    def __init__(self) -> None:
+        self.last_messages: list[dict] = []
+        self.tool_names: set[str] = set()
+        self.classification_calls = 0
+
+    def classify_turn(self, user_input, *, previous_assistant=""):
+        self.classification_calls += 1
+        return "task", {"prompt_tokens": 3, "completion_tokens": 1}
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.last_messages = messages
+        self.tool_names = {
+            item["function"]["name"]
+            for item in tools or []
+        }
+        return ModelReply(
+            message={
+                "role": "assistant",
+                "content": "（轻笑）光说可不算。",
+                "tool_calls": [
+                    {
+                        "id": "call_result",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_result",
+                            "arguments": json.dumps(
+                                {
+                                    "kind": "answer",
+                                    "status": "completed",
+                                    "summary": "接住了你这句。光说可不算，先忙正事。",
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+            },
+            usage={"prompt_tokens": 10, "completion_tokens": 5},
+            finish_reason="tool_calls",
+        )
+
+
 class CancelledAfterWriteModel:
     def __init__(self) -> None:
         self.calls = 0
@@ -246,6 +449,18 @@ class CancelledAfterWriteModel:
 
 class NoProgressModel:
     def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        if tools is None:
+            return ModelReply(
+                message={
+                    "role": "assistant",
+                    "content": (
+                        "目录检查连续没有取得新证据，所以我不再重复检查。"
+                        "目前可确认旧结果没有变化；需要你补充具体目标或允许新的检查范围。"
+                    ),
+                },
+                usage={"total_tokens": 12},
+                finish_reason="stop",
+            )
         return ModelReply(
             message={
                 "role": "assistant",
@@ -262,6 +477,119 @@ class NoProgressModel:
                 ],
             },
             usage={"total_tokens": 10},
+            finish_reason="tool_calls",
+        )
+
+
+class CircuitToolOnlyModel(NoProgressModel):
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        if tools is None:
+            raise RuntimeError("final answer model unavailable")
+        return super().chat(
+            messages,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+
+class NetworkTimeoutThenAnswerModel:
+    def __init__(self) -> None:
+        self.fetch_calls = 0
+        self.final_calls = 0
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        if tools is None:
+            self.final_calls += 1
+            return ModelReply(
+                message={
+                    "role": "assistant",
+                    "content": (
+                        "这次网页读取在 TLS/SSL 握手阶段连续超时，"
+                        "所以我无法确认维基百科页面当前正文。"
+                        "能回答的边界是：网络授权已生效，但目标站点不可达；"
+                        "可以稍后重试，或提供页面正文后继续分析。"
+                    ),
+                },
+                usage={"total_tokens": 14},
+                finish_reason="stop",
+            )
+        self.fetch_calls += 1
+        return ModelReply(
+            message={
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": f"call_fetch_{self.fetch_calls}",
+                        "type": "function",
+                        "function": {
+                            "name": "fetch_url",
+                            "arguments": json.dumps(
+                                {
+                                    "url": (
+                                        "https://en.wikipedia.org/wiki/"
+                                        f"Raven%27s_Progressive_Matrices?try={self.fetch_calls}"
+                                    )
+                                }
+                            ),
+                        },
+                    }
+                ],
+            },
+            usage={"total_tokens": 10},
+            finish_reason="tool_calls",
+        )
+
+
+class RecoveryToolSwitchModel:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.recovery_system = ""
+        self.fetch_calls = 0
+        self.browser_calls = 0
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.calls += 1
+        system = str(messages[0].get("content") or "")
+        if "运行控制恢复契约" in system:
+            self.recovery_system = system
+        if self.calls == 1:
+            name = "fetch_url"
+            arguments = {"url": "https://a.example/data"}
+            self.fetch_calls += 1
+        elif self.calls == 2:
+            name = "fetch_url"
+            arguments = {"url": "https://b.example/data"}
+            self.fetch_calls += 1
+        elif self.calls == 3:
+            name = "inspect_browser"
+            arguments = {"browser": "chrome", "mode": "active"}
+            self.browser_calls += 1
+        else:
+            name = "submit_result"
+            arguments = {
+                "kind": "answer",
+                "status": "completed",
+                "summary": "改读已打开页面后拿到了可用证据。",
+            }
+        return ModelReply(
+            message={
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": f"call_recovery_{self.calls}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(
+                                arguments,
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+            },
+            usage={"total_tokens": 5},
             finish_reason="tool_calls",
         )
 
@@ -803,7 +1131,7 @@ class AgentTests(unittest.TestCase):
             events_text = events.path.read_text(encoding="utf-8")
             self.assertIn("task_grant_started", events_text)
             self.assertIn("task_grant_ended", events_text)
-            self.assertIn("thinking_operators_selected", events_text)
+            self.assertIn("cognitive_context_prepared", events_text)
             self.assertIn("读取文件 · note.txt", events_text)
             self.assertIn("assistant_progress", events_text)
             self.assertIn("我先读取文件。", events_text)
@@ -812,7 +1140,8 @@ class AgentTests(unittest.TestCase):
             self.assertIn("长期使命", model.last_messages[0]["content"])
             self.assertIn("结论先行", model.last_messages[0]["content"])
             self.assertIn("任务边界", model.last_messages[0]["content"])
-            self.assertIn("当前首选思维算子", model.last_messages[0]["content"])
+            self.assertIn("认知自主契约", model.last_messages[0]["content"])
+            self.assertNotIn("当前首选思维算子", model.last_messages[0]["content"])
             self.assertIn("持久任务状态", model.last_messages[0]["content"])
             self.assertIn(
                 "多个互相独立的只读检查必须在同一轮 `tool_calls` 中批量发起",
@@ -828,6 +1157,10 @@ class AgentTests(unittest.TestCase):
             )
             self.assertIn(
                 "其他文件、源码、文档和配置也使用同一原则",
+                model.last_messages[0]["content"],
+            )
+            self.assertIn(
+                "低功耗是所有执行方式的第一约束",
                 model.last_messages[0]["content"],
             )
             self.assertEqual(result.usage["prompt_cache_hit_tokens"], 13)
@@ -1301,6 +1634,69 @@ class AgentTests(unittest.TestCase):
             )
             memory.close()
 
+    def test_configured_relationship_keeps_intimate_chat_direct(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+                persona=PersonaConfig(
+                    relationship=RelationshipConfig(
+                        label="恋人",
+                        sunus_role="女朋友",
+                        user_role="男朋友",
+                    )
+                ),
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_intimate", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = CapturingReplyModel(
+                "（轻笑）别急。过来一点，我陪你待会儿。"
+            )
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("抱抱我")
+
+            self.assertEqual(model.tool_names, set())
+            self.assertLessEqual(len(result.text), 32)
+            self.assertNotIn("（", result.text)
+            events_text = events.path.read_text(encoding="utf-8")
+            self.assertIn('"type":"response_mode"', events_text)
+            self.assertIn('"mode":"conversation"', events_text)
+            self.assertIn('"relationship_chat":true', events_text)
+            self.assertIn('"type":"cognitive_context_prepared"', events_text)
+            self.assertIn('"mode":"关系性对话"', events_text)
+            self.assertIsNotNone(
+                memory.latest_pending_strategy(scope=agent.scope)
+            )
+            memory.close()
+
     def test_dsml_protocol_output_is_intercepted_and_retried(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "workspace"
@@ -1400,6 +1796,242 @@ class AgentTests(unittest.TestCase):
             self.assertIn(
                 "conversation_style_retry",
                 events.path.read_text(encoding="utf-8"),
+            )
+            memory.close()
+
+    def test_current_code_claim_without_evidence_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_code_state_gate", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = CodeStateClaimModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("当前代码已经改了吗")
+
+            self.assertEqual(model.calls, 2)
+            self.assertEqual(result.reason, "blocked")
+            self.assertIn("无法核实代码状态", result.text)
+            events_text = events.path.read_text(encoding="utf-8")
+            self.assertIn("code_state_evidence_retry", events_text)
+            self.assertIn("code_state_evidence_blocked", events_text)
+            memory.close()
+
+    def test_semantic_affect_classifier_overrides_lexical_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_semantic_affect", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = SemanticAffectModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            agent.run_turn("你别这样想，别问我为什么")
+
+            self.assertEqual(model.affect_calls, 1)
+            affect_state = json.loads(
+                (data / "affect_state.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                affect_state["last_appraisal"],
+                {"events": ["安抚"], "source": "semantic"},
+            )
+            self.assertFalse(
+                affect_state["question_inhibition_until"]
+            )
+            memory.close()
+
+    def test_structured_perception_runs_on_tasks_and_resolves_strategy_outcome(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_perception_outcome", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = StructuredPerceptionModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            first = agent.run_turn("帮我修改项目并检查")
+            pending = memory.latest_pending_strategy(scope=agent.scope)
+            self.assertIsNotNone(pending)
+            self.assertEqual(model.perception_calls, 1)
+            self.assertGreaterEqual(first.usage["prompt_tokens"], 27)
+            self.assertIn(
+                "<current_user_message>",
+                model.perception_inputs[0],
+            )
+
+            second = agent.run_turn("对了，就是这个，解决了")
+
+            self.assertEqual(model.perception_calls, 2)
+            self.assertIn("已完成。", model.perception_inputs[1])
+            resolved = memory.get(str(pending["id"]))
+            self.assertEqual(resolved["status"], "supported")
+            self.assertIn("successful", resolved["tags"])
+            self.assertIn(
+                "strategy_outcome_resolved",
+                events.path.read_text(encoding="utf-8"),
+            )
+            self.assertGreater(second.text.count("已完成"), 0)
+            memory.close()
+
+    def test_current_code_claim_passes_after_evidence_inspection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            source = root / "src" / "app.py"
+            source.parent.mkdir()
+            source.write_text("value = 1\nmax_tokens = 256\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "config", "user.name", "Test"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "add budget"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=5,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_code_state_verified", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = CodeStateVerifiedModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("当前代码里的 max_tokens 是多少")
+
+            self.assertEqual(model.calls, 2)
+            self.assertEqual(result.reason, "completed")
+            self.assertIn("max_tokens=256", result.text)
+            trace_names = [item["name"] for item in result.tool_traces]
+            self.assertEqual(
+                trace_names,
+                ["inspect_code_state", "submit_result"],
             )
             memory.close()
 
@@ -1556,6 +2188,109 @@ class AgentTests(unittest.TestCase):
                     self.assertIn("response_mode_classified", events_text)
                     self.assertIn('"source":"model"', events_text)
                     memory.close()
+
+    def test_failed_classifier_falls_back_to_chat_and_cleans_stage_directions(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+                persona=PersonaConfig(stage_directions=False),
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_classifier_fallback", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = FailingClassifierReplyModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            with patch("sunus.agent.conversation_hint", return_value="ambiguous"):
+                result = agent.run_turn("碰一下")
+
+            self.assertEqual(model.classification_calls, 1)
+            self.assertEqual(result.text, "过来一点。")
+            self.assertEqual(model.tool_names, set())
+            events_text = events.path.read_text(encoding="utf-8")
+            self.assertIn('"source":"model_error_fallback_chat"', events_text)
+            self.assertIn("stage_directions_removed", events_text)
+            memory.close()
+
+    def test_natural_reply_beats_submit_summary_when_task_mode_is_wrong(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+                persona=PersonaConfig(stage_directions=False),
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_natural_reply", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = NaturalReplyThenSubmitModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            with patch("sunus.agent.conversation_hint", return_value="ambiguous"):
+                result = agent.run_turn("随便聊一句")
+
+            self.assertEqual(result.text, "光说可不算。")
+            events_text = events.path.read_text(encoding="utf-8")
+            self.assertNotIn('"type":"assistant_progress"', events_text)
+            self.assertIn("casual_natural_reply_preferred", events_text)
+            self.assertIn("stage_directions_removed", events_text)
+            memory.close()
 
     def test_consultation_filters_unauthorized_command_tool(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -2020,6 +2755,11 @@ class AgentTests(unittest.TestCase):
             requests = [
                 row for row in event_rows if row.get("type") == "model_request"
             ]
+            event_types = [row.get("type") for row in event_rows]
+            self.assertLess(
+                event_types.index("turn_started"),
+                event_types.index("model_request"),
+            )
             self.assertEqual(
                 [row["max_tokens"] for row in requests],
                 [8192, 16_384],
@@ -2136,11 +2876,13 @@ class AgentTests(unittest.TestCase):
             result = agent.run_turn("持续检查目录")
 
             self.assertEqual(result.reason, "circuit_open")
-            self.assertIn("熔断", result.text)
+            self.assertIn("没有取得新证据", result.text)
+            self.assertNotEqual(result.text.strip(), "任务已熔断。")
             self.assertGreaterEqual(result.metrics["no_progress_rounds"], 3)
             events_text = events.path.read_text(encoding="utf-8")
             self.assertIn("recovery_requested", events_text)
             self.assertIn("circuit_open", events_text)
+            self.assertIn("circuit_final_answer", events_text)
             receipt_lines = [
                 line
                 for line in session.path.read_text(encoding="utf-8").splitlines()
@@ -2149,6 +2891,327 @@ class AgentTests(unittest.TestCase):
             self.assertTrue(receipt_lines)
             self.assertIn("circuit_open", receipt_lines[-1])
             self.assertIn('"metrics"', receipt_lines[-1])
+            memory.close()
+
+    def test_circuit_open_returns_deterministic_answer_when_finalization_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=10,
+                loop_budget=LoopBudgetConfig(
+                    max_model_calls=10,
+                    max_tool_calls=20,
+                    max_wall_seconds=60,
+                    max_total_tokens=10_000,
+                    no_progress_soft=2,
+                    no_progress_hard=3,
+                ),
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_circuit_fallback", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+            )
+            agent = Agent(
+                config=config,
+                model=CircuitToolOnlyModel(),  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+            agent._task_state.evidence = [
+                "fetch_url: <!doctype html><html><body>noisy page</body></html>"
+            ]
+
+            result = agent.run_turn("持续检查目录")
+
+            self.assertEqual(result.reason, "circuit_open")
+            self.assertIn("已经停止重复动作", result.text)
+            self.assertIn("补充具体目标", result.text)
+            self.assertIn("已取得部分网页内容", result.text)
+            self.assertNotIn("<!doctype", result.text.lower())
+            self.assertNotIn("任务已熔断", result.text)
+            self.assertIn(
+                "circuit_finalization_error",
+                events.path.read_text(encoding="utf-8"),
+            )
+            memory.close()
+
+    def test_network_timeouts_open_circuit_but_still_return_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=10,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_network_circuit", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=True,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = NetworkTimeoutThenAnswerModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+            timeout = ToolResult(
+                False,
+                json.dumps(
+                    {
+                        "error": "network_timeout",
+                        "detail": "SSL handshake timed out",
+                        "host": "en.wikipedia.org",
+                        "timeout_sec": 15,
+                        "retryable": True,
+                    }
+                ),
+            )
+            with patch.object(tools, "execute", return_value=timeout):
+                result = agent.run_turn(
+                    "读取 https://en.wikipedia.org/wiki/"
+                    "Raven%27s_Progressive_Matrices"
+                )
+
+            self.assertEqual(result.reason, "circuit_open")
+            self.assertEqual(model.fetch_calls, 3)
+            self.assertEqual(model.final_calls, 1)
+            self.assertIn("TLS/SSL 握手阶段连续超时", result.text)
+            self.assertNotIn("任务已熔断", result.text)
+            self.assertIn(
+                "circuit_final_answer",
+                events.path.read_text(encoding="utf-8"),
+            )
+            memory.close()
+
+    def test_circuit_finalization_repairs_partial_parallel_tool_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_circuit_pairs", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+            )
+            model = CapturingReplyModel("已基于现有信息收口。")
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+            agent.messages = [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "读取资料"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_a",
+                            "type": "function",
+                            "function": {
+                                "name": "fetch_url",
+                                "arguments": '{"url":"https://a.example"}',
+                            },
+                        },
+                        {
+                            "id": "call_b",
+                            "type": "function",
+                            "function": {
+                                "name": "fetch_url",
+                                "arguments": '{"url":"https://b.example"}',
+                            },
+                        },
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_a",
+                    "content": '{"ok":false}',
+                },
+            ]
+
+            answer, _usage = agent._finalize_circuit_answer(
+                error=CircuitOpen("同类失败策略重复达到 3 次", {}),
+                changed_files=[],
+            )
+
+            self.assertEqual(answer, "已基于现有信息收口。")
+            final_messages = model.last_messages
+            assistant_index = next(
+                index
+                for index, message in enumerate(final_messages)
+                if message.get("tool_calls")
+            )
+            tool_ids = {
+                message.get("tool_call_id")
+                for message in final_messages[
+                    assistant_index + 1 :
+                    assistant_index + 3
+                ]
+                if message.get("role") == "tool"
+            }
+            self.assertEqual(tool_ids, {"call_a", "call_b"})
+            self.assertIn(
+                "circuit_history_repaired",
+                events.path.read_text(encoding="utf-8"),
+            )
+            memory.close()
+
+    def test_recovery_prompt_recalls_memory_and_model_switches_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=8,
+            )
+            memory = MemoryStore(data / "memory.db")
+            memory_id = memory.add(
+                content=(
+                    "网络超时 timeout fetch_url 恢复经验：读取网页失败时，"
+                    "检查是否已有页面或其他证据源，不把同一抓取方式当成唯一入口。"
+                ),
+                scope=str(root.resolve()),
+                kind="strategy",
+                status="supported",
+                tags=("strategy", "successful", "recovery"),
+            )
+            events = EventBus(data)
+            session = SessionLogger("s_recovery_switch", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=True,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = RecoveryToolSwitchModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+            timeout = ToolResult(
+                False,
+                json.dumps(
+                    {
+                        "error": "network_timeout",
+                        "detail": "timed out",
+                        "host": "example",
+                        "retryable": True,
+                    }
+                ),
+            )
+            browser = ToolResult(
+                True,
+                '{"title":"可用页面","url":"https://example.test"}',
+            )
+            calls: list[str] = []
+
+            def execute(name, arguments):
+                calls.append(name)
+                return timeout if name == "fetch_url" else browser
+
+            with patch.object(tools, "execute", side_effect=execute):
+                result = agent.run_turn(
+                    "读取 https://a.example/data 和 https://b.example/data"
+                )
+
+            self.assertEqual(result.reason, "completed")
+            self.assertEqual(model.fetch_calls, 2)
+            self.assertEqual(model.browser_calls, 1)
+            self.assertEqual(calls, ["fetch_url", "fetch_url", "inspect_browser"])
+            self.assertIn("运行控制恢复契约", model.recovery_system)
+            self.assertIn("不得机械套用固定工具替代表", model.recovery_system)
+            self.assertIn("恢复阶段的认知自主契约", model.recovery_system)
+            self.assertIn(
+                "自主选择是否需要思维算子",
+                model.recovery_system,
+            )
+            self.assertIn("类比", model.recovery_system)
+            self.assertNotIn("当前首选思维算子", model.recovery_system)
+            self.assertIn("inspect_browser", model.recovery_system)
+            self.assertIn("browser_state", model.recovery_system)
+            self.assertIn("证据=browser_page", model.recovery_system)
+            self.assertIn("目标浏览器正在运行", model.recovery_system)
+            self.assertIn(memory_id, model.recovery_system)
+            self.assertIn(
+                "recovery_prompt_applied",
+                events.path.read_text(encoding="utf-8"),
+            )
             memory.close()
 
     def test_reserved_finalization_returns_result_at_model_budget(self) -> None:

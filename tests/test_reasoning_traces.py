@@ -44,15 +44,32 @@ class ReasoningTraceTests(unittest.TestCase):
                 reason="completed",
                 operators=("演绎", "批判"),
                 contrast_checks=("检查前提和边界是否成立",),
+                operator_checkpoints=("锁定当前对象", "证据足够立即停止"),
             )
 
             self.assertIsNotNone(memory_id)
             row = memory.get(str(memory_id))
-            self.assertEqual(row["status"], "supported")
-            self.assertIn("successful", row["tags"])
+            self.assertEqual(row["status"], "candidate")
+            self.assertIn("completed", row["tags"])
+            self.assertIn('"outcome": "pending"', row["metadata"])
             self.assertIn('"tool_sequence": ["inspect_browser"]', row["metadata"])
             self.assertIn('"operators": ["演绎", "批判"]', row["metadata"])
+            self.assertIn(
+                '"operator_checkpoints": ["锁定当前对象", "证据足够立即停止"]',
+                row["metadata"],
+            )
             self.assertIn("复核=检查前提和边界是否成立", row["content"])
+            self.assertIn("检查点=锁定当前对象,证据足够立即停止", row["content"])
+
+            memory.resolve_strategy_outcome(
+                str(memory_id),
+                "positive",
+                "用户确认解决",
+            )
+            resolved = memory.get(str(memory_id))
+            self.assertEqual(resolved["status"], "supported")
+            self.assertIn("successful", resolved["tags"])
+            self.assertIn('"outcome": "positive"', resolved["metadata"])
             memory.close()
 
     def test_trace_and_turn_episode_do_not_overwrite_each_other(self) -> None:
@@ -122,6 +139,42 @@ class ReasoningTraceTests(unittest.TestCase):
                 limit=2,
             )
             self.assertNotIn(memory_id, {item["id"] for item in strategies})
+            memory.close()
+
+    def test_completed_but_corrected_trace_is_not_reused_as_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            memory = MemoryStore(Path(temp) / "memory.db")
+            memory_id = record_reasoning_trace(
+                memory,
+                scope="/project/example",
+                receipt_id="r_corrected",
+                objective="修复同步失败",
+                mode="根因诊断",
+                capabilities=("command",),
+                preferred_tools=("run_command",),
+                tool_traces=[{"name": "run_command"}],
+                blocker="",
+                reason="completed",
+            )
+            self.assertIsNotNone(memory_id)
+            memory.resolve_strategy_outcome(
+                str(memory_id),
+                "negative",
+                "用户指出没有找到根因",
+            )
+            row = memory.get(str(memory_id))
+            self.assertEqual(row["status"], "candidate")
+            self.assertIn("failed", row["tags"])
+            self.assertNotIn(
+                memory_id,
+                {
+                    item["id"]
+                    for item in memory.relevant_strategies(
+                        "修复同步失败",
+                        scope="/project/example",
+                    )
+                },
+            )
             memory.close()
 
     def test_strategy_recall_is_bounded_and_prioritized(self) -> None:

@@ -12,7 +12,7 @@ class ConversationStyleTests(unittest.TestCase):
     def test_reply_budget_mirrors_input_turn_length(self) -> None:
         cases = (
             ("嗯", 32),
-            ("今天有点累", 72),
+            ("今天有点累", 56),
             ("今天开会的时候被临时加了一个很麻烦的需求", 120),
             (
                 "今天发生了很多事情，我想从头跟你说一下具体情况，包括上午开会时"

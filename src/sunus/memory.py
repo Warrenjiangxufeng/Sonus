@@ -1251,6 +1251,103 @@ class MemoryStore:
                 )
             self._append_memory_revision(memory_id, "credit")
 
+    def latest_pending_strategy(
+        self,
+        *,
+        scope: str,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM memories
+                WHERE kind = 'strategy'
+                  AND source = 'reasoning_trace'
+                  AND scope = ?
+                  AND status = 'candidate'
+                ORDER BY created_at DESC
+                LIMIT 12
+                """,
+                (scope,),
+            ).fetchall()
+        for row in rows:
+            try:
+                metadata = json.loads(str(row["metadata"] or "{}"))
+            except json.JSONDecodeError:
+                continue
+            if metadata.get("outcome") == "pending":
+                return dict(row)
+        return None
+
+    def resolve_strategy_outcome(
+        self,
+        memory_id: str,
+        outcome: str,
+        reason: str = "",
+    ) -> None:
+        if outcome not in {"positive", "negative", "neutral"}:
+            raise ValueError("outcome 必须是 positive/negative/neutral")
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM memories WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                metadata = json.loads(str(row["metadata"] or "{}"))
+            except json.JSONDecodeError:
+                metadata = {}
+            metadata["outcome"] = outcome
+            metadata["outcome_reason"] = _safe_text(reason, 1000)
+            metadata["resolved_at"] = iso()
+            tags = {
+                tag
+                for tag in str(row["tags"] or "").split(",")
+                if tag and tag not in {"successful", "failed", "partial"}
+            }
+            tags.add("completed")
+            status = str(row["status"] or "candidate")
+            if outcome == "positive":
+                tags.add("successful")
+                status = "supported"
+            elif outcome == "negative":
+                tags.add("failed")
+                status = "candidate"
+            self._connection.execute(
+                """
+                UPDATE memories
+                SET status = ?, tags = ?, metadata = ?,
+                    positive = positive + ?,
+                    negative = negative + ?,
+                    verified_at = CASE WHEN ? THEN ? ELSE verified_at END
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    ",".join(sorted(tags)),
+                    json.dumps(metadata, ensure_ascii=False),
+                    1 if outcome == "positive" else 0,
+                    1 if outcome == "negative" else 0,
+                    1 if outcome == "positive" else 0,
+                    iso(),
+                    memory_id,
+                ),
+            )
+            self._connection.execute(
+                """
+                INSERT INTO memory_credit(memory_id, outcome, weight, reason, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    memory_id,
+                    outcome,
+                    1 if outcome == "positive" else -1 if outcome == "negative" else 0,
+                    _safe_text(reason, 1000),
+                    iso(),
+                ),
+            )
+            self._append_memory_revision(memory_id, "outcome")
+
     def record_turn(
         self,
         *,

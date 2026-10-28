@@ -144,6 +144,7 @@ experimental_bearer_token ="sk-test-secret-value"
             self.assertEqual(config.model, "deepseek-flash")
             self.assertFalse(config.proactive.enabled)
             self.assertEqual(config.proactive.base_interval_sec, 300)
+            self.assertEqual(config.proactive.max_interval_sec, 21_600)
             self.assertEqual(config.proactive.backoff_factor, 2)
             self.assertEqual(
                 dict(config.proactive.topic_weights),
@@ -161,6 +162,11 @@ experimental_bearer_token ="sk-test-secret-value"
             self.assertEqual(config.proactive.custom_quirks, ())
             self.assertEqual(config.proactive.min_idle_sec, 8)
             self.assertEqual(config.proactive.max_idle_sec, 600)
+            self.assertEqual(config.proactive.thought_min_score, 0.5)
+            self.assertEqual(config.proactive.thought_max_open, 24)
+            self.assertEqual(config.proactive.thought_cooldown_sec, 900)
+            self.assertEqual(config.proactive.thought_no_response_sec, 21_600)
+            self.assertEqual(config.proactive.thought_review_interval_sec, 3_600)
             self.assertEqual(config.proactive.typing_chars_per_second, 28)
             self.assertEqual(config.proactive.bubble_seconds, 15)
             self.assertEqual(config.proactive.action_mode, "safe_auto")
@@ -481,6 +487,37 @@ experimental_bearer_token ="sk-test-secret-value"
                 45,
             )
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_proactive_thought_and_interval_limits_are_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / "data"
+            data.mkdir()
+            (data / "config.json").write_text(
+                json.dumps(
+                    {
+                        "proactive": {
+                            "base_interval_sec": 1000,
+                            "max_interval_sec": 500,
+                            "thought_min_score": 2.0,
+                            "thought_max_open": 0,
+                            "thought_cooldown_sec": 1,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = {
+                "SUNUS_DATA_DIR": str(data),
+                "SUNUS_API_KEY": "sk-test",
+            }
+            with patch.dict(os.environ, env, clear=True):
+                config = resolve_config(root / "workspace")
+
+            self.assertEqual(config.proactive.max_interval_sec, 1000)
+            self.assertEqual(config.proactive.thought_min_score, 1.0)
+            self.assertEqual(config.proactive.thought_max_open, 1)
+            self.assertEqual(config.proactive.thought_cooldown_sec, 30)
 
 if __name__ == "__main__":
     unittest.main()

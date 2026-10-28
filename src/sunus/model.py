@@ -234,6 +234,16 @@ class ModelClient(Protocol):
     ) -> str:
         ...
 
+    def complete_with_usage(
+        self,
+        system: str,
+        user: str,
+        *,
+        max_tokens: int = 512,
+        temperature: float = 0.6,
+    ) -> tuple[str, dict[str, Any]]:
+        ...
+
     def classify_turn(
         self,
         user_input: str,
@@ -505,8 +515,25 @@ class BaseModelClient:
         max_tokens: int = 512,
         temperature: float = 0.6,
     ) -> str:
+        content, _ = self.complete_with_usage(
+            system,
+            user,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return content
+
+    def complete_with_usage(
+        self,
+        system: str,
+        user: str,
+        *,
+        max_tokens: int = 512,
+        temperature: float = 0.6,
+    ) -> tuple[str, dict[str, Any]]:
         requested_tokens = max(1, max_tokens)
         reply: ModelReply | None = None
+        usage: dict[str, Any] = {}
         attempts = 3
 
         def reasoning_token_count(value: ModelReply) -> int | None:
@@ -530,9 +557,12 @@ class BaseModelClient:
                 max_tokens=requested_tokens,
                 temperature=temperature,
             )
+            for key, value in reply.usage.items():
+                if isinstance(value, (int, float)):
+                    usage[key] = usage.get(key, 0) + value
             content = str(reply.message.get("content") or "").strip()
             if content and reply.finish_reason != "length":
-                return content
+                return content, usage
             if attempt < attempts - 1:
                 reasoning_tokens = reasoning_token_count(reply)
                 requested_tokens = max(

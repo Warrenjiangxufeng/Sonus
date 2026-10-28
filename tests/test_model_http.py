@@ -422,6 +422,32 @@ class ModelHttpTests(unittest.TestCase):
             self.assertIn("上一轮的角色提示词", messages[1]["content"])
             self.assertIn("加点卖萌的元素", messages[1]["content"])
 
+    def test_complete_with_usage_returns_provider_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            config = RuntimeConfig(
+                workspace=Path(temp),
+                data_dir=Path(temp),
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="deepseek-flash",
+            )
+            client = DeepSeekClient(config)
+            reply = ModelReply(
+                message={"role": "assistant", "content": '{"ok":true}'},
+                usage={"prompt_tokens": 21, "completion_tokens": 7},
+                finish_reason="stop",
+            )
+            with patch.object(client, "chat", return_value=reply):
+                content, usage = client.complete_with_usage(
+                    "只输出 JSON",
+                    "测试",
+                    max_tokens=80,
+                )
+
+            self.assertEqual(content, '{"ok":true}')
+            self.assertEqual(usage["prompt_tokens"], 21)
+            self.assertEqual(usage["completion_tokens"], 7)
+
     def test_remote_disconnect_retries_and_can_recover(self) -> None:
         DroppingHandler.attempts = 0
         DroppingHandler.drop_attempts = 2

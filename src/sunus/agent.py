@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import traceback
 import uuid
@@ -15,8 +16,17 @@ from sunus.context import (
     compact_messages,
     estimate_messages_tokens,
     repair_tool_pairs,
+    strip_parenthetical_stage_directions,
 )
-from sunus.affect import SunusAffectState
+from sunus.affect import (
+    AFFECT_EVENT_LABELS,
+    RELATIONSHIP_SIGNALS,
+    RESPONSE_FEEDBACK_LABELS,
+    Perception,
+    SunusAffectState,
+    lexical_perception,
+)
+from sunus.code_state_gate import CodeStateEvidenceGate
 from sunus.conversation_style import conversation_repair_instruction
 from sunus.events import EventBus
 from sunus.config import redact_value, save_user_config
@@ -36,6 +46,7 @@ from sunus.persona_expression import build_persona_expression
 from sunus.reasoning import (
     ReasoningPlan,
     build_reasoning_plan,
+    reasoning_memory_query,
 )
 from sunus.reasoning_traces import (
     record_reasoning_trace,
@@ -57,6 +68,10 @@ from sunus.result import (
 from sunus.scope import RequestScope, conversation_hint
 from sunus.storage import SessionLogger
 from sunus.task_state import TaskState
+from sunus.thinking_operators import (
+    COGNITIVE_INVARIANTS,
+    OPERATOR_LIBRARY,
+)
 from sunus.tools import ToolExecutor, ToolResult
 
 
@@ -176,6 +191,7 @@ class Agent:
         self._reasoning_plan: ReasoningPlan | None = None
         self._last_request_scope = None
         self._task_state = TaskState()
+        self._code_state_gate = CodeStateEvidenceGate()
         self._memory_write_required = False
         self._remembered_this_turn = False
         self._response_mode = ""
@@ -186,6 +202,9 @@ class Agent:
         self._relationship_change_denied = False
         self._relationship_denial_reason = ""
         self._allow_relationship_update = True
+        self._turn_perception: Perception | None = None
+        self._turn_started_at = 0.0
+        self._last_strategy_id = ""
         self.reset()
 
     def reset(self) -> None:
@@ -196,6 +215,7 @@ class Agent:
         self._reasoning_plan = None
         self._last_request_scope = None
         self._task_state = TaskState()
+        self._code_state_gate = CodeStateEvidenceGate()
         self._memory_write_required = False
         self._remembered_this_turn = False
         self._response_mode = ""
@@ -206,6 +226,9 @@ class Agent:
         self._relationship_change_denied = False
         self._relationship_denial_reason = ""
         self._allow_relationship_update = True
+        self._turn_perception = None
+        self._turn_started_at = 0.0
+        self._last_strategy_id = ""
         self._session_memory_flushed = False
         self._base_context = self._base_system_prompt()
         self.messages = [{"role": "system", "content": ""}]
@@ -329,6 +352,9 @@ class Agent:
             content += "\n\n" + self._tool_visibility_prompt
         if self._reasoning_plan is not None:
             content += "\n\n" + self._reasoning_plan.prompt()
+        code_state_block = self._code_state_gate.prompt_block()
+        if code_state_block:
+            content += "\n\n" + code_state_block
         self._system_context = content
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0] = {"role": "system", "content": content}
@@ -465,8 +491,8 @@ class Agent:
 长期使命：{mission}
 {persona_block}
 {relationship_block}
-{embodiment_prompt()}
-{self.affect.prompt_block()}
+{embodiment_prompt(stage_directions=self.config.persona.stage_directions)}
+{self.affect.prompt_block(relationship_stage=relationship_stage(relationship))}
 
 {environment_prompt()}
 
@@ -496,12 +522,14 @@ class Agent:
 17. 任务确实需要未开放的写入、命令或网络能力时，调用 request_authorization 发起授权；不要仅凭工具清单自行判断为永久无权限。
 18. 查询“上次、刚才”的失败时先用 inspect_runtime_history 的 recent/latest_failure；需要一段时间的规律时用 trend，让运行时在本地按错误指纹和日期聚合，绝不把数百天逐条日志塞进上下文；只有确定 turn_id 后才用 mode=turn 下钻。不要用 error/crash/Traceback 等泛词搜索整个 .sunus。
 19. 一张候选清单加一次单回合下钻足以判断时立即停止；若两个以上候选都可能是“上次”且无法区分，问用户一个具体的时间或任务锚点，不要继续遍历。365 天全有错误也不等于需要看 365 天每条记录。
-20. 其他文件、源码、文档和配置也使用同一原则：先按路径/时间/类型列候选或 count_by_file 聚合，再只读命中文件的相关行；一次范围搜索足够后停止，禁止用泛词扫描整个工作区来碰运气。
+20. 其他文件、源码、文档和配置也使用同一原则：搜索前先判断最便宜的路径——已知文件直接 read_file，当前代码状态用 inspect_code_state，已知仓库用精确符号搜索，未知仓库先用 list_files 锁定一层；只有这些都不够时才扩大范围，禁止一开始用泛词扫描整个工作区来碰运气。
 21. 用户明确要求“记住、落库、长期保存、不要忘”或要求保存复盘时，必须调用 remember 写入桌面记忆库；只有拿到真实 memory_id 才能说已经记住。故障轮次也要保存用户要求的复盘结论。
 22. 核心不变量由代码保护：事实准确、安全边界、越权保护和记忆不可静默清除不能通过人设或普通工具关闭。名字、语气、称呼和风格仍由用户配置。
 23. 读取已打开浏览器页面时优先使用 inspect_browser；禁止用剪贴板、模拟全选/复制或反复试 osascript。JavaScript 权限关闭时直接说明恢复入口，不猜页面数字。
 24. 查询长期记忆、偏好、经历或复盘时使用 search_memory；禁止把 memory.db 当作目录搜索或文本文件读取。
 25. 用户明确要求“下次/以后由主动消息写文件”时，必须调用 schedule_proactive_file_write 创建或更新结构化主动待办；remember 只保存用户偏好，不能替代待办。优先使用用户当前消息指定的路径；区分 once 与 daily，并把来源 memory_id 一并登记。
+26. 判断“当前状态”时先识别证据域：历史记忆只证明过去说过或发生过什么；配置文件只证明声明意图；源码只证明当前实现；实际生效必须看运行时结果。任何一类证据都不能替代另一类。
+27. 低功耗是所有执行方式的第一约束：证据足够时优先单次专用工具、最小目录、最少命令、最少网络和最少模型往返；先扩大便宜范围再精确读取，不为“更全面”重复已完成检查。
 
 任务边界：
 - 只执行用户当前消息明确要求的动作。建议、假设、示例、推测、可选优化和未点名待办都不是执行指令。
@@ -530,9 +558,13 @@ class Agent:
 """
 
     def _refresh_system_context(self, user_input: str) -> list[str]:
+        memory_query = reasoning_memory_query(
+            user_input,
+            self._reasoning_plan,
+        )
         memory_context = self.memory.build_context(
             scope=self.scope,
-            query=user_input,
+            query=memory_query,
             preference_limit=12,
             recall_limit=5,
         )
@@ -601,6 +633,142 @@ class Agent:
             for item in memory_context.recalled
             if item.get("id")
         ]
+
+    def _recovery_memory_prompt(
+        self,
+        *,
+        controller: TurnController,
+        user_input: str,
+        turn_id: str,
+    ) -> tuple[str, tuple[str, ...]]:
+        query = " ".join(
+            part
+            for part in (
+                user_input,
+                self._task_state.objective,
+                *controller.recovery_query_terms(),
+            )
+            if part
+        )
+        searched = self.memory.search(
+            query,
+            scope=self.scope,
+            limit=24,
+        )
+        strategies = [
+            item
+            for item in searched
+            if item.get("kind") == "strategy"
+            and item.get("status") in {"supported", "verified"}
+            and "failed" not in str(item.get("tags") or "").split(",")
+        ]
+        signal_terms = {
+            token
+            for token in re.findall(
+                r"[A-Za-z_]{4,}|[\u3400-\u9fff]{2,}",
+                query.lower(),
+            )
+            if token
+            not in {
+                "https",
+                "example",
+                "读取",
+                "策略",
+                "family",
+                "strategy",
+                "failed_action",
+            }
+        }
+        strategies.sort(
+            key=lambda item: (
+                sum(
+                    term in str(item.get("content") or "").lower()
+                    for term in signal_terms
+                ),
+                str(item.get("created_at") or ""),
+            ),
+            reverse=True,
+        )
+        strategies = strategies[:3]
+        recalled_ids: list[str] = []
+        for item in strategies:
+            memory_id = str(item.get("id") or "")
+            if memory_id:
+                recalled_ids.append(memory_id)
+                self.memory.record_use(memory_id, turn_id=turn_id)
+        if not strategies:
+            return (
+                "\n\n恢复经验召回：没有匹配的历史策略。"
+                "不要把“没有先例”解释成“没有其他能力”，"
+                "继续根据当前工具和证据自行判断。",
+                (),
+            )
+        lines = [
+            "\n\n恢复经验召回（只能作为候选，不是强制路线）：",
+        ]
+        for item in strategies:
+            lines.append(
+                f"- [{item.get('id')}] "
+                f"{' '.join(str(item.get('content') or '').split())[:700]}"
+            )
+        lines.append(
+            "结合当前语境重新验证这些经验；若关键条件不同，可以拒绝旧路径。"
+        )
+        return "\n".join(lines), tuple(recalled_ids)
+
+    def _recovery_cognition_prompt(
+        self,
+        *,
+        controller: TurnController,
+        available_tool_schemas: list[dict[str, Any]],
+        recalled_memory_ids: tuple[str, ...],
+    ) -> str:
+        tools = []
+        for schema in available_tool_schemas:
+            function = schema.get("function") or {}
+            name = str(function.get("name") or "")
+            spec = self.tools.registry.get(name)
+            if spec is None:
+                tools.append(name)
+                continue
+            details = [
+                spec.capability,
+                f"证据={spec.evidence_kind}",
+            ]
+            if spec.preconditions:
+                details.append(
+                    "前置=" + "、".join(spec.preconditions)
+                )
+            if spec.failure_modes:
+                details.append(
+                    "常见失败=" + "、".join(spec.failure_modes)
+                )
+            tools.append(
+                f"{name}[{spec.risk}；" + "；".join(details) + "]"
+            )
+        memory_text = (
+            "、".join(recalled_memory_ids)
+            if recalled_memory_ids
+            else "无匹配记忆"
+        )
+        return (
+            "\n\n恢复阶段的认知自主契约：\n"
+            "- 重新运用基础认知契约，不套固定流程。由你根据目标、关系、"
+            "证据缺口、风险和当前情境，自主选择是否需要思维算子以及使用哪几个。\n"
+            "- 选择时至少要能回答：现在真正要解决什么、哪些是观察、"
+            "哪些是推断、记忆经验与当前情境哪里相似又哪里不同、"
+            "下一步能增加什么证据、何时应当停止。\n"
+            "- 思维过程留在你的内部，不要输出隐藏推理链；只执行实际下一步，"
+            "或提交有边界的部分/阻塞结果。\n"
+            f"- 本轮真实可见工具：{'、'.join(tools) or '无'}。\n"
+            "- 工具是否可用只以运行时清单、当前请求范围和授权结果为准；"
+            "记忆里的工具名不能证明它现在可用。\n"
+            "- 若记忆涉及未出现在可见列表中的能力，先判断是否需要合法授权；"
+            "无法获得、无必要或不适合当前语境时，选择其他可用能力或直接收口。\n"
+            "- 选择记忆候选前，比较当前任务与历史场景的相似点、关键差异和失败前提；"
+            "不要把相似工具名当作适用性证明。\n"
+            f"- 本轮召回记忆 ID：{memory_text}。\n"
+        )
 
     def _compact_context(
         self,
@@ -716,6 +884,7 @@ class Agent:
             "read_file",
             "list_files",
             "search_text",
+            "inspect_code_state",
             "memory_context_metrics",
             "remember",
             "inspect_environment",
@@ -1070,6 +1239,12 @@ class Agent:
             content=result.content,
             changed_files=result.changed_files,
         )
+        self._code_state_gate.record_tool(
+            invocation.name,
+            invocation.arguments,
+            ok=result.ok,
+            content=result.content,
+        )
         if invocation.name == "remember" and result.ok:
             self._remembered_this_turn = True
             self.events.emit(
@@ -1078,24 +1253,324 @@ class Agent:
                 summary=result.content,
             )
 
-    def run_turn(self, user_input: str) -> AgentResult:
-        turn_id = f"t_{uuid.uuid4().hex[:10]}"
-        self._runtime_policy_prompt = ""
-        self._tool_visibility_prompt = ""
-        self._prepare_turn_relationship(user_input)
-        affect_snapshot = None
+    def _semantic_affect_appraisal(
+        self,
+        text: str,
+        *,
+        previous_assistant: str = "",
+        relationship: RelationshipConfig | None = None,
+        current_state: str = "",
+    ) -> tuple[Perception, dict[str, Any]] | None:
+        complete_with_usage = getattr(
+            self.model,
+            "complete_with_usage",
+            None,
+        )
+        complete = getattr(self.model, "complete", None)
+        if not callable(complete_with_usage) and not callable(complete):
+            return None
+        system = (
+            "你是 Sunus 的关系感知器。只输出 JSON，不解释。"
+            "输入包含当前用户消息、上一条助手回复、关系标签和当前内在状态。"
+            "先记录可观察线索，再推断对方状态；推断不是事实。"
+            "输出字段：observed_cues（短标签数组）、"
+            "inferred_user_state（distress/fatigue/warmth/boundary/"
+            "engagement，0到1）、alternative_explanations（最多2条）、"
+            "relationship_signal（warm/neutral/uncertain/strained/boundary）、"
+            "affect_events、response_feedback、confidence（0到1）。"
+            "affect_events 只能取："
+            + "、".join(AFFECT_EVENT_LABELS)
+            + "。response_feedback 只能取："
+            + "、".join(RESPONSE_FEEDBACK_LABELS)
+            + "，用于判断上一条助手回复在用户这一轮得到的反应。"
+            "普通技术请求若没有关系影响，affect_events 和 "
+            "response_feedback 都可以为空。"
+        )
+        previous = str(previous_assistant or "").strip()[:3000] or "（无）"
+        relation_label = (
+            relationship.label
+            if relationship is not None and relationship.configured
+            else "（未设置）"
+        )
+        user = (
+            f"<current_user_message>\n{text.strip()[:4000]}\n"
+            "</current_user_message>\n"
+            f"<previous_assistant_reply>\n{previous}\n"
+            "</previous_assistant_reply>\n"
+            f"<relationship>{relation_label}</relationship>\n"
+            f"<current_internal_state>\n{current_state[:1600]}\n"
+            "</current_internal_state>"
+        )
         try:
-            affect_snapshot = self.affect.observe(user_input)
+            if callable(complete_with_usage):
+                raw, usage = complete_with_usage(
+                    system,
+                    user,
+                    max_tokens=420,
+                    temperature=0.0,
+                )
+            else:
+                raw = complete(
+                    system,
+                    user,
+                    max_tokens=420,
+                    temperature=0.0,
+                )
+                usage = {
+                    "semantic_appraisal_estimated": True,
+                    "semantic_prompt_tokens_estimate": text_metrics(
+                        system + "\n" + user
+                    )["estimated_tokens"],
+                    "semantic_completion_tokens_estimate": text_metrics(
+                        raw
+                    )["estimated_tokens"],
+                }
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start < 0 or end <= start:
+                return None
+            payload = json.loads(raw[start : end + 1])
+            raw_events = payload.get(
+                "affect_events",
+                payload.get("events", []),
+            )
+            events = [
+                str(item)
+                for item in raw_events
+                if str(item) in AFFECT_EVENT_LABELS
+            ][:8]
+            feedback = [
+                str(item)
+                for item in payload.get("response_feedback", [])
+                if str(item) in RESPONSE_FEEDBACK_LABELS
+            ][:6]
+            inferred: dict[str, float] = {}
+            raw_inferred = payload.get("inferred_user_state")
+            if isinstance(raw_inferred, dict):
+                for key in (
+                    "distress",
+                    "fatigue",
+                    "warmth",
+                    "boundary",
+                    "engagement",
+                ):
+                    try:
+                        inferred[key] = max(
+                            0.0,
+                            min(1.0, float(raw_inferred.get(key, 0.0))),
+                        )
+                    except (TypeError, ValueError):
+                        inferred[key] = 0.0
+            signal = str(payload.get("relationship_signal") or "uncertain")
+            if signal not in RELATIONSHIP_SIGNALS:
+                signal = "uncertain"
+            confidence = max(
+                0.0,
+                min(1.0, float(payload.get("confidence", 0.0))),
+            )
+            observed = [
+                str(item)[:80]
+                for item in payload.get("observed_cues", [])
+                if str(item).strip()
+            ][:8]
+            alternatives = [
+                str(item)[:160]
+                for item in payload.get("alternative_explanations", [])
+                if str(item).strip()
+            ][:2]
+            return (
+                Perception(
+                    observed_cues=tuple(observed or events),
+                    inferred_user_state=inferred,
+                    alternative_explanations=tuple(
+                        alternatives or ("语义推断仍需下一轮反应复核",)
+                    ),
+                    relationship_signal=signal,
+                    affect_events=tuple(events),
+                    response_feedback=tuple(feedback),
+                    confidence=confidence,
+                    source="semantic",
+                ),
+                usage,
+            )
+        except ModelCancelled:
+            raise
         except Exception as error:
             self.events.emit(
-                "affect_state_error",
-                summary=f"内感受状态更新失败: {error}",
+                "affect_semantic_error",
+                summary=f"结构化感知失败，回退词表: {error}",
             )
-        questions_allowed = bool(
-            affect_snapshot is not None
-            and affect_snapshot.question_readiness >= 0.36
-            and not affect_snapshot.questions_inhibited
+            return None
+
+    def _apply_previous_strategy_feedback(
+        self,
+        perception: Perception,
+    ) -> None:
+        feedback = set(perception.response_feedback)
+        if not feedback:
+            return
+        if feedback & {
+            "回应被纠正",
+            "对方仍不安",
+            "对方拉开距离",
+        }:
+            outcome = "negative"
+        elif feedback & {
+            "回应被接纳",
+            "对方缓和",
+            "对方继续投入",
+        }:
+            outcome = "positive"
+        else:
+            outcome = "neutral"
+        pending = self.memory.latest_pending_strategy(scope=self.scope)
+        if pending is None:
+            return
+        memory_id = str(pending["id"])
+        self.memory.resolve_strategy_outcome(
+            memory_id,
+            outcome,
+            "、".join(sorted(feedback)),
         )
+        self.events.emit(
+            "strategy_outcome_resolved",
+            memory_id=memory_id,
+            outcome=outcome,
+            feedback=sorted(feedback),
+            summary=f"上一轮策略效果结算为 {outcome}",
+        )
+
+    def _finalize_circuit_answer(
+        self,
+        *,
+        error: CircuitOpen,
+        changed_files: list[str],
+    ) -> tuple[str, dict[str, Any]]:
+        evidence = list(self._task_state.evidence[-5:])
+        last_error = self._task_state.last_error
+        changed = sorted(set(changed_files))
+        facts: list[str] = []
+        saw_web_content = False
+        for item in evidence:
+            text = str(item)
+            lowered = text.lower()
+            if any(
+                marker in lowered
+                for marker in ("<!doctype", "<html", "<?xml")
+            ):
+                saw_web_content = True
+                continue
+            clean = " ".join(text.split())
+            if clean:
+                facts.append(clean[:240])
+            if len(facts) >= 3:
+                break
+        if saw_web_content:
+            facts.append("已取得部分网页内容，但未形成可靠、可引用的结论。")
+        error_text = " ".join(str(last_error or "").split())
+        if "http_error" in error_text:
+            if "404" in error_text:
+                facts.append("部分候选资料页返回 HTTP 404。")
+            else:
+                facts.append("部分候选资料页返回 HTTP 错误。")
+        elif "network_timeout" in error_text or "timed out" in error_text.lower():
+            facts.append("部分网络请求超时。")
+        elif error_text:
+            facts.append(error_text[:240])
+        if changed:
+            facts.append(
+                f"本轮已修改 {len(changed)} 个文件，变更已保留。"
+            )
+        reason = str(error.reason)
+        if "timeout" in reason.lower() or "超时" in reason:
+            boundary = "资料读取连续超时，当前无法可靠获得网页内容。"
+            next_step = (
+                "可以稍后重试网络、改用已有离线资料，"
+                "或把页面正文发给我继续。"
+            )
+        elif "无新证据" in reason or "没有发现新证据" in reason:
+            boundary = "现有检查连续没有取得新证据，因此已经停止重复动作。"
+            next_step = "可以补充具体目标、提供新的线索，或允许新的检查范围。"
+        else:
+            boundary = f"任务因重复失败停止：{reason}。"
+            next_step = "可以补充缺失信息，或调整目标后重试。"
+        confirmed = "；".join(facts) if facts else "没有取得足够可靠的新证据。"
+        fallback = (
+            f"{boundary}\n已确认：{confirmed}\n"
+            "这不妨碍我先告诉你结论：目前不能把未读取到的内容当作事实。"
+            + next_step
+        )
+        try:
+            messages = [dict(item) for item in self.messages]
+            messages, inserted_pairs, dropped_pairs = repair_tool_pairs(
+                messages
+            )
+            if inserted_pairs or dropped_pairs:
+                self.events.emit(
+                    "circuit_history_repaired",
+                    inserted_tool_messages=inserted_pairs,
+                    dropped_messages=dropped_pairs,
+                    summary="熔断收口前修复未闭合的工具调用配对",
+                )
+            self.messages = [dict(item) for item in messages]
+            instruction = (
+                "\n\n运行已因重复失败停止，不再允许调用任何工具。"
+                "现在必须直接回答用户的原始问题：先说明哪些事实已经确认，"
+                "再说明因网络或权限无法确认什么；如果已有知识足以给出一般性回答，"
+                "可以明确标注为未经当前资料验证的通用说明。禁止编造刚读取到的页面内容，"
+                "禁止只回复“任务已熔断”，也不要把内部策略日志当成正文。"
+            )
+            if messages and messages[0].get("role") == "system":
+                messages[0]["content"] = (
+                    str(messages[0].get("content") or "") + instruction
+                )
+            else:
+                messages.insert(
+                    0,
+                    {"role": "system", "content": instruction.strip()},
+                )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"请基于当前已确认信息直接作答。停止原因：{reason}。"
+                        "不要调用工具，不要只给错误码。"
+                    ),
+                }
+            )
+            reply = self.model.chat(
+                messages,
+                tools=None,
+                max_tokens=min(2048, self.config.max_tokens),
+                temperature=0.2,
+            )
+            answer = str(reply.message.get("content") or "").strip()
+            if reply.message.get("tool_calls"):
+                answer = ""
+            reply_usage = dict(reply.usage or {})
+            if answer:
+                return answer, reply_usage
+        except ModelCancelled:
+            raise
+        except Exception as error_detail:
+            self.events.emit(
+                "circuit_finalization_error",
+                summary=f"熔断后答复生成失败，使用确定性答复: {error_detail}",
+            )
+        return fallback, {}
+
+    def run_turn(self, user_input: str) -> AgentResult:
+        turn_id = f"t_{uuid.uuid4().hex[:10]}"
+        self._turn_started_at = time.monotonic()
+        self._turn_perception = None
+        self._runtime_policy_prompt = ""
+        self._tool_visibility_prompt = ""
+        self.events.emit(
+            "turn_started",
+            turn_id=turn_id,
+            summary="开始处理本轮输入",
+        )
+        self._prepare_turn_relationship(user_input)
         self._memory_write_required = (
             self.memory.is_explicit_memory_request(user_input)
         )
@@ -1111,7 +1586,19 @@ class Agent:
         mode_hint = conversation_hint(
             user_input,
             previous_assistant=previous_assistant,
+            relationship_configured=(
+                self.config.persona.relationship.configured
+            ),
         )
+        relationship_chat = bool(
+            self.config.persona.relationship.configured
+            and len(user_input.strip()) <= 80
+            and not request_scope.allows_mutation
+            and not request_scope.allows_commands
+            and not request_scope.allows_network
+        )
+        if relationship_chat:
+            mode_hint = "casual"
         conversation = (
             mode_hint != "task"
             and not request_scope.allows_mutation
@@ -1137,33 +1624,110 @@ class Agent:
                 except ModelCancelled:
                     raise
                 except Exception as error:
-                    # A failed classifier must not block the main answer.
-                    conversation = False
-                    mode_source = "model_error_fallback_task"
+                    # The rule layer already excludes technical and side-effect
+                    # requests. Keep ambiguous non-technical turns conversational.
+                    conversation = True
+                    mode_source = "model_error_fallback_chat"
                     classification_error = str(error)
             else:
                 mode_source = "rule_fallback"
         self._response_mode = "conversation" if conversation else "default"
+        self.events.emit(
+            "response_mode",
+            turn_id=turn_id,
+            mode=self._response_mode,
+            source=mode_source,
+            relationship_chat=relationship_chat,
+            summary="闲聊模式" if conversation else "任务模式",
+        )
         self._reasoning_plan = build_reasoning_plan(
             user_input,
             request_scope,
             conversation=conversation,
             previous_assistant=previous_assistant,
         )
+        if self._reasoning_plan.requires_code_state_evidence:
+            conversation = False
+            self._response_mode = "default"
+        self._code_state_gate = CodeStateEvidenceGate(
+            enabled=not conversation,
+            prompt_required=bool(
+                self._reasoning_plan
+                and self._reasoning_plan.requires_code_state_evidence
+            ),
+        )
+        affect_snapshot = None
+        appraisal_usage: dict[str, Any] = {}
+        relationship = (
+            self._turn_relationship
+            if self._relationship_update_pending
+            else self.config.persona.relationship
+        )
+        semantic_appraisal = self._semantic_affect_appraisal(
+            user_input,
+            previous_assistant=previous_assistant,
+            relationship=relationship,
+            current_state=self.affect.prompt_block(
+                relationship_stage=relationship_stage(relationship),
+            ),
+        )
+        if semantic_appraisal is not None:
+            perception, appraisal_usage = semantic_appraisal
+            for key, value in appraisal_usage.items():
+                if isinstance(value, (int, float)):
+                    usage[key] = usage.get(key, 0) + value
+        else:
+            perception = lexical_perception(
+                user_input,
+                previous_assistant=previous_assistant,
+            )
+        self._turn_perception = perception
+        try:
+            self._apply_previous_strategy_feedback(perception)
+        except Exception as error:
+            self.events.emit(
+                "memory_write_error",
+                summary=f"上一轮策略效果结算失败: {error}",
+            )
+        try:
+            affect_snapshot = self.affect.observe(
+                user_input,
+                perception=perception,
+            )
+            if semantic_appraisal is not None:
+                self.events.emit(
+                    "affect_semantic_appraisal",
+                    events=list(perception.affect_events),
+                    feedback=list(perception.response_feedback),
+                    relationship_signal=perception.relationship_signal,
+                    confidence=perception.confidence,
+                    usage=appraisal_usage,
+                    summary="感知、关系信号和回应反馈使用语义判定",
+                )
+        except Exception as error:
+            self.events.emit(
+                "affect_state_error",
+                summary=f"内感受状态更新失败: {error}",
+            )
+        questions_allowed = bool(
+            affect_snapshot is not None
+            and affect_snapshot.question_readiness >= 0.08
+            and not affect_snapshot.questions_inhibited
+        )
+        self._apply_system_message()
         if not conversation:
             self._task_state.update(user_input, request_scope)
             if self._reasoning_plan.complexity == "高":
                 self._task_state.phase = "planning"
-            operator_selection = self._reasoning_plan.operator_selection
-            self.events.emit(
-                "thinking_operators_selected",
-                turn_id=turn_id,
-                operators=list(operator_selection.operators),
-                contrast_checks=list(operator_selection.contrast_checks),
-                summary=(
-                    f"思维算子: {','.join(operator_selection.operators)}"
-                ),
-            )
+        self.events.emit(
+            "cognitive_context_prepared",
+            turn_id=turn_id,
+            mode=self._reasoning_plan.mode,
+            available_operators=list(OPERATOR_LIBRARY),
+            invariants=list(COGNITIVE_INVARIANTS),
+            perception_signal=perception.relationship_signal,
+            summary="认知视角由模型自主选择",
+        )
         grant = self.tools.approvals.begin_task()
         self.events.emit(
             "task_grant_started",
@@ -1243,6 +1807,7 @@ class Agent:
         tool_traces: list[dict[str, Any]] = []
         changed_files: list[str] = []
         final_text = ""
+        last_assistant_content = ""
         reason = "completed"
         last_finish_reason = ""
         last_reasoning_characters = 0
@@ -1250,6 +1815,7 @@ class Agent:
         output_retry_used = False
         protocol_retry_used = False
         conversation_style_retry_used = False
+        code_state_gate_retry_used = False
         structured_result: dict[str, Any] | None = None
         budget = replace(
             self.config.loop_budget,
@@ -1266,6 +1832,11 @@ class Agent:
         controller.start()
         if classification_usage:
             controller.record_usage(classification_usage)
+        if semantic_appraisal is not None:
+            controller.record_auxiliary_model_call(
+                appraisal_usage,
+                purpose="structured_perception",
+            )
 
         try:
             while True:
@@ -1275,7 +1846,32 @@ class Agent:
                 )
                 recovery = controller.before_model_call()
                 if recovery:
-                    self._runtime_policy_prompt = recovery
+                    if controller.finalizing:
+                        recovery_memory = ""
+                        recalled_memory_ids: tuple[str, ...] = ()
+                    else:
+                        (
+                            recovery_memory,
+                            recalled_memory_ids,
+                        ) = self._recovery_memory_prompt(
+                            controller=controller,
+                            user_input=user_input,
+                            turn_id=turn_id,
+                        )
+                    recovery_operators = (
+                        ""
+                        if controller.finalizing
+                        else self._recovery_cognition_prompt(
+                            controller=controller,
+                            available_tool_schemas=available_tool_schemas,
+                            recalled_memory_ids=recalled_memory_ids,
+                        )
+                    )
+                    self._runtime_policy_prompt = (
+                        recovery
+                        + recovery_memory
+                        + recovery_operators
+                    )
                     self._apply_system_message()
                     self.events.emit(
                         (
@@ -1518,6 +2114,42 @@ class Agent:
                             summary="上一版对话过于解释或违背不追问要求，已重写一次",
                         )
                         continue
+                if not tool_calls and visible_text:
+                    code_state_missing = self._code_state_gate.missing_instruction(
+                        visible_text
+                    )
+                    if code_state_missing:
+                        if not code_state_gate_retry_used:
+                            code_state_gate_retry_used = True
+                            self._runtime_policy_prompt = (
+                                f"{self._runtime_policy_prompt}\n"
+                                f"{code_state_missing}"
+                            ).strip()
+                            self._apply_system_message()
+                            self.events.emit(
+                                "code_state_evidence_retry",
+                                turn_id=turn_id,
+                                summary=(
+                                    "当前代码状态证据不足，已要求先检查代码与 Git"
+                                ),
+                            )
+                            continue
+                        final_text = self._code_state_gate.unverified_answer()
+                        envelope = fallback_result(
+                            final_text,
+                            changed_files=changed_files,
+                            reason="blocked",
+                        )
+                        structured_result = envelope.to_dict()
+                        reason = "blocked"
+                        self.events.emit(
+                            "code_state_evidence_blocked",
+                            turn_id=turn_id,
+                            summary=(
+                                "代码状态证据仍不足，已阻止无依据版本结论"
+                            ),
+                        )
+                        break
                 self._record_message(
                     self._assistant_payload(message),
                     turn_id=turn_id,
@@ -1592,15 +2224,24 @@ class Agent:
                     break
                 progress = str(message.get("content") or "").strip()
                 if progress:
+                    last_assistant_content = progress
+
+                submitted = False
+                invocations = self._parse_tool_invocations(tool_calls)
+                if progress and not (
+                    invocations
+                    and all(
+                        not invocation.parse_error
+                        and invocation.name == "submit_result"
+                        for invocation in invocations
+                    )
+                ):
                     self.events.emit(
                         "assistant_progress",
                         turn_id=turn_id,
                         step=controller.model_calls,
                         summary=progress[:1000],
                     )
-
-                submitted = False
-                invocations = self._parse_tool_invocations(tool_calls)
                 invocation_index = 0
                 while invocation_index < len(invocations):
                     invocation = invocations[invocation_index]
@@ -1671,6 +2312,11 @@ class Agent:
                                     summary="已压缩内部审计字段，保留用户答案",
                                 )
                             envelope = normalized
+                            code_state_missing = self._code_state_gate.missing_instruction(
+                                render_result(envelope)
+                            )
+                            if code_state_missing:
+                                raise ValueError(code_state_missing)
                             if envelope.kind == "document":
                                 for artifact in envelope.artifacts:
                                     path = self.tools.path_guard.resolve(
@@ -1817,21 +2463,23 @@ class Agent:
             )
         except CircuitOpen as error:
             reason = "circuit_open"
-            final_text = f"任务已熔断：{error.reason}。"
-            if self._task_state.evidence:
-                final_text += (
-                    "\n已确认："
-                    + "；".join(self._task_state.evidence[-3:])
+            final_text, circuit_usage = self._finalize_circuit_answer(
+                error=error,
+                changed_files=changed_files,
+            )
+            if circuit_usage:
+                controller.record_auxiliary_model_call(
+                    circuit_usage,
+                    purpose="circuit_final_answer",
                 )
-            if self._task_state.last_error:
-                final_text += (
-                    "\n最近错误：" + self._task_state.last_error
-                )
-            if changed_files:
-                final_text += (
-                    f"本轮已完成 {len(set(changed_files))} 个文件修改，"
-                    "变更已保留并写入 Receipt。"
-                )
+                for key, value in circuit_usage.items():
+                    if isinstance(value, (int, float)):
+                        usage[key] = usage.get(key, 0) + value
+            self.events.emit(
+                "circuit_final_answer",
+                turn_id=turn_id,
+                summary="熔断后已生成面向用户的最终答复",
+            )
         except ModelError as error:
             reason = "model_error"
             final_text = f"模型调用失败：{error}"
@@ -1861,6 +2509,8 @@ class Agent:
                 changed_files=changed_files,
                 reason=reason,
             )
+            if reason == "circuit_open":
+                envelope = replace(envelope, next_action="")
             structured_result = envelope.to_dict()
             final_text = render_result(envelope)
             self.events.emit(
@@ -1869,6 +2519,37 @@ class Agent:
                 reason=reason,
                 summary="已生成兼容结构化结果",
             )
+
+        if (
+            mode_hint != "task"
+            and last_assistant_content
+            and tool_traces
+            and all(
+                str(trace.get("name") or "") == "submit_result"
+                for trace in tool_traces
+            )
+        ):
+            final_text = last_assistant_content
+            structured_result["summary"] = final_text
+            self.events.emit(
+                "casual_natural_reply_preferred",
+                turn_id=turn_id,
+                summary="已用自然回复替代结构化摘要",
+            )
+
+        if (
+            not self.config.persona.stage_directions
+            and (relationship_chat or mode_hint != "task")
+        ):
+            before_stage_directions = final_text
+            final_text = strip_parenthetical_stage_directions(final_text)
+            structured_result["summary"] = final_text
+            if final_text != before_stage_directions:
+                self.events.emit(
+                    "stage_directions_removed",
+                    turn_id=turn_id,
+                    summary="已移除闲聊中的括号动作旁白",
+                )
 
         if conversation and reason == "completed":
             before_characters = len(final_text)
@@ -1881,6 +2562,7 @@ class Agent:
             final_text = compact_conversation_reply(
                 final_text,
                 limit=response_limit,
+                allow_stage_directions=self.config.persona.stage_directions,
             )
             structured_result["summary"] = final_text
             if len(final_text) != before_characters:
@@ -1917,25 +2599,59 @@ class Agent:
             metrics=metrics,
             structured_result=structured_result,
         )
-        if not conversation and self._reasoning_plan is not None:
+        relationship_trace = bool(
+            self._turn_perception is not None
+            and (
+                self._turn_perception.affect_events
+                or self._turn_perception.response_feedback
+                or self._turn_perception.relationship_signal
+                in {"warm", "strained", "boundary"}
+            )
+        )
+        should_trace = bool(
+            self._reasoning_plan is not None
+            and (not conversation or relationship_trace)
+        )
+        if should_trace:
             try:
+                trace_objective = (
+                    self._task_state.objective
+                    if not conversation
+                    else (
+                        "关系回合："
+                        + ",".join(self._turn_perception.affect_events or ("neutral",))
+                        + "；signal="
+                        + self._turn_perception.relationship_signal
+                    )
+                )
+                tool_names = [
+                    str(trace.get("name") or "")
+                    for trace in tool_traces
+                    if trace.get("name")
+                    and trace.get("name") != "submit_result"
+                ]
                 strategy_id = record_reasoning_trace(
                     self.memory,
                     scope=self.scope,
                     receipt_id=receipt["receipt_id"],
-                    objective=self._task_state.objective,
+                    objective=trace_objective,
                     mode=self._reasoning_plan.mode,
                     capabilities=self._reasoning_plan.capabilities,
                     preferred_tools=self._reasoning_plan.preferred_tools,
                     tool_traces=tool_traces,
                     blocker=self._task_state.blocker,
                     reason=reason,
-                    operators=self._reasoning_plan.operator_selection.operators,
-                    contrast_checks=(
-                        self._reasoning_plan.operator_selection.contrast_checks
+                    operators=(),
+                    contrast_checks=(),
+                    operator_checkpoints=COGNITIVE_INVARIANTS,
+                    perception=(
+                        self._turn_perception.to_dict()
+                        if self._turn_perception is not None
+                        else None
                     ),
                 )
                 if strategy_id:
+                    self._last_strategy_id = strategy_id
                     self.events.emit(
                         "reasoning_trace_recorded",
                         turn_id=turn_id,
@@ -1949,6 +2665,33 @@ class Agent:
                     turn_id=turn_id,
                     summary=f"策略轨迹写入失败: {error}",
                 )
+        try:
+            failed_tools = sum(
+                1
+                for trace in tool_traces
+                if trace.get("ok") is False
+            )
+            self.affect.record_runtime_activity(
+                action_names=[
+                    str(trace.get("name") or "")
+                    for trace in tool_traces
+                    if trace.get("name")
+                    and trace.get("name") != "submit_result"
+                ],
+                failure_count=failed_tools,
+                changed_file_count=len(changed_files),
+                expression_text=final_text,
+                mode="conversation" if conversation else "task",
+                elapsed_seconds=max(
+                    0.0,
+                    time.monotonic() - self._turn_started_at,
+                ),
+            )
+        except Exception as error:
+            self.events.emit(
+                "affect_state_error",
+                summary=f"动作与表达通道更新失败: {error}",
+            )
         if self._memory_write_required and not self._remembered_this_turn:
             try:
                 memory_id = self.memory.record_explicit_review(

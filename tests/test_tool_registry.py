@@ -40,6 +40,7 @@ class ToolRegistryTests(unittest.TestCase):
                 "schedule_proactive_file_write"
             )
             runtime_history = tools.registry.get("inspect_runtime_history")
+            code_state = tools.registry.get("inspect_code_state")
             memory_search = tools.registry.get("search_memory")
             browser = tools.registry.get("inspect_browser")
             remember = tools.registry.get("remember")
@@ -49,6 +50,8 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertTrue(read.read_only)
             self.assertTrue(read.parallel_safe)
             self.assertEqual(read.risk, "R0")
+            self.assertEqual(read.capability, "workspace_text")
+            self.assertEqual(read.evidence_kind, "file_content")
             self.assertFalse(write.read_only)
             self.assertFalse(write.parallel_safe)
             self.assertEqual(write.risk, "R1")
@@ -63,10 +66,19 @@ class ToolRegistryTests(unittest.TestCase):
             self.assertEqual(schedule_proactive.risk, "R1")
             self.assertTrue(runtime_history.read_only)
             self.assertTrue(runtime_history.parallel_safe)
+            self.assertTrue(code_state.read_only)
+            self.assertTrue(code_state.parallel_safe)
             self.assertTrue(memory_search.read_only)
             self.assertTrue(memory_search.parallel_safe)
             self.assertFalse(browser.read_only)
             self.assertFalse(browser.parallel_safe)
+            self.assertEqual(browser.capability, "browser_state")
+            self.assertEqual(browser.evidence_kind, "browser_page")
+            self.assertTrue(browser.preconditions)
+            self.assertTrue(browser.failure_modes)
+            fetch = tools.registry.get("fetch_url")
+            self.assertEqual(fetch.capability, "remote_http")
+            self.assertEqual(fetch.evidence_kind, "remote_page")
             self.assertFalse(remember.read_only)
             self.assertFalse(remember.parallel_safe)
             self.assertFalse(result.parallel_safe)
@@ -76,6 +88,7 @@ class ToolRegistryTests(unittest.TestCase):
                     "read_file",
                     "list_files",
                     "search_text",
+                    "inspect_code_state",
                     "search_memory",
                     "memory_context_metrics",
                     "inspect_environment",

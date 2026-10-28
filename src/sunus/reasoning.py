@@ -6,9 +6,7 @@ from dataclasses import dataclass
 from sunus.conversation_style import plan_conversation_turn
 from sunus.scope import RequestScope
 from sunus.thinking_operators import (
-    OPERATOR_LIBRARY,
-    OperatorSelection,
-    select_operators,
+    cognitive_protocol_prompt,
 )
 
 
@@ -43,6 +41,16 @@ _PLAYWRIGHT_PATTERN = re.compile(
 )
 _BROWSER_PATTERN = re.compile(r"(?:浏览器|标签页|已打开网页|网页展示)", re.I)
 _TEMPORAL_PATTERN = re.compile(r"(?:上次|刚才|最近)", re.I)
+_CODE_STATE_PATTERN = re.compile(
+    r"(?:"
+    r"(?:最新|当前)(?:的)?(?:代码|版本|实现|改动)|"
+    r"已经(?:改|修|实现|更新)(?:过|了)?|改过(?:吗|么|没)|"
+    r"上次修改|哪个提交|什么时候改|"
+    r"(?:代码|配置).{0,18}(?:有没有|是否|生效|最新|旧版本)|"
+    r"为什么还.{0,18}(?:没有|没|旧|之前)"
+    r")",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -57,10 +65,7 @@ class ReasoningPlan:
     drop_details: bool = False
     strategy: str = ""
     response_char_limit: int = 0
-
-    @property
-    def operator_selection(self) -> OperatorSelection:
-        return select_operators(mode=self.mode, complexity=self.complexity)
+    requires_code_state_evidence: bool = False
 
     def prompt(self) -> str:
         lines = [
@@ -76,19 +81,24 @@ class ReasoningPlan:
         if self.strategy:
             lines.append(f"- 专项策略: {self.strategy}")
         if self.mode != "关系性对话":
-            lines.append(self.operator_selection.prompt())
-            if self.complexity == "高":
-                lines.append(
-                    f"- 备用算子: {','.join(OPERATOR_LIBRARY)}"
-                )
+            lines.append(
+                "- 第一约束: 低功耗；在证据充分的前提下，优先单次专用工具、"
+                "最小范围、最少模型/命令/网络调用"
+            )
+        lines.append(cognitive_protocol_prompt())
         if self.response_char_limit:
             lines.append(
                 f"- 回复长度上限: 约 {self.response_char_limit} 字"
             )
+        if self.requires_code_state_evidence:
+            lines.append(
+                "- 证据门控: 必须调用 inspect_code_state，取得符号命中、"
+                "代码上下文、当前 HEAD 和提交归属后才能断言代码状态"
+            )
         return "\n".join(lines)
 
 
-def build_reasoning_plan(
+def _build_reasoning_plan(
     text: str,
     scope: RequestScope,
     *,
@@ -97,7 +107,8 @@ def build_reasoning_plan(
 ) -> ReasoningPlan:
     value = str(text or "")
     capabilities = tuple(sorted(scope.required_capabilities))
-    if conversation:
+    code_state_query = is_code_state_query(value)
+    if conversation and not code_state_query:
         turn_plan = plan_conversation_turn(value)
         return ReasoningPlan(
             mode="关系性对话",
@@ -127,6 +138,23 @@ def build_reasoning_plan(
             stop_condition="拿到状态和关键标识即停止，不扩展未点名对象。",
             answer_style="首句给结论，1-3 句；details 留空，不复述工具日志。",
             drop_details=True,
+        )
+    if code_state_query:
+        return ReasoningPlan(
+            mode="当前代码状态核验",
+            complexity="高",
+            capabilities=capabilities,
+            preferred_tools=("inspect_code_state", "submit_result"),
+            max_exploration_calls=4,
+            stop_condition=(
+                "取得当前 HEAD、精确符号命中、命中上下文和 Git 归属后停止。"
+            ),
+            answer_style=(
+                "结论必须对应代码证据；区分“代码存在”“配置可调”“运行时生效”。"
+                "证据不足时明确说无法核实，不猜测。"
+            ),
+            strategy=code_state_verification_prompt(),
+            requires_code_state_evidence=True,
         )
     if is_playwright_cli_request(value):
         return ReasoningPlan(
@@ -213,6 +241,21 @@ def build_reasoning_plan(
     )
 
 
+def build_reasoning_plan(
+    text: str,
+    scope: RequestScope,
+    *,
+    conversation: bool = False,
+    previous_assistant: str = "",
+) -> ReasoningPlan:
+    return _build_reasoning_plan(
+        text,
+        scope,
+        conversation=conversation,
+        previous_assistant=previous_assistant,
+    )
+
+
 def is_diagnostic_request(text: str) -> bool:
     return bool(_DIAGNOSTIC_PATTERN.search(str(text or "")))
 
@@ -240,6 +283,40 @@ def is_simple_lookup_request(text: str) -> bool:
 
 def is_playwright_cli_request(text: str) -> bool:
     return bool(_PLAYWRIGHT_PATTERN.search(str(text or "")))
+
+
+def is_code_state_query(text: str) -> bool:
+    return bool(_CODE_STATE_PATTERN.search(str(text or "")))
+
+
+def code_state_verification_prompt() -> str:
+    return """本轮在核验当前代码状态或版本，按可观察证据执行：
+1. 低功耗优先：参考召回经验后，选择能一次取得所需证据的最短路径；记忆只能提示方法，不能证明当前实现。
+2. 优先单次调用 inspect_code_state，传入具体文件和精确符号；不要先做多轮目录扫描或只读 config.json。
+3. 必须读取返回的命中上下文，并确认当前分支、HEAD 和该代码的提交归属。
+4. 配置项不存在只能说明“不可配置”，不能推断“代码没有实现”。
+5. 文件修改时间不是版本证据；旧事件与当前代码必须用提交时间区分。
+6. 证据不足时回答“无法核实”，不得声称已修复、最新或只是旧版本。"""
+
+
+def reasoning_memory_query(text: str, plan: ReasoningPlan | None) -> str:
+    """Augment recall with reusable routing lessons, never current-state facts."""
+    value = " ".join(str(text or "").split())
+    if plan is None or plan.mode == "关系性对话":
+        return value
+    additions: list[str] = []
+    if plan.requires_code_state_evidence:
+        additions.extend(
+            ["代码状态", "证据", "符号", "调用上下文", "提交", "教训"]
+        )
+    elif plan.mode == "根因诊断":
+        additions.extend(["排查", "根因", "教训", "路径", "坑"])
+    elif any(
+        name in plan.preferred_tools
+        for name in ("search_text", "list_files", "inspect_code_state")
+    ):
+        additions.extend(["搜索", "范围", "最佳路径", "功耗"])
+    return " ".join([value, *additions]).strip()
 
 
 def playwright_cli_prompt() -> str:
@@ -294,6 +371,7 @@ def conversation_thinking_prompt(
 12. 被问“你有没有情绪/欲望”时，直接说有或没有，再给一个具体表现；不要罗列精力、疲劳、阈值、状态机或参数来证明自己。
 13. 被问“怎样更像人”时，只给一个具体立场或做法；不要列三条计划，不要把对方变成裁判、教练或监督者。
 14. 不用“要是你嫌烦我就自己磨”这类愧疚、赌气或条件句换反馈；可以承认别扭，但说完就收。
+15. 面对简短的亲密邀请，直接接住当下动作或感受；只选一个主反应，最多补一个感官细节。不要扩写场景、堆叠动作、分析心理、翻旧账或强行反问。
 历史记忆中的旧回复只能作为风格参考，不得当作可复用模板。{turn_block}{previous_block}"""
 
 

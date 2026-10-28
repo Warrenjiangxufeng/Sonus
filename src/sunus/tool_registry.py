@@ -19,6 +19,10 @@ class ToolSpec:
     parallel_safe: bool = False
     timeout_sec: int = 60
     approval_mode: str = "ask"
+    capability: str = "general"
+    evidence_kind: str = "observation"
+    preconditions: tuple[str, ...] = ()
+    failure_modes: tuple[str, ...] = ()
 
     def as_schema(self) -> dict[str, Any]:
         return {
@@ -55,6 +59,10 @@ class ToolRegistry:
         parallel_safe: bool = False,
         timeout_sec: int = 60,
         approval_mode: str = "ask",
+        capability: str = "general",
+        evidence_kind: str = "observation",
+        preconditions: tuple[str, ...] = (),
+        failure_modes: tuple[str, ...] = (),
     ) -> None:
         function = schema.get("function") or {}
         parameters = function.get("parameters") or {
@@ -75,6 +83,10 @@ class ToolRegistry:
                 parallel_safe=parallel_safe,
                 timeout_sec=timeout_sec,
                 approval_mode=approval_mode,
+                capability=capability,
+                evidence_kind=evidence_kind,
+                preconditions=tuple(preconditions),
+                failure_modes=tuple(failure_modes),
             )
         )
 

@@ -462,6 +462,105 @@ class TurnControllerTests(unittest.TestCase):
         right = TurnController._error_fingerprint("fetch_url", second)
         self.assertEqual(left, right)
 
+    def test_structured_network_timeout_has_stable_strategy_without_target(
+        self,
+    ) -> None:
+        first = json.dumps(
+            {
+                "error": "network_timeout",
+                "detail": "handshake timed out after 7 seconds",
+                "host": "en.wikipedia.org",
+            }
+        )
+        second = json.dumps(
+            {
+                "error": "network_timeout",
+                "detail": "timed out after 9 seconds",
+                "host": "example.org",
+            }
+        )
+        left = TurnController._failure_strategy_key(
+            "fetch_url",
+            "timeout",
+            "timed out",
+            first,
+        )
+        right = TurnController._failure_strategy_key(
+            "fetch_url",
+            "timeout",
+            "timed out",
+            second,
+        )
+        self.assertEqual(left, right)
+        self.assertIn("network-timeout", left)
+
+    def test_recovery_blocks_exact_failed_actions_but_allows_new_paths(self) -> None:
+        events = RecordingEvents()
+        controller = TurnController(
+            replace(
+                LoopBudgetConfig(),
+                same_error_soft=2,
+                same_error_hard=4,
+            ),
+            events=events,  # type: ignore[arg-type]
+        )
+        controller.before_model_call()
+        controller.record_tool_result(
+            "fetch_url",
+            {"url": "https://a.example"},
+            ok=False,
+            content=(
+                '{"error":"network_timeout","detail":"timed out",'
+                '"host":"a.example"}'
+            ),
+            changed_files=[],
+        )
+        controller.before_model_call()
+        controller.record_tool_result(
+            "fetch_url",
+            {"url": "https://b.example"},
+            ok=False,
+            content=(
+                '{"error":"network_timeout","detail":"timed out",'
+                '"host":"b.example"}'
+            ),
+            changed_files=[],
+        )
+        recovery = controller.before_model_call()
+
+        self.assertIsNotNone(recovery)
+        prompt = recovery or ""
+        self.assertIn("由你结合用户目标", prompt)
+        self.assertIn("不得机械套用固定工具替代表", prompt)
+        self.assertNotIn("inspect_browser", prompt)
+        self.assertNotIn("request_authorization", prompt)
+        self.assertIn("https://a.example", prompt)
+        self.assertIn("https://b.example", prompt)
+        self.assertIsNotNone(
+            controller.before_tool(
+                "fetch_url",
+                {"url": "https://a.example"},
+            )
+        )
+        self.assertIsNotNone(
+            controller.before_tool(
+                "fetch_url",
+                {"url": "https://b.example"},
+            )
+        )
+        self.assertIsNone(
+            controller.before_tool(
+                "fetch_url",
+                {"url": "https://c.example"},
+            )
+        )
+        self.assertIsNone(
+            controller.before_tool(
+                "inspect_browser",
+                {"browser": "chrome", "mode": "active"},
+            )
+        )
+
     def test_error_fingerprint_attributes_failure_before_recovery(self) -> None:
         family, _detail, _label = TurnController._error_fingerprint(
             "run_command",

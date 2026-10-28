@@ -13,6 +13,7 @@ from sunus.policy import (
     PolicyError,
     TaskGrant,
     _choose_approval_option,
+    _clear_approval_options,
     _read_menu_key,
     _render_approval_options,
     command_denial_reason,
@@ -224,17 +225,18 @@ class PolicyTests(unittest.TestCase):
             )
         rendered = output.getvalue()
         self.assertIn(
-            "\x1b[1;7;36m  ❯ 1. 允许本次",
+            "\x1b[1;7;36m  ❯ 1. 允许本次（↑/↓ 选择 · Enter / y）",
             rendered,
         )
         self.assertIn(
-            "\x1b[2m    2. 本会话全部允许\x1b[0m",
+            "\x1b[2m    2. 本会话全部允许（↑/↓ 选择 · 2 / a）\x1b[0m",
             rendered,
         )
         self.assertIn(
-            "\x1b[2m    3. 拒绝\x1b[0m",
+            "\x1b[2m    3. 拒绝（↑/↓ 选择 · 3 / x / Esc）\x1b[0m",
             rendered,
         )
+        self.assertNotIn("Enter 确认 · y 允许 · x 拒绝", rendered)
 
         output = io.StringIO()
         with redirect_stdout(output):
@@ -245,11 +247,11 @@ class PolicyTests(unittest.TestCase):
             )
         rendered = output.getvalue()
         self.assertIn(
-            "\x1b[1;7;36m  ❯ 2. 本会话全部允许",
+            "\x1b[1;7;36m  ❯ 2. 本会话全部允许（↑/↓ 选择 · 2 / a）",
             rendered,
         )
         self.assertIn(
-            "\x1b[2m    1. 允许本次\x1b[0m",
+            "\x1b[2m    1. 允许本次（↑/↓ 选择 · Enter / y）\x1b[0m",
             rendered,
         )
 
@@ -262,9 +264,24 @@ class PolicyTests(unittest.TestCase):
                 color_enabled=False,
             )
         rendered = output.getvalue()
-        self.assertIn("  ❯ 1. 允许本次", rendered)
+        self.assertIn("  ❯ 1. 允许本次（↑/↓ 选择 · Enter / y）", rendered)
+        self.assertNotIn("Enter 确认 · y 允许 · x 拒绝", rendered)
         self.assertNotIn("\x1b[1;7;36m", rendered)
         self.assertNotIn("\x1b[2m", rendered)
+
+    def test_approval_options_are_cleared_after_rendering(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            _render_approval_options(
+                0,
+                first=True,
+                color_enabled=False,
+            )
+            _clear_approval_options()
+        rendered = output.getvalue()
+        self.assertIn("\x1b[3A", rendered)
+        self.assertGreaterEqual(rendered.count("\x1b[2K"), 3)
+        self.assertTrue(rendered.endswith("\r"))
 
     def test_session_allow_option_persists_for_session(self) -> None:
         approvals = ApprovalManager(

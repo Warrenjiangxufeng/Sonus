@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from sunus.memory import MemoryStore
@@ -13,17 +14,17 @@ def _lesson_for(
     tool_names: list[str],
 ) -> str:
     if reason == "completed":
-        if "inspect_browser" in tool_names:
-            return "现有页面优先用结构化浏览器读取；登录或权限边界出现时立即停止。"
-        if "inspect_runtime_history" in tool_names:
-            return "历史故障先按时间锚点取候选，再只下钻一个 turn。"
-        if "run_command" in tool_names:
-            return "先验证环境和真实命令结果，再基于输出决定下一步。"
-        return "用最少只读检查拿到证据，证据足够后直接收束。"
+        return (
+            "从当前可用能力中选择能产生新证据且风险可接受的动作；"
+            "若新证据已足够回答，立即停止扩展。"
+        )
     if reason == "circuit_open":
-        return f"同类路径在 {mode} 中达到预算或重复失败；下次更早归因并向用户收口。"
+        return (
+            f"{mode} 中跨动作仍没有产生足够新证据；"
+            "下次更早比较信息增益，并在无证据增益时收口。"
+        )
     if blocker == "authorization":
-        return "权限拒绝是确定性阻塞；第一次出现就申请对应能力或说明缺少的授权。"
+        return "权限拒绝是确定性阻塞；保留已确认事实，并说明缺少的具体能力。"
     if blocker == "missing_path":
         return "点名路径不存在时直接报告，不遍历相邻目录碰运气。"
     return "保留已确认事实，先归因再换路径，不重复同一假设。"
@@ -43,6 +44,8 @@ def record_reasoning_trace(
     reason: str,
     operators: tuple[str, ...] = (),
     contrast_checks: tuple[str, ...] = (),
+    operator_checkpoints: tuple[str, ...] = (),
+    perception: dict[str, Any] | None = None,
 ) -> str | None:
     if not objective:
         return None
@@ -59,27 +62,33 @@ def record_reasoning_trace(
     )
     content = (
         "策略轨迹："
+        f"轨迹={receipt_id}；"
         f"模式={mode}；目标={objective[:300]}；"
         f"能力={','.join(capabilities) or '无'}；"
         f"首选={','.join(preferred_tools) or '直接回答'}；"
         f"算子={','.join(operators) or '无'}；"
+        f"检查点={','.join(operator_checkpoints) or '无'}；"
         f"复核={','.join(contrast_checks) or '无'}；"
+        f"感知={json.dumps(perception or {}, ensure_ascii=False, sort_keys=True)}；"
         f"实际动作={'→'.join(tool_names[:8]) or '无'}；"
         f"阻塞={blocker or '无'}；结果={reason}；"
         f"策略={lesson}"
     )
     tags = ["strategy", "reasoning_trace", mode]
     if reason == "completed":
-        tags.append("successful")
+        tags.append("completed")
+        outcome = "pending"
     elif reason in {"circuit_open", "model_error", "internal_error"}:
         tags.append("failed")
+        outcome = "negative"
     else:
         tags.append("partial")
+        outcome = "unknown"
     return memory.add(
         content=content,
         scope=scope,
         kind="strategy",
-        status="supported" if reason == "completed" else "candidate",
+        status="candidate",
         tags=tuple(tags),
         source="reasoning_trace",
         evidence_kind="strategy_trace",
@@ -90,6 +99,9 @@ def record_reasoning_trace(
             "tool_sequence": tool_names,
             "operators": list(operators),
             "contrast_checks": list(contrast_checks),
+            "operator_checkpoints": list(operator_checkpoints),
+            "outcome": outcome,
+            "perception": perception or {},
         },
     )
 
@@ -104,8 +116,8 @@ REASONING_EXEMPLARS = (
         "同因重试不改变结果。"
     ),
     (
-        "复合目标先映射能力组合，例如读取已打开网页需要浏览器读取能力，"
-        "外部抓取才需要网络能力。"
+        "复合目标先明确缺少的证据，再比较当前可用能力能提供的证据类型；"
+        "不要把某个工具名当成唯一入口。"
     ),
     (
         "只读查证先给结论，不把命令、工具日志和内部推理混进最终回答。"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import random
 import tempfile
 import unittest
@@ -174,7 +175,7 @@ class ProactiveTests(unittest.TestCase):
             self.assertTrue(allowed)
             self.assertEqual(idle, 10.0)
             current[0] += timedelta(seconds=700)
-            self.assertFalse(scheduler.presence_gate()[0])
+            self.assertTrue(scheduler.presence_gate()[0])
             self.assertEqual(scheduler.defer(30), 30)
             self.assertAlmostEqual(scheduler.seconds_until_due(), 30)
             scheduler.close()
@@ -183,6 +184,186 @@ class ProactiveTests(unittest.TestCase):
             format_interval_demo(300, 2, count=4),
             "5 分钟 → 10 分钟 → 20 分钟 → 40 分钟",
         )
+
+    def test_interval_is_capped_and_shared_by_status_and_mark_sent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            local = timezone(timedelta(hours=8))
+            current = [datetime(2026, 1, 1, 9, 0, tzinfo=local)]
+            scheduler = ProactiveScheduler(
+                Path(temp) / "state.db",
+                ProactiveConfig(
+                    base_interval_sec=10,
+                    backoff_factor=2,
+                    max_interval_sec=60,
+                ),
+                "s_cap",
+                clock=lambda: current[0],
+            )
+
+            delays = []
+            for _ in range(5):
+                delays.append(scheduler.mark_sent())
+                current[0] += timedelta(seconds=delays[-1])
+
+            self.assertEqual(delays, [20, 40, 60, 60, 60])
+            signature = inspect.signature(scheduler._compute_delay)
+            self.assertEqual(list(signature.parameters), ["streak"])
+            scheduler.close()
+
+    def test_new_reset_daypart_starts_a_fresh_streak(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            local = timezone(timedelta(hours=8))
+            current = [datetime(2026, 1, 1, 11, 40, tzinfo=local)]
+            scheduler = ProactiveScheduler(
+                Path(temp) / "state.db",
+                ProactiveConfig(base_interval_sec=300),
+                "s_daypart",
+                clock=lambda: current[0],
+            )
+            scheduler.mark_sent()
+            current[0] += timedelta(minutes=5)
+            scheduler.mark_sent()
+            before = scheduler.status()
+            self.assertEqual(before.stored_unanswered_streak, 2)
+
+            current[0] = datetime(2026, 1, 1, 12, 5, tzinfo=local)
+            reset = scheduler.status()
+            self.assertTrue(reset.daypart_changed)
+            self.assertEqual(reset.unanswered_streak, 0)
+            self.assertEqual(reset.stored_unanswered_streak, 2)
+            self.assertEqual(reset.next_delay_sec, 300)
+            self.assertAlmostEqual(scheduler.seconds_until_due(), 0)
+
+            self.assertEqual(scheduler.mark_sent(), 600)
+            after = scheduler.status()
+            self.assertFalse(after.daypart_changed)
+            self.assertEqual(after.stored_unanswered_streak, 1)
+            scheduler.close()
+
+    def test_old_proactive_state_is_migrated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "state.db"
+            connection = sqlite3.connect(path)
+            connection.execute(
+                """
+                CREATE TABLE proactive_state (
+                    session_id TEXT PRIMARY KEY,
+                    paused INTEGER NOT NULL DEFAULT 0,
+                    next_due_at REAL NOT NULL,
+                    last_sent_at REAL,
+                    last_user_at REAL,
+                    unanswered_streak INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO proactive_state
+                (session_id, next_due_at, last_sent_at, unanswered_streak, updated_at)
+                VALUES ('old', 0, 0, 4, '2026-01-01T00:00:00+00:00')
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            scheduler = ProactiveScheduler(
+                path,
+                ProactiveConfig(),
+                "old",
+                clock=lambda: datetime(2026, 1, 1, 9, tzinfo=timezone.utc),
+            )
+            columns = {
+                row["name"]
+                for row in scheduler._connection.execute(
+                    "PRAGMA table_info(proactive_state)"
+                )
+            }
+            self.assertIn("last_daypart", columns)
+            self.assertEqual(scheduler.status().stored_unanswered_streak, 4)
+            scheduler.close()
+
+    def test_daypart_review_can_be_acknowledged_without_sending(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            local = timezone(timedelta(hours=8))
+            current = [datetime(2026, 1, 1, 11, 55, tzinfo=local)]
+            scheduler = ProactiveScheduler(
+                Path(temp) / "state.db",
+                ProactiveConfig(),
+                "s_review",
+                clock=lambda: current[0],
+            )
+            scheduler.mark_sent()
+            current[0] = datetime(2026, 1, 1, 12, 5, tzinfo=local)
+            self.assertTrue(scheduler.status().daypart_changed)
+            scheduler.acknowledge_daypart()
+            status = scheduler.status()
+            self.assertFalse(status.daypart_changed)
+            self.assertEqual(status.stored_unanswered_streak, 1)
+            scheduler.close()
+
+    def test_task_channel_does_not_move_social_streak_or_topic(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            local = timezone(timedelta(hours=8))
+            current = [datetime(2026, 1, 1, 9, 0, tzinfo=local)]
+            scheduler = ProactiveScheduler(
+                Path(temp) / "state.db",
+                ProactiveConfig(base_interval_sec=300),
+                "s_task_channel",
+                clock=lambda: current[0],
+            )
+            before = scheduler.status()
+            message_id = scheduler.record_message(
+                "日记已写入",
+                channel="task",
+                thought_id="th_diary",
+            )
+            self.assertTrue(message_id)
+            self.assertEqual(scheduler.mark_sent(channel="task"), 0)
+            after = scheduler.status()
+            self.assertEqual(after.stored_unanswered_streak, 0)
+            self.assertEqual(after.topic_index, before.topic_index)
+            self.assertEqual(after.next_due_at, before.next_due_at)
+            self.assertEqual(
+                scheduler.recent_message_texts(channel="social"),
+                [],
+            )
+            self.assertEqual(
+                scheduler.recent_message_texts(channel="task"),
+                ["日记已写入"],
+            )
+            scheduler.close()
+
+    def test_due_task_is_leased_and_can_be_retried_after_defer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            local = timezone(timedelta(hours=8))
+            current = [datetime(2026, 1, 1, 9, 0, tzinfo=local)]
+            scheduler = ProactiveScheduler(
+                Path(temp) / "state.db",
+                ProactiveConfig(),
+                "s_task_lease",
+                clock=lambda: current[0],
+            )
+            task = scheduler.create_task(
+                name="daily_diary",
+                instruction="写今天的日记",
+                target_path_template="diary.md",
+                cadence="once",
+                not_before="00:00",
+            )
+            self.assertTrue(scheduler.has_due_task())
+            claimed = scheduler.claim_due_task()
+            self.assertIsNotNone(claimed)
+            self.assertEqual(claimed.id, task.id)
+            self.assertFalse(scheduler.has_due_task())
+            self.assertIsNone(scheduler.claim_due_task())
+            scheduler.defer_task(task.id, 60)
+            current[0] += timedelta(seconds=61)
+            retried = scheduler.claim_due_task()
+            self.assertIsNotNone(retried)
+            self.assertEqual(retried.id, task.id)
+            scheduler.defer_task(task.id, 60)
+            scheduler.close()
 
     def test_schedule_persists_across_scheduler_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

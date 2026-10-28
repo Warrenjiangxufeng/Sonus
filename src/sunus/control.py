@@ -74,6 +74,9 @@ class TurnController:
         self.strategy_counts_at_recovery: dict[str, int] = {}
         self.blocked_tool_signatures: set[str] = set()
         self.blocked_tools: dict[str, str] = {}
+        self.failed_tool_signatures: set[str] = set()
+        self.failed_tool_labels: dict[str, str] = {}
+        self.recovery_blocked_signatures: set[str] = set()
         self.search_calls = 0
         self.search_checkpoint_sent = False
         self._warned: set[str] = set()
@@ -205,6 +208,23 @@ class TurnController:
                     self.total_tokens += max(0, int(value))
         self._emit_warnings()
 
+    def record_auxiliary_model_call(
+        self,
+        usage: dict[str, Any] | None,
+        *,
+        purpose: str,
+    ) -> None:
+        self.start()
+        self.model_calls += 1
+        self.record_usage(usage)
+        self._emit(
+            "auxiliary_model_call",
+            purpose=purpose,
+            model_calls=self.model_calls,
+            usage=usage or {},
+            summary=f"辅助模型调用: {purpose}",
+        )
+
     def ensure_within_budget(self) -> None:
         self._check_hard_limits(include_model=False)
 
@@ -239,6 +259,17 @@ class TurnController:
             reason = "运行控制拒绝了重复失败的动作；请改用不同参数或方案。"
             self._emit(
                 "repeat_tool_blocked",
+                name=name,
+                summary=reason,
+            )
+            return reason
+        if signature in self.recovery_blocked_signatures:
+            reason = (
+                "恢复阶段禁止原样重复已失败动作；请基于当前证据选择不同参数、"
+                "不同工具、不同证据源或无工具的回答方案。"
+            )
+            self._emit(
+                "recovery_tool_signature_blocked",
                 name=name,
                 summary=reason,
             )
@@ -305,6 +336,8 @@ class TurnController:
             f"{name}|{error_family}|{error_detail.lower()}"
         )
         tool_label = self._tool_label(name, arguments)
+        self.failed_tool_signatures.add(signature)
+        self.failed_tool_labels[signature] = tool_label
         record = self.errors.get(error_fingerprint)
         if record is None:
             record = _ErrorRecord(
@@ -361,6 +394,9 @@ class TurnController:
         self.strategy_counts_at_recovery.clear()
         self.blocked_tool_signatures.clear()
         self.blocked_tools.clear()
+        self.failed_tool_signatures.clear()
+        self.failed_tool_labels.clear()
+        self.recovery_blocked_signatures.clear()
         if had_failures:
             self._emit(
                 "failure_state_reset",
@@ -415,6 +451,7 @@ class TurnController:
         if self.recovery_count >= self.budget.max_recoveries:
             self._trip(f"恢复次数已达上限：{reason}")
         self.recovery_count += 1
+        self.recovery_blocked_signatures.update(self.failed_tool_signatures)
         for fingerprint, record in unrecovered_errors.items():
             self.error_counts_at_recovery[fingerprint] = record.count
         for strategy_key, record in unrecovered_strategies.items():
@@ -449,41 +486,43 @@ class TurnController:
             + "；".join(example[:160] for example in item.examples)
             for item in strategies
         ]
-        families = {item.family for item in errors}
-        guidance: list[str] = []
-        if "authorization" in families:
-            guidance.append(
-                "权限失败：调用 request_authorization，或一次性说明缺少的具体能力。"
-            )
-        if "path" in families:
-            guidance.append("路径失败：先列父目录或确认候选路径，再读取。")
-        if "timeout" in families:
-            guidance.append("超时：缩小范围或降低单次工作量，不要原样重试。")
-        if "model" in families:
-            guidance.append("模型失败：保留已有证据，收口或等待用户重试。")
-        if "verification" in families:
-            guidance.append("验证失败：读取首个真实错误，区分代码、环境和权限。")
-        if any(item.key == "runtime-compatibility" for item in strategies):
-            guidance.append(
-                "运行时或依赖不兼容：停止改参数、伪造版本或注入 shim；"
-                "改用兼容运行时，或明确请求安装。"
-            )
-        blocked = sorted(self.blocked_tools.values())[:6]
+        blocked = sorted(self.failed_tool_labels.values())[:8]
+        attempted = sorted(self.failed_tool_signatures)
         return (
-            "运行控制恢复检查点："
-            f"{reason}。停止重复已经失败的步骤，重新评估假设。\n"
+            "运行控制恢复契约："
+            f"{reason}。停止原样重复，重新判断目标和证据缺口。\n"
             "最近失败：\n"
             + ("\n".join(error_lines) or "- 无明确错误，但缺少新证据")
-            + "\n失败归因后的候选路径：\n"
-            + ("\n".join(f"- {item}" for item in guidance) or "- 无")
             + "\n重复失败策略：\n"
             + ("\n".join(strategy_lines) or "- 无")
             + "\n禁止重复的工具调用指纹：\n"
             + ("\n".join(f"- {value}" for value in blocked) or "- 无")
-            + "\n请给出一个新的、最小可验证动作，并明确成功判据。"
-            "如果缺少依赖、tokenizer 或工具，不要自行安装；"
-            "直接说明能力边界，并用现有证据给出部分结论或阻塞原因。"
+            + "\n本轮已失败动作的内部签名数量："
+            + str(len(attempted))
+            + "\n恢复要求：\n"
+            "- 由你结合用户目标、已确认证据、当前实际可用工具和记忆召回自行提出下一步；"
+            "不得机械套用固定工具替代表。\n"
+            "- 新动作必须与原失败动作签名不同，并说明它预期补上什么证据缺口。\n"
+            "- 可以换参数、换工具、换证据源、换抽象层级，或判断现有证据足以直接回答。\n"
+            "- 如果确实缺少能力，先判断是否有合法的替代路径；没有时直接提交部分或阻塞结果，"
+            "不要假装成功。\n"
+            "- 只执行一个信息增益最高、风险可接受的下一步；得到新证据后重新评估。"
         )
+
+    def recovery_query_terms(self) -> tuple[str, ...]:
+        terms = [
+            f"family:{record.family}"
+            for record in self.errors.values()
+        ]
+        terms.extend(
+            f"strategy:{record.label}"
+            for record in self.failure_strategies.values()
+        )
+        terms.extend(
+            f"failed_action:{record.tool_label}"
+            for record in self.errors.values()
+        )
+        return tuple(dict.fromkeys(terms))[:12]
 
     def _finalization_prompt(self, reason: str) -> str:
         remaining = min(
@@ -692,6 +731,14 @@ class TurnController:
             re.IGNORECASE,
         ):
             return "permission"
+        if error_code in {
+            "network_timeout",
+            "network_error",
+            "dns_error",
+            "tls_error",
+            "http_error",
+        }:
+            return error_code.replace("_", "-")
         if error_code == "browser_not_running":
             return "not-running"
         normalized = cls._normalize_error_line(value).lower()

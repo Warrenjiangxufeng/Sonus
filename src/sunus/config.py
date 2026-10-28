@@ -157,6 +157,7 @@ class LoopBudgetConfig:
 class ProactiveConfig:
     enabled: bool = True
     base_interval_sec: int = DEFAULT_PROACTIVE_BASE_INTERVAL_SEC
+    max_interval_sec: int = 21_600
     backoff_factor: int = 2
     recent_memory_window_hours: int = 168
     recent_memory_limit: int = 32
@@ -168,6 +169,11 @@ class ProactiveConfig:
     custom_topics: tuple[str, ...] = ()
     min_idle_sec: int = 8
     max_idle_sec: int = 600
+    thought_min_score: float = 0.5
+    thought_max_open: int = 24
+    thought_cooldown_sec: int = 900
+    thought_no_response_sec: int = 21_600
+    thought_review_interval_sec: int = 3_600
     typing_chars_per_second: int = 28
     bubble_seconds: int = 15
     action_mode: str = "safe_auto"
@@ -196,6 +202,7 @@ class PersonaConfig:
         ("risk", 0.3),
     )
     conversation_max_chars: int = 260
+    stage_directions: bool = False
     learn_from_self_share: bool = False
 
 
@@ -275,11 +282,13 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
             "risk": 0.3,
         },
         "conversation_max_chars": 260,
+        "stage_directions": False,
         "learn_from_self_share": False,
     },
     "proactive": {
         "enabled": True,
         "base_interval_sec": DEFAULT_PROACTIVE_BASE_INTERVAL_SEC,
+        "max_interval_sec": 21_600,
         "backoff_factor": 2,
         "recent_memory_window_hours": 168,
         "recent_memory_limit": 32,
@@ -291,6 +300,11 @@ DEFAULT_USER_CONFIG: dict[str, Any] = {
         "custom_topics": [],
         "min_idle_sec": 8,
         "max_idle_sec": 600,
+        "thought_min_score": 0.5,
+        "thought_max_open": 24,
+        "thought_cooldown_sec": 900,
+        "thought_no_response_sec": 21_600,
+        "thought_review_interval_sec": 3_600,
         "typing_chars_per_second": 28,
         "bubble_seconds": 15,
         "action_mode": "safe_auto",
@@ -577,21 +591,27 @@ def resolve_config(
     else:
         raise ConfigError("proactive.custom_topics 必须是字符串数组")
 
+    base_interval_sec = max(
+        1,
+        int(
+            proactive_payload.get(
+                "base_interval_sec",
+                DEFAULT_PROACTIVE_BASE_INTERVAL_SEC,
+            )
+        ),
+    )
+    max_interval_sec = max(
+        base_interval_sec,
+        int(proactive_payload.get("max_interval_sec", 21_600)),
+    )
     proactive = ProactiveConfig(
         enabled=(
             bool(proactive_payload.get("enabled", True))
             if proactive_enabled is None
             else proactive_enabled
         ),
-        base_interval_sec=max(
-            1,
-            int(
-                proactive_payload.get(
-                    "base_interval_sec",
-                    DEFAULT_PROACTIVE_BASE_INTERVAL_SEC,
-                )
-            ),
-        ),
+        base_interval_sec=base_interval_sec,
+        max_interval_sec=max_interval_sec,
         backoff_factor=max(2, int(proactive_payload.get("backoff_factor", 2))),
         recent_memory_window_hours=max(
             1, int(proactive_payload.get("recent_memory_window_hours", 168))
@@ -617,6 +637,31 @@ def resolve_config(
         max_idle_sec=max(
             max(0, int(proactive_payload.get("min_idle_sec", 8))),
             int(proactive_payload.get("max_idle_sec", 600)),
+        ),
+        thought_min_score=min(
+            1.0,
+            max(0.0, float(proactive_payload.get("thought_min_score", 0.5))),
+        ),
+        thought_max_open=max(
+            1,
+            int(proactive_payload.get("thought_max_open", 24)),
+        ),
+        thought_cooldown_sec=max(
+            30,
+            int(proactive_payload.get("thought_cooldown_sec", 900)),
+        ),
+        thought_no_response_sec=max(
+            60,
+            int(proactive_payload.get("thought_no_response_sec", 21_600)),
+        ),
+        thought_review_interval_sec=max(
+            60,
+            int(
+                proactive_payload.get(
+                    "thought_review_interval_sec",
+                    3_600,
+                )
+            ),
         ),
         typing_chars_per_second=max(
             1,
@@ -715,6 +760,9 @@ def resolve_config(
     )
     if not isinstance(raw_learn_from_self_share, bool):
         raise ConfigError("persona.learn_from_self_share 必须是布尔值")
+    raw_stage_directions = persona_payload.get("stage_directions", False)
+    if not isinstance(raw_stage_directions, bool):
+        raise ConfigError("persona.stage_directions 必须是布尔值")
     try:
         conversation_max_chars = int(
             persona_payload.get("conversation_max_chars", 260)
@@ -777,6 +825,7 @@ def resolve_config(
         style=tuple(style_values),
         context_intensity=tuple(context_intensity),
         conversation_max_chars=conversation_max_chars,
+        stage_directions=raw_stage_directions,
         learn_from_self_share=raw_learn_from_self_share,
     )
     runtime_payload = user.get("runtime", {})
@@ -1115,6 +1164,7 @@ def config_summary(config: RuntimeConfig) -> dict[str, Any]:
             "style": dict(config.persona.style),
             "context_intensity": dict(config.persona.context_intensity),
             "conversation_max_chars": config.persona.conversation_max_chars,
+            "stage_directions": config.persona.stage_directions,
             "learn_from_self_share": config.persona.learn_from_self_share,
         },
         "budget": {
@@ -1133,6 +1183,7 @@ def config_summary(config: RuntimeConfig) -> dict[str, Any]:
         "proactive": {
             "enabled": config.proactive.enabled,
             "base_interval_sec": config.proactive.base_interval_sec,
+            "max_interval_sec": config.proactive.max_interval_sec,
             "backoff_factor": config.proactive.backoff_factor,
             "recent_memory_window_hours": config.proactive.recent_memory_window_hours,
             "recent_memory_limit": config.proactive.recent_memory_limit,
@@ -1145,6 +1196,13 @@ def config_summary(config: RuntimeConfig) -> dict[str, Any]:
             "custom_topics": list(config.proactive.custom_topics),
             "min_idle_sec": config.proactive.min_idle_sec,
             "max_idle_sec": config.proactive.max_idle_sec,
+            "thought_min_score": config.proactive.thought_min_score,
+            "thought_max_open": config.proactive.thought_max_open,
+            "thought_cooldown_sec": config.proactive.thought_cooldown_sec,
+            "thought_no_response_sec": config.proactive.thought_no_response_sec,
+            "thought_review_interval_sec": (
+                config.proactive.thought_review_interval_sec
+            ),
             "typing_chars_per_second": (
                 config.proactive.typing_chars_per_second
             ),

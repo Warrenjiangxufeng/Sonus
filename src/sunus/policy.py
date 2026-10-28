@@ -519,9 +519,9 @@ def command_denial_reason(command: str) -> str:
 
 
 _APPROVAL_OPTIONS = (
-    "允许本次",
-    "本会话全部允许",
-    "拒绝",
+    "允许本次（↑/↓ 选择 · Enter / y）",
+    "本会话全部允许（↑/↓ 选择 · 2 / a）",
+    "拒绝（↑/↓ 选择 · 3 / x / Esc）",
 )
 _APPROVAL_SELECTED = "\x1b[1;7;36m"
 _APPROVAL_DIM = "\x1b[2m"
@@ -610,7 +610,7 @@ def _render_approval_options(
         else color_enabled
     )
     if not first:
-        sys.stdout.write(f"\x1b[{len(_APPROVAL_OPTIONS) + 1}A")
+        sys.stdout.write(f"\x1b[{len(_APPROVAL_OPTIONS)}A")
     for index, label in enumerate(_APPROVAL_OPTIONS):
         line = _approval_option_line(
             index,
@@ -619,16 +619,26 @@ def _render_approval_options(
             color_enabled=enabled,
         )
         sys.stdout.write(f"\r\x1b[2K{line}\n")
-    hint = "  ↑/↓ 选择 · Enter 确认 · y 允许 · x 拒绝"
-    if enabled:
-        hint = f"{_APPROVAL_DIM}{hint}{_APPROVAL_RESET}"
-    sys.stdout.write(f"\r\x1b[2K{hint}\n")
+    sys.stdout.flush()
+
+
+def _clear_approval_options() -> None:
+    count = len(_APPROVAL_OPTIONS)
+    sys.stdout.write(f"\x1b[{count}A")
+    for index in range(count):
+        sys.stdout.write("\r\x1b[2K")
+        if index < count - 1:
+            sys.stdout.write("\x1b[1B")
+    if count > 1:
+        sys.stdout.write(f"\x1b[{count - 1}A")
+    sys.stdout.write("\r")
     sys.stdout.flush()
 
 
 def _choose_approval_option(*, key_reader=None) -> int:
     selected = 0
     first = True
+    rendered = False
     read_key = key_reader or _read_choice_key
     while True:
         if key_reader is None and not sys.stdin.isatty():
@@ -637,18 +647,31 @@ def _choose_approval_option(*, key_reader=None) -> int:
         else:
             _render_approval_options(selected, first=first)
             first = False
-            key = read_key()
+            rendered = True
+            try:
+                key = read_key()
+            except (EOFError, KeyboardInterrupt):
+                _clear_approval_options()
+                raise
         if key == "UP":
             selected = (selected - 1) % len(_APPROVAL_OPTIONS)
         elif key == "DOWN":
             selected = (selected + 1) % len(_APPROVAL_OPTIONS)
         elif key == "ENTER":
+            if rendered:
+                _clear_approval_options()
             return selected
         elif key in {"1", "y"}:
+            if rendered:
+                _clear_approval_options()
             return 0
         elif key in {"2", "a"}:
+            if rendered:
+                _clear_approval_options()
             return 1
         elif key in {"3", "x", "n", "ESC", "EOF"}:
+            if rendered:
+                _clear_approval_options()
             return 2
 
 

@@ -183,11 +183,13 @@ def is_casual_conversation(
     text: str,
     *,
     previous_assistant: str = "",
+    relationship_configured: bool = False,
 ) -> bool:
     """Return whether a turn may be social chat rather than project work."""
     return conversation_hint(
         text,
         previous_assistant=previous_assistant,
+        relationship_configured=relationship_configured,
     ) in {"casual", "ambiguous"}
 
 
@@ -195,6 +197,7 @@ def conversation_hint(
     text: str,
     *,
     previous_assistant: str = "",
+    relationship_configured: bool = False,
 ) -> str:
     """Classify unambiguous turns and mark short follow-ups for model review."""
     stripped = text.strip()
@@ -209,6 +212,8 @@ def conversation_hint(
         return "task"
     if scope.allows_mutation or scope.allows_commands or scope.allows_network:
         return "task"
+    if relationship_configured and len(stripped) <= 80:
+        return "casual"
     if _RELATIONAL_PATTERN.search(stripped):
         return "casual"
     if _CASUAL_PATTERN.search(stripped):

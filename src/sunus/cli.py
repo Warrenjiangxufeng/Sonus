@@ -11,6 +11,7 @@ import sqlite3
 import sys
 import termios
 import threading
+import time
 import tty
 import unicodedata
 import uuid
@@ -273,7 +274,7 @@ class TerminalInputDock:
     def _erase(self) -> None:
         if not self.is_tty or self._rendered_rows <= 0:
             return
-        up = self._rendered_rows - 1 - self._cursor_row
+        up = self._cursor_row
         self.stream.write("\r")
         if up:
             self.stream.write(f"\x1b[{up}A")
@@ -349,52 +350,171 @@ class RuntimeEventRenderer:
         color_enabled: bool | None = None,
         is_tty: bool | None = None,
         activity_stream: TextIO | None = None,
+        completion_stream: TextIO | None = None,
         input_dock: TerminalInputDock | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.color_enabled = (
             sys.stdout.isatty() if color_enabled is None else color_enabled
         )
         self.is_tty = sys.stdout.isatty() if is_tty is None else is_tty
         self.activity_stream = activity_stream or sys.stderr
+        self.completion_stream = completion_stream or self.activity_stream
         self.input_dock = input_dock
+        self.clock = clock or time.monotonic
+        self._activity_lock = threading.RLock()
+        self._chain_lines: list[tuple[str, str]] = []
+        self._thinking_active = False
+        self._thinking_started_at: float | None = None
+        self._thinking_timer_stop = threading.Event()
+        self._thinking_timer: threading.Thread | None = None
+        self._thinking_generation = 0
+        self._pending_finish: tuple[str, str] | None = None
         self._line_active = False
         self._analysis_count = 0
         self._tool_counts: dict[str, int] = {}
         self.streamed_text = ""
         self._turn_active = False
+        self._conversation_mode = False
 
-    def _status(self, text: str, code: str = "") -> None:
+    def _elapsed_seconds(self) -> float:
+        if self._thinking_started_at is None:
+            return 0.0
+        return max(0.0, self.clock() - self._thinking_started_at)
+
+    @staticmethod
+    def _format_elapsed(seconds: float) -> str:
+        total = max(0, int(seconds))
+        if total < 60:
+            return f"{total}秒"
+        minutes, remainder = divmod(total, 60)
+        if minutes < 60:
+            return f"{minutes}分{remainder:02d}秒"
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}小时{minutes:02d}分"
+
+    def _thinking_line(self) -> str:
+        return (
+            "  ◇ 思考中… · "
+            f"{self._format_elapsed(self._elapsed_seconds())}"
+            "（Tab/Esc 打断）"
+        )
+
+    def _render_chain(self) -> list[str]:
+        lines = [
+            color(text, code, self.color_enabled)
+            for text, code in self._chain_lines
+        ]
+        if self._thinking_active:
+            lines.append(color(self._thinking_line(), DIM, self.color_enabled))
+        return lines
+
+    def _refresh_activity(self) -> None:
         if self.input_dock is not None:
-            self.input_dock.set_activity(
-                color(text.strip(), code, self.color_enabled)
-            )
-            self._line_active = True
+            self.input_dock.set_activity("\n".join(self._render_chain()))
+            self._line_active = bool(self._chain_lines or self._thinking_active)
             return
         if not self.is_tty:
             return
-        self.activity_stream.write(
-            "\r\x1b[2K" + color(text, code, self.color_enabled)
-        )
-        self.activity_stream.flush()
-        self._line_active = True
+        if self._thinking_active:
+            self.activity_stream.write(
+                "\r\x1b[2K"
+                + color(self._thinking_line(), DIM, self.color_enabled)
+            )
+            self.activity_stream.flush()
+            self._line_active = True
 
-    def _finish(self, text: str, code: str = "") -> None:
-        if self.input_dock is not None:
-            self.input_dock.set_activity(
-                color(text.strip(), code, self.color_enabled)
+    def _append_chain(self, text: str, code: str = "") -> None:
+        clean = text.strip()
+        if not clean:
+            return
+        with self._activity_lock:
+            self._chain_lines.append((clean, code))
+            if self.input_dock is not None:
+                self._refresh_activity()
+                return
+            if not self.is_tty:
+                return
+            if self._line_active:
+                self.activity_stream.write("\r\x1b[2K")
+            print(
+                color(clean, code, self.color_enabled),
+                file=self.activity_stream,
+                flush=True,
             )
             self._line_active = False
-            return
-        if not self.is_tty:
-            return
-        if self._line_active:
-            self.activity_stream.write("\r\x1b[2K")
-        print(
-            color(text, code, self.color_enabled),
-            file=self.activity_stream,
-            flush=True,
-        )
-        self._line_active = False
+            self._refresh_activity()
+
+    def _status(self, text: str, code: str = "") -> None:
+        self._append_chain(text, code)
+
+    def _start_thinking(self) -> None:
+        with self._activity_lock:
+            if self._thinking_active:
+                return
+            self._thinking_active = True
+            self._thinking_started_at = self.clock()
+            self._thinking_timer_stop.set()
+            self._thinking_generation += 1
+            generation = self._thinking_generation
+            stop_event = threading.Event()
+            self._thinking_timer_stop = stop_event
+            self._thinking_timer = threading.Thread(
+                target=self._thinking_timer_loop,
+                args=(stop_event, generation),
+                name="sunus-working-timer",
+                daemon=True,
+            )
+            self._thinking_timer.start()
+            self._refresh_activity()
+
+    def _stop_thinking(self) -> None:
+        self._thinking_timer_stop.set()
+        self._thinking_active = False
+
+    def _thinking_timer_loop(
+        self,
+        stop_event: threading.Event,
+        generation: int,
+    ) -> None:
+        while not stop_event.wait(1.0):
+            with self._activity_lock:
+                if (
+                    not self._thinking_active
+                    or generation != self._thinking_generation
+                ):
+                    return
+                self._refresh_activity()
+
+    def _queue_finish(self, text: str, code: str = "") -> None:
+        with self._activity_lock:
+            self._stop_thinking()
+            self._pending_finish = (text.strip(), code)
+
+    def commit_turn(self) -> None:
+        """Print the completed activity chain before the final response."""
+        with self._activity_lock:
+            pending = self._pending_finish
+            self._pending_finish = None
+            if self.input_dock is not None:
+                self.input_dock.clear()
+            elif self.is_tty and self._line_active:
+                self.activity_stream.write("\r\x1b[2K")
+                self.activity_stream.flush()
+            self._line_active = False
+            if pending is not None and self.is_tty:
+                self._chain_lines.append(pending)
+                print(
+                    "\n".join(self._render_chain()),
+                    file=self.completion_stream,
+                    flush=True,
+                )
+            self._chain_lines.clear()
+            self.streamed_text = ""
+            self._analysis_count = 0
+            self._tool_counts.clear()
+            self._turn_active = False
+            self._conversation_mode = False
 
     def _summary(self) -> str:
         total_tools = sum(self._tool_counts.values())
@@ -415,12 +535,46 @@ class RuntimeEventRenderer:
         event_type = str(event.get("type") or "")
         if event_type.startswith("task_grant") or event_type.startswith("proactive_"):
             return
+        if event_type == "turn_started":
+            with self._activity_lock:
+                self._thinking_timer_stop.set()
+                self._thinking_active = False
+                self._pending_finish = None
+                self._chain_lines.clear()
+                self._analysis_count = 0
+                self._tool_counts.clear()
+                self.streamed_text = ""
+                self._turn_active = True
+                self._conversation_mode = False
+            self._start_thinking()
+            return
+        if event_type == "response_mode":
+            self._conversation_mode = (
+                str(event.get("mode") or "") == "conversation"
+            )
+            if self._conversation_mode:
+                with self._activity_lock:
+                    self._stop_thinking()
+                    self._chain_lines.clear()
+                    if self.input_dock is not None:
+                        self.input_dock.set_activity("")
+                    elif self.is_tty and self._line_active:
+                        self.activity_stream.write("\r\x1b[2K")
+                        self.activity_stream.flush()
+                    self._line_active = False
+            return
         if event_type == "model_request":
             if not self._turn_active:
                 self.streamed_text = ""
                 self._turn_active = True
+                with self._activity_lock:
+                    self._thinking_timer_stop.set()
+                    self._thinking_active = False
+                    self._chain_lines.clear()
             self._analysis_count += 1
-            self._status("  ◇ 思考中…（Tab/Esc 打断）", DIM)
+            if self._conversation_mode:
+                return
+            self._start_thinking()
             return
         if event_type == "assistant_delta":
             text = str(event.get("text") or "")
@@ -473,7 +627,17 @@ class RuntimeEventRenderer:
         if event_type == "turn_end":
             reason = str(event.get("reason") or "completed")
             if reason == "completed":
-                self._finish(self._summary(), GREEN)
+                if self._conversation_mode:
+                    with self._activity_lock:
+                        self._chain_lines.clear()
+                    if self.input_dock is not None:
+                        self.input_dock.clear()
+                    elif self.is_tty and self._line_active:
+                        self.activity_stream.write("\r\x1b[2K")
+                        self.activity_stream.flush()
+                    self._line_active = False
+                else:
+                    self._queue_finish(self._summary(), GREEN)
             else:
                 labels = {
                     "max_steps": "达到工具步数上限",
@@ -487,14 +651,11 @@ class RuntimeEventRenderer:
                     "blocked": "任务阻塞",
                 }
                 total_tools = sum(self._tool_counts.values())
-                self._finish(
+                self._queue_finish(
                     f"  ⚠ {labels.get(reason, reason)} · "
                     f"{self._analysis_count} 次分析 · {total_tools} 个动作",
                     YELLOW,
                 )
-            self._analysis_count = 0
-            self._tool_counts.clear()
-            self._turn_active = False
             return
         if event_type.endswith("_error"):
             summary = str(event.get("summary") or event_type)
@@ -509,7 +670,7 @@ class ThinkingStateObserver:
         event_type = str(payload.get("type") or "")
         if event_type.startswith("task_grant") or event_type.startswith("proactive_"):
             return
-        if event_type == "model_request":
+        if event_type in {"turn_started", "model_request"}:
             self.event.set()
         else:
             self.event.clear()
@@ -641,6 +802,8 @@ def persona_config_command(
         updates["conversation_max_chars"] = (
             args.persona_conversation_max_chars
         )
+    if args.persona_stage_directions is not None:
+        updates["stage_directions"] = args.persona_stage_directions
     if examples or args.clear_examples:
         updates["examples"] = examples
     styles = _persona_metric_updates(
@@ -871,6 +1034,7 @@ def build_components(
             config=config.proactive,
             persona=config.persona,
             action_catalog=action_catalog,
+            thoughts=scheduler.thoughts,
         )
         agent = Agent(
             config=config,
@@ -1106,6 +1270,21 @@ def _proactive_message_announces_action(text: str, tool_name: str) -> bool:
 
 def _proactive_status_payload(scheduler: ProactiveScheduler) -> dict[str, Any]:
     payload = dict(scheduler.status().__dict__)
+    payload["thoughts"] = scheduler.thoughts.stats()
+    payload["recent_thoughts"] = [
+        {
+            "id": thought.id,
+            "question": thought.question[:160],
+            "status": thought.status,
+            "action_hint": thought.action_hint,
+            "prediction": thought.prediction[:160],
+            "importance": round(thought.importance, 3),
+            "attempts": thought.attempts,
+            "last_outcome": thought.last_outcome,
+            "prediction_match": thought.prediction_match,
+        }
+        for thought in scheduler.thoughts.recent_thoughts(limit=10)
+    ]
     payload["tasks"] = [
         {
             "id": task.id,
@@ -1158,15 +1337,74 @@ def _execute_proactive_action_with_task(
     return False
 
 
-def due_message(components: Components) -> None:
+def due_message(components: Components) -> bool:
     if (
         not components.config.proactive.enabled
         or components.proactive is None
     ):
-        return
+        return False
+    initial_status = components.scheduler.status()
+    if initial_status.paused:
+        return False
+    tty = sys.stdout.isatty()
+
+    pending_task = components.scheduler.claim_due_task()
+    if pending_task is not None:
+        try:
+            text, meta = components.proactive.generate(
+                components.scheduler.recent_message_texts(5),
+                sequence_index=components.scheduler.current_topic_index(),
+                presence=None,
+                pending_task=pending_task,
+            )
+            if not _execute_proactive_action_with_task(
+                components,
+                text,
+                meta,
+            ):
+                raise RuntimeError("主动待办动作未完成")
+            message_id = components.scheduler.record_message(
+                text,
+                channel="task",
+            )
+            memory_id = _remember_proactive_delivery(
+                components,
+                text,
+                meta,
+                message_id=message_id,
+                trigger="scheduled_task",
+            )
+            components.scheduler.mark_sent(channel="task")
+            components.events.emit(
+                "proactive_task_delivered",
+                message_id=message_id,
+                memory_id=memory_id,
+                task_id=pending_task.id,
+                social_streak=(
+                    components.scheduler.status().stored_unanswered_streak
+                ),
+                summary=f"独立主动待办已送达 · {pending_task.name}",
+            )
+            print(color("Sunus 主动待办", GREEN, tty) + "\n" + text + "\n")
+            return True
+        except Exception as error:
+            components.scheduler.defer_task(
+                pending_task.id,
+                max(60, components.config.proactive.thought_cooldown_sec),
+            )
+            components.events.emit(
+                "proactive_task_failed",
+                task_id=pending_task.id,
+                summary=f"主动待办失败，未修改社交节奏: {error}",
+            )
+            return False
+
     status = components.scheduler.status()
-    if status.paused or components.scheduler.seconds_until_due() > 0:
-        return
+    components.proactive.refresh_thoughts(
+        daypart_changed=status.daypart_changed,
+    )
+    if components.scheduler.seconds_until_due() > 0:
+        return False
     allowed, idle_seconds = components.scheduler.presence_gate()
     if not allowed:
         delay = components.scheduler.defer(30)
@@ -1174,17 +1412,64 @@ def due_message(components: Components) -> None:
             "proactive_presence_deferred",
             delay_sec=delay,
             idle_seconds=idle_seconds,
-            summary="主动发言时机不合适，已延后",
+            summary="刚发生明确交互，暂不打断",
         )
-        return
-    tty = sys.stdout.isatty()
+        return False
+    thought_decision = (
+        components.proactive.think(
+            daypart_changed=status.daypart_changed,
+        )
+        if components.scheduler.thoughts is not None
+        else None
+    )
+    if thought_decision is not None and thought_decision.action != "message":
+        thought = thought_decision.thought
+        if thought is not None:
+            if thought_decision.action in {"review", "maintenance"}:
+                components.scheduler.thoughts.resolve(
+                    thought.id,
+                    thought_decision.action,
+                )
+                components.scheduler.acknowledge_daypart()
+            else:
+                components.scheduler.thoughts.defer(
+                    thought.id,
+                    thought_decision.wait_seconds,
+                    thought_decision.reason,
+                )
+        delay = components.scheduler.defer(
+            max(60, thought_decision.wait_seconds)
+        )
+        components.events.emit(
+            "proactive_thought_deferred",
+            thought_id=thought.id if thought is not None else "",
+            action=thought_decision.action,
+            score=thought_decision.score,
+            delay_sec=delay,
+            reason=thought_decision.reason,
+            summary="主动思考选择暂不发言",
+        )
+        return False
+    thought = thought_decision.thought if thought_decision is not None else None
     try:
-        pending_task = components.scheduler.due_task()
+        long_absence = bool(
+            idle_seconds is not None
+            and idle_seconds > components.config.proactive.max_idle_sec
+        )
         text, meta = components.proactive.generate(
             components.scheduler.recent_message_texts(5),
             sequence_index=components.scheduler.current_topic_index(),
-            presence=PresenceContext(idle_seconds=idle_seconds),
-            pending_task=pending_task,
+            presence=PresenceContext(
+                idle_seconds=idle_seconds,
+                long_absence=long_absence,
+                daypart=components.scheduler.status().daypart,
+            ),
+            thought=thought,
+            thought_score=(
+                thought_decision.score
+                if thought_decision is not None
+                else 0.0
+            ),
         )
         if not _execute_proactive_action_with_task(
             components,
@@ -1192,7 +1477,11 @@ def due_message(components: Components) -> None:
             meta,
         ):
             raise RuntimeError("主动待办动作未完成")
-        message_id = components.scheduler.record_message(text)
+        message_id = components.scheduler.record_message(
+            text,
+            channel="social",
+            thought_id=thought.id if thought is not None else "",
+        )
         memory_id = _remember_proactive_delivery(
             components,
             text,
@@ -1200,7 +1489,9 @@ def due_message(components: Components) -> None:
             message_id=message_id,
             trigger="scheduled",
         )
-        delay = components.scheduler.mark_sent()
+        delay = components.scheduler.mark_sent(channel="social")
+        if thought is not None:
+            components.scheduler.thoughts.record_delivery(thought.id)
         components.events.emit(
             "proactive_message_delivered",
             message_id=message_id,
@@ -1209,11 +1500,30 @@ def due_message(components: Components) -> None:
             topic=meta.get("topic"),
             topic_weight=meta.get("topic_weight"),
             generation_mode=meta.get("generation_mode"),
+            thought_id=thought.id if thought is not None else "",
+            thought_score=(
+                thought_decision.score
+                if thought_decision is not None
+                else 0.0
+            ),
             summary=f"主动消息已送达 · {meta.get('topic_label', '主动陪伴')}",
         )
-        print("\n" + color("Sunus 主动消息", GREEN, tty) + "\n" + text + "\n")
+        print(color("Sunus 主动消息", GREEN, tty) + "\n" + text + "\n")
+        return True
     except Exception as error:
         components.scheduler.mark_failed()
+        if thought is not None and components.scheduler.thoughts is not None:
+            components.scheduler.thoughts.defer(
+                thought.id,
+                components.config.proactive.thought_cooldown_sec,
+                "generation_failed",
+            )
+        components.events.emit(
+            "proactive_message_failed",
+            thought_id=thought.id if thought is not None else "",
+            summary=f"主动消息生成失败: {error}",
+        )
+        return False
         components.events.emit(
             "proactive_message_failed",
             summary=f"主动消息失败: {error}",
@@ -1234,36 +1544,6 @@ def _display_width(text: str) -> int:
     return width
 
 
-def _visible_input_window(
-    text: str,
-    cursor: int,
-    available_width: int,
-) -> tuple[str, int]:
-    flat = text.replace("\r", "").replace("\n", "↵")
-    cursor = max(0, min(cursor, len(flat)))
-    room = max(8, available_width - 2)
-    start = cursor
-    used = 0
-    while start > 0:
-        width = _display_width(flat[start - 1])
-        if used + width > room // 2:
-            break
-        start -= 1
-        used += width
-    end = cursor
-    while end < len(flat):
-        width = _display_width(flat[end])
-        if used + width > room:
-            break
-        end += 1
-        used += width
-    prefix = "…" if start > 0 else ""
-    suffix = "…" if end < len(flat) else ""
-    visible = prefix + flat[start:end] + suffix
-    cursor_column = _display_width(prefix + flat[start:cursor])
-    return visible, cursor_column
-
-
 def _read_escape_sequence(descriptor: int) -> bytes:
     sequence = bytearray(b"\x1b")
     while len(sequence) < 16 and select.select([descriptor], [], [], 0.03)[0]:
@@ -1277,7 +1557,7 @@ def _input_with_initial(
     prompt: str,
     initial: str,
     *,
-    on_idle: Callable[[], bool] | None = None,
+    on_idle: Callable[[Callable[[], None]], bool] | None = None,
 ) -> str:
     if not sys.stdin.isatty():
         return initial + input(prompt)
@@ -1286,19 +1566,52 @@ def _input_with_initial(
     buffer = initial
     cursor = len(buffer)
     decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
+    rendered_rows = 0
+    rendered_cursor_row = 0
+
+    def erase_rendered() -> None:
+        nonlocal rendered_rows, rendered_cursor_row
+        if rendered_rows <= 0:
+            return
+        up = rendered_cursor_row
+        sys.stdout.write("\r")
+        if up:
+            sys.stdout.write(f"\x1b[{up}A")
+        for index in range(rendered_rows):
+            sys.stdout.write("\x1b[2K")
+            if index < rendered_rows - 1:
+                sys.stdout.write("\n")
+        if rendered_rows > 1:
+            sys.stdout.write(f"\x1b[{rendered_rows - 1}A")
+        sys.stdout.write("\r")
+        sys.stdout.flush()
+        rendered_rows = 0
+        rendered_cursor_row = 0
 
     def redraw() -> None:
+        nonlocal rendered_rows, rendered_cursor_row
+        erase_rendered()
         terminal_width = shutil.get_terminal_size((80, 24)).columns
-        visible, cursor_column = _visible_input_window(
+        lines, cursor_row, cursor_column = _wrap_input_lines(
+            prompt,
             buffer,
             cursor,
-            terminal_width - _display_width(prompt),
+            terminal_width,
         )
-        sys.stdout.write("\r\x1b[2K" + prompt + visible)
-        trailing = _display_width(visible) - cursor_column
-        if trailing > 0:
-            sys.stdout.write(f"\x1b[{trailing}D")
+        for index, line in enumerate(lines):
+            if index:
+                sys.stdout.write("\n")
+            sys.stdout.write(f"\x1b[2K{line}")
+        total_rows = len(lines)
+        up = total_rows - 1 - cursor_row
+        sys.stdout.write("\r")
+        if up:
+            sys.stdout.write(f"\x1b[{up}A")
+        if cursor_column:
+            sys.stdout.write(f"\x1b[{cursor_column}C")
         sys.stdout.flush()
+        rendered_rows = total_rows
+        rendered_cursor_row = cursor_row
 
     def delete_word() -> None:
         nonlocal buffer, cursor
@@ -1329,8 +1642,9 @@ def _input_with_initial(
         in_paste = False
         while True:
             if not select.select([descriptor], [], [], 0.25)[0]:
-                if on_idle is not None and on_idle():
-                    redraw()
+                if on_idle is not None:
+                    if on_idle(erase_rendered):
+                        redraw()
                 continue
             raw = os.read(descriptor, 1)
             if raw == b"":
@@ -1480,15 +1794,27 @@ def read_with_proactive(
         except EOFError:
             return None
     _enable_utf8_input(sys.stdin.fileno())
+    last_proactive_check = 0.0
 
-    def on_idle() -> bool:
+    def on_idle(clear_input: Callable[[], None]) -> bool:
+        nonlocal last_proactive_check
+        now = time.monotonic()
+        if now - last_proactive_check < 1.0:
+            return False
+        last_proactive_check = now
         if (
             components.proactive is None
             or not components.config.proactive.enabled
             or components.scheduler.status().paused
-            or components.scheduler.seconds_until_due() > 0
         ):
             return False
+        due = bool(
+            components.scheduler.seconds_until_due() <= 0
+            or components.scheduler.has_due_task()
+        )
+        if not due:
+            return False
+        clear_input()
         due_message(components)
         return True
 
@@ -1696,13 +2022,60 @@ def handle_slash(command: str, components: Components) -> bool:
             if components.proactive is None:
                 print("模型未初始化。")
             else:
+                pending_task = components.scheduler.claim_due_task()
+                thought_decision = (
+                    components.proactive.think(
+                        daypart_changed=(
+                            components.scheduler.status().daypart_changed
+                        )
+                    )
+                    if pending_task is None
+                    else None
+                )
+                if (
+                    pending_task is None
+                    and thought_decision is not None
+                    and thought_decision.action != "message"
+                ):
+                    if thought_decision.thought is not None:
+                        if thought_decision.action in {"review", "maintenance"}:
+                            components.scheduler.thoughts.resolve(
+                                thought_decision.thought.id,
+                                thought_decision.action,
+                            )
+                            components.scheduler.acknowledge_daypart()
+                        else:
+                            components.scheduler.thoughts.defer(
+                                thought_decision.thought.id,
+                                thought_decision.wait_seconds,
+                                thought_decision.reason,
+                            )
+                    print(
+                        f"本轮主动思考选择 {thought_decision.action}，"
+                        f"暂不发言：{thought_decision.reason}"
+                    )
+                    return True
+                thought = (
+                    thought_decision.thought
+                    if thought_decision is not None
+                    else None
+                )
                 try:
                     text, meta = components.proactive.generate(
                         sequence_index=components.scheduler.current_topic_index(),
-                        pending_task=components.scheduler.due_task(),
+                        pending_task=pending_task,
+                        thought=thought,
+                        thought_score=(
+                            thought_decision.score
+                            if thought_decision is not None
+                            else 0.0
+                        ),
                     )
                 except Exception as error:
-                    components.scheduler.mark_failed()
+                    if pending_task is not None:
+                        components.scheduler.defer_task(pending_task.id, 60)
+                    else:
+                        components.scheduler.mark_failed()
                     components.events.emit(
                         "proactive_message_failed",
                         trigger="slash_trigger",
@@ -1717,7 +2090,12 @@ def handle_slash(command: str, components: Components) -> bool:
                 ):
                     print("主动待办动作未完成，本次未发送。")
                     return True
-                message_id = components.scheduler.record_message(text)
+                channel = "task" if pending_task is not None else "social"
+                message_id = components.scheduler.record_message(
+                    text,
+                    channel=channel,
+                    thought_id=thought.id if thought is not None else "",
+                )
                 memory_id = _remember_proactive_delivery(
                     components,
                     text,
@@ -1725,6 +2103,9 @@ def handle_slash(command: str, components: Components) -> bool:
                     message_id=message_id,
                     trigger="slash_trigger",
                 )
+                components.scheduler.mark_sent(channel=channel)
+                if thought is not None:
+                    components.scheduler.thoughts.record_delivery(thought.id)
                 components.events.emit(
                     "proactive_message_generated",
                     message_id=message_id,
@@ -1796,7 +2177,10 @@ def run_turn_with_interrupt(
     if agent is None:
         raise RuntimeError("模型未初始化")
     if not sys.stdin.isatty():
-        return agent.run_turn(user_input), []
+        result = agent.run_turn(user_input)
+        if components.proactive is not None:
+            components.proactive.refresh_thoughts(force=True)
+        return result, []
 
     outcome: dict[str, Any] = {}
 
@@ -1876,6 +2260,8 @@ def run_turn_with_interrupt(
     result = outcome.get("result")
     if not isinstance(result, AgentResult):
         raise RuntimeError("Agent 回合未返回结果")
+    if components.proactive is not None:
+        components.proactive.refresh_thoughts(force=True)
     submitted = pending_input.take_submitted() if pending_input is not None else []
     return result, submitted
 
@@ -1921,7 +2307,10 @@ def run_repl(
         else None
     )
     renderer = (
-        RuntimeEventRenderer(input_dock=input_dock)
+        RuntimeEventRenderer(
+            input_dock=input_dock,
+            completion_stream=sys.stdout,
+        )
         if not verbose
         else None
     )
@@ -1979,7 +2368,7 @@ def run_repl(
                 break
             if not user_input.strip():
                 continue
-            components.scheduler.user_activity()
+            components.scheduler.user_activity(text=user_input)
             if user_input.strip().startswith("/"):
                 if not handle_slash(user_input, components):
                     print("再见。")
@@ -2002,10 +2391,10 @@ def run_repl(
                 print("\n操作已中断。")
                 continue
             queued_inputs.extend(submitted)
-            print_terminal_markdown(result.text)
             if renderer is not None:
-                renderer.streamed_text = ""
-            if result.reason not in {"completed"}:
+                renderer.commit_turn()
+            print_terminal_markdown(result.text)
+            if result.reason not in {"completed", "circuit_open"}:
                 print(
                     color(
                         f"[turn: {result.reason}; receipt: {result.receipt_id}]",
@@ -2073,6 +2462,8 @@ def run_exec(
                     forked_from=forked_from,
                 )
         result = components.agent.run_turn(prompt)
+        if components.proactive is not None:
+            components.proactive.refresh_thoughts(force=True)
         if json_mode:
             print(
                 json.dumps(
@@ -2168,13 +2559,67 @@ def proactive_command(
         elif action == "trigger":
             if components.proactive is None:
                 raise ModelError("模型未初始化")
+            pending_task = components.scheduler.claim_due_task()
+            thought_decision = (
+                components.proactive.think(
+                    daypart_changed=(
+                        components.scheduler.status().daypart_changed
+                    )
+                )
+                if pending_task is None
+                else None
+            )
+            if (
+                pending_task is None
+                and thought_decision is not None
+                and thought_decision.action != "message"
+            ):
+                if thought_decision.thought is not None:
+                    if thought_decision.action in {"review", "maintenance"}:
+                        components.scheduler.thoughts.resolve(
+                            thought_decision.thought.id,
+                            thought_decision.action,
+                        )
+                        components.scheduler.acknowledge_daypart()
+                    else:
+                        components.scheduler.thoughts.defer(
+                            thought_decision.thought.id,
+                            thought_decision.wait_seconds,
+                            thought_decision.reason,
+                        )
+                print(
+                    json.dumps(
+                        {
+                            "status": "deferred",
+                            "action": thought_decision.action,
+                            "score": thought_decision.score,
+                            "reason": thought_decision.reason,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 0
+            thought = (
+                thought_decision.thought
+                if thought_decision is not None
+                else None
+            )
             try:
                 text, meta = components.proactive.generate(
                     sequence_index=components.scheduler.current_topic_index(),
-                    pending_task=components.scheduler.due_task(),
+                    pending_task=pending_task,
+                    thought=thought,
+                    thought_score=(
+                        thought_decision.score
+                        if thought_decision is not None
+                        else 0.0
+                    ),
                 )
             except Exception as error:
-                components.scheduler.mark_failed()
+                if pending_task is not None:
+                    components.scheduler.defer_task(pending_task.id, 60)
+                else:
+                    components.scheduler.mark_failed()
                 components.events.emit(
                     "proactive_message_failed",
                     trigger="cli_trigger",
@@ -2189,7 +2634,12 @@ def proactive_command(
             ):
                 print("主动待办动作未完成，本次未发送。", file=sys.stderr)
                 return 1
-            message_id = components.scheduler.record_message(text)
+            channel = "task" if pending_task is not None else "social"
+            message_id = components.scheduler.record_message(
+                text,
+                channel=channel,
+                thought_id=thought.id if thought is not None else "",
+            )
             memory_id = _remember_proactive_delivery(
                 components,
                 text,
@@ -2197,6 +2647,9 @@ def proactive_command(
                 message_id=message_id,
                 trigger="cli_trigger",
             )
+            components.scheduler.mark_sent(channel=channel)
+            if thought is not None:
+                components.scheduler.thoughts.record_delivery(thought.id)
             meta["message_id"] = message_id
             meta["memory_id"] = memory_id
             print(text)
@@ -2547,6 +3000,20 @@ def make_parser() -> argparse.ArgumentParser:
         type=int,
         metavar="CHARS",
         help="Limit casual-chat replies from 40 to 1000 characters",
+    )
+    stage_direction_config = persona_config.add_mutually_exclusive_group()
+    stage_direction_config.add_argument(
+        "--stage-directions",
+        dest="persona_stage_directions",
+        action="store_true",
+        default=None,
+        help="Allow parenthetical action and expression narration in chat",
+    )
+    stage_direction_config.add_argument(
+        "--no-stage-directions",
+        dest="persona_stage_directions",
+        action="store_false",
+        help="Remove parenthetical action and expression narration from chat",
     )
     persona_config.add_argument(
         "--example",

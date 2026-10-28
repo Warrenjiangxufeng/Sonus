@@ -8,8 +8,47 @@ from typing import Any
 from sunus.memory import estimate_tokens
 
 
-def compact_conversation_reply(text: str, *, limit: int = 100) -> str:
-    cleaned = " ".join(str(text or "").split()).strip()
+_PARENTHETICAL_STAGE = re.compile(
+    r"[（(][^（）()\n]{0,180}?"
+    r"(?:没挡|一僵|僵住|吸气|呼吸|声音|低声|小声|轻声|闷声|"
+    r"抬眼看|低头|看着你|视线|目光|眼神|轻笑|笑了一下|顿了顿|"
+    r"手撑|撑在|手腕|肩膀|肩|额头|心口|胸口|指尖|抓紧|"
+    r"攥住|衣领|衣襟|头发|整个人|腿|靠近|靠回|贴在|贴住|"
+    r"退开|往后退|偏头|侧过脸|仰头|俯下)"
+    r"[^（）()\n]{0,180}[）)]"
+)
+_STANDALONE_PARENTHETICAL = re.compile(
+    r"^\s*[（(][^（）()\n]{1,180}[）)]\s*$"
+)
+_CORNER_QUOTE = re.compile(r"[「『]([^」』\n]+)[」』]")
+
+
+def strip_parenthetical_stage_directions(text: str) -> str:
+    """Remove screenplay-style stage directions from conversational prose."""
+    lines: list[str] = []
+    for line in str(text or "").splitlines():
+        if _STANDALONE_PARENTHETICAL.fullmatch(line):
+            continue
+        cleaned = _PARENTHETICAL_STAGE.sub("", line)
+        cleaned = _CORNER_QUOTE.sub(r"\1", cleaned)
+        cleaned = " ".join(cleaned.split())
+        if cleaned:
+            lines.append(cleaned)
+    return "\n".join(lines)
+
+
+def compact_conversation_reply(
+    text: str,
+    *,
+    limit: int = 100,
+    allow_stage_directions: bool = False,
+) -> str:
+    source = (
+        str(text or "")
+        if allow_stage_directions
+        else strip_parenthetical_stage_directions(text)
+    )
+    cleaned = " ".join(source.split()).strip()
     if len(cleaned) <= limit:
         return cleaned
     sentences = re.findall(r".+?(?:[。！？!?]+|$)", cleaned)

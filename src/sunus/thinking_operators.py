@@ -1,6 +1,5 @@
+"""Human-inspired cognitive lenses offered to Sunus, never a fixed route."""
 from __future__ import annotations
-
-from dataclasses import dataclass
 
 
 MAX_OPERATORS = 4
@@ -26,15 +25,25 @@ OPERATOR_LIBRARY = (
     "具身直觉",
 )
 
-MODE_ROUTES: dict[str, tuple[str, ...]] = {
-    "关系性对话": ("叙事时间", "心理理论"),
-    "简单状态查询": ("演绎", "批判"),
-    "Playwright CLI 工具链": ("溯因", "因果", "反事实", "元认知"),
-    "根因诊断": ("溯因", "因果", "反事实", "批判"),
-    "浏览器只读查证": ("演绎", "批判"),
-    "只读查证": ("演绎", "批判"),
-    "修改交付": ("发散", "反事实", "决策优化", "元认知"),
-    "一般任务": ("归纳", "类比", "概率", "元认知"),
+OPERATOR_ACTIONS: dict[str, str] = {
+    "演绎": "写清结论依赖的前提，再逐项核对证据",
+    "归纳": "从独立样本形成假设，并主动寻找反例",
+    "溯因": "列出竞争解释，寻找能区分它们的证据",
+    "类比": "迁移结构，同时检查关键差异",
+    "因果": "区分相关、混杂、共同原因和反向因果",
+    "概率": "先看基础率，再考虑样本偏差和证据独立性",
+    "发散": "扩大候选，再用现实约束筛选",
+    "组合创造": "组合已有能力并检查新冲突",
+    "反事实": "改变一个关键条件，预演结果和风险",
+    "心智模拟": "按时间顺序走正常与异常路径",
+    "批判": "检查最强反方解释和隐含假设",
+    "系统": "检查局部、整体、反馈和延迟",
+    "决策优化": "按证据收益、成本、权限和可逆性排序",
+    "元认知": "确认证据是否增加、策略是否有效并设置停止条件",
+    "叙事时间": "检查时间、指代、关系和缺失环节",
+    "心理理论": "区分观察、推测和对方可能意图",
+    "伦理实践智慧": "检查受影响方、同意、边界和情境差异",
+    "具身直觉": "把直觉当作假设，用可观察证据复核",
 }
 
 CONTRAST_CHECKS: dict[str, str] = {
@@ -46,49 +55,48 @@ CONTRAST_CHECKS: dict[str, str] = {
     "概率": "检查基础率、样本偏差和证据独立性",
     "发散": "用约束、成本和可验证性筛掉候选",
     "组合创造": "检查组合后的新冲突和风险",
-    "反事实": "确认改变条件后的推演与证据一致",
+    "反事实": "确认推演没有替代现实证据",
     "心智模拟": "寻找现实约束和异常路径",
     "批判": "检查最强反方解释和隐含假设",
     "系统": "用局部检查验证系统解释",
     "决策优化": "检查代价、可逆性和尾部风险",
-    "元认知": "确认策略是否增加证据并设置停止条件",
+    "元认知": "确认策略是否真的增加证据并停止重复",
     "叙事时间": "检查时间、指代和缺失环节",
-    "心理理论": "寻找不依赖意图或情绪的替代解释",
-    "伦理实践智慧": "检查受影响方、权利边界和情境差异",
+    "心理理论": "寻找不依赖意图或情绪的证据",
+    "伦理实践智慧": "检查受影响方、权利边界和情境",
     "具身直觉": "用可验证证据检查直觉是否失真",
 }
 
-
-@dataclass(frozen=True)
-class OperatorSelection:
-    operators: tuple[str, ...]
-    contrast_checks: tuple[str, ...]
-
-    def prompt(self) -> str:
-        return (
-            f"- 当前首选思维算子: {', '.join(self.operators)}\n"
-            f"- 反向复核: {'；'.join(self.contrast_checks)}"
-        )
+COGNITIVE_INVARIANTS = (
+    "先区分观察、推断、记忆经验和当前事实",
+    "算子选择由模型根据当前情境决定，不套固定模式路由",
+    "可以不用显式算子，也可以选择不超过四个相关视角",
+    "至少做一次反向复核，但不要为了形式走完整清单",
+    "证据足够、无法再区分、风险过高或需要用户决定时停止",
+)
 
 
-def select_operators(
-    *,
-    mode: str,
-    complexity: str,
-) -> OperatorSelection:
-    """Use only the already-computed plan mode; no model, tool, or I/O cost."""
-    operators = list(MODE_ROUTES.get(mode, MODE_ROUTES["一般任务"]))
-    if complexity == "低":
-        operators = operators[:2]
-    elif "元认知" not in operators and len(operators) < MAX_OPERATORS:
-        operators.append("元认知")
-    selected = tuple(operators[:MAX_OPERATORS])
-    contrasts = tuple(
-        CONTRAST_CHECKS[operator]
-        for operator in selected
-        if operator in CONTRAST_CHECKS
-    )[:2]
-    return OperatorSelection(
-        operators=selected,
-        contrast_checks=contrasts or (CONTRAST_CHECKS["批判"],),
+def cognitive_protocol_prompt() -> str:
+    actions = "；".join(
+        f"{operator}={OPERATOR_ACTIONS[operator]}"
+        for operator in OPERATOR_LIBRARY
+    )
+    contrasts = "；".join(
+        f"{operator}={CONTRAST_CHECKS[operator]}"
+        for operator in OPERATOR_LIBRARY
+    )
+    return (
+        "认知自主契约（由模型自主判断，不使用固定算子路由）：\n"
+        "- 先判断当前究竟要理解、决定、修复、验证、安慰还是收束；"
+        "不要因为任务类别相似就机械套用相同思路。\n"
+        "- 可用的人类思维视角："
+        + "、".join(OPERATOR_LIBRARY)
+        + "。可自行选择 0-4 个，也可以组合或不用。\n"
+        f"- 视角执行参考：{actions}。\n"
+        f"- 反向复核参考：{contrasts}。\n"
+        "- 必须遵守："
+        + "；".join(COGNITIVE_INVARIANTS)
+        + "。\n"
+        "- 内部思考不需要展示，也不要为了证明思考而扩写；"
+        "输出只保留结论、必要依据和实际动作。"
     )

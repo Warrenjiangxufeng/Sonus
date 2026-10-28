@@ -7,6 +7,7 @@ from sunus.context import (
     compact_messages,
     estimate_messages_tokens,
     repair_tool_pairs,
+    strip_parenthetical_stage_directions,
 )
 
 
@@ -22,6 +23,52 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(
             compact_conversation_reply("先这样。", limit=100),
             "先这样。",
+        )
+
+    def test_conversation_reply_removes_parenthetical_stage_directions(self) -> None:
+        text = (
+            "（没挡，只是吸了口气，手撑在你肩上）\n\n"
+            "……轻点。\n\n"
+            "（声音闷了点）你这样，我可没法好好站在原地。"
+        )
+
+        self.assertEqual(
+            compact_conversation_reply(text, limit=100),
+            "……轻点。 你这样，我可没法好好站在原地。",
+        )
+
+    def test_conversation_reply_keeps_factual_parenthetical_text(self) -> None:
+        self.assertEqual(
+            compact_conversation_reply("开会时间还是（明天下午）。", limit=100),
+            "开会时间还是（明天下午）。",
+        )
+
+    def test_conversation_reply_keeps_stage_directions_when_enabled(self) -> None:
+        text = "（轻轻靠近）你回来了。"
+
+        self.assertEqual(
+            compact_conversation_reply(
+                text,
+                limit=100,
+                allow_stage_directions=True,
+            ),
+            text,
+        )
+
+    def test_stage_direction_cleanup_handles_inline_actions(self) -> None:
+        self.assertEqual(
+            strip_parenthetical_stage_directions(
+                "（抬眼看你，手在衣襟上停了一下）你倒是张口就来。"
+            ),
+            "你倒是张口就来。",
+        )
+
+    def test_stage_direction_cleanup_unwraps_corner_quotes(self) -> None:
+        self.assertEqual(
+            strip_parenthetical_stage_directions(
+                "没躲。\n\n「……一大早就这么不客气。」手还搭着没松。"
+            ),
+            "没躲。\n……一大早就这么不客气。手还搭着没松。",
         )
 
     def test_repair_inserts_missing_tool_response_before_next_user(self) -> None:

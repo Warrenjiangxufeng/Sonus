@@ -3,9 +3,12 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
+import subprocess
 import tempfile
 import time
 import unittest
+import urllib.error
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -19,6 +22,7 @@ from sunus.storage import ArtifactStore
 from sunus.tools import (
     ToolExecutor,
     _command_changes_target_state,
+    _is_broad_search_root,
     find_ripgrep,
     tool_schemas,
 )
@@ -31,11 +35,19 @@ class ToolTests(unittest.TestCase):
         self.assertIn("write_document", names)
         self.assertIn("memory_context_metrics", names)
         self.assertIn("search_memory", names)
+        self.assertIn("inspect_code_state", names)
         self.assertIn("remember", names)
         self.assertIn("inspect_environment", names)
         self.assertIn("inspect_browser", names)
         self.assertIn("inspect_runtime_history", names)
         self.assertIn("request_authorization", names)
+
+    def test_broad_home_roots_are_rejected_before_recursive_search(self) -> None:
+        self.assertTrue(_is_broad_search_root(Path.home()))
+        self.assertTrue(_is_broad_search_root(Path.home() / "Documents"))
+        self.assertTrue(_is_broad_search_root(Path.home() / "Desktop"))
+        with tempfile.TemporaryDirectory() as temp:
+            self.assertFalse(_is_broad_search_root(Path(temp)))
 
     def make_executor(
         self,
@@ -98,6 +110,119 @@ class ToolTests(unittest.TestCase):
             self.assertIn("a.txt\t2 命中", result.content)
             self.assertIn("b.txt\t1 命中", result.content)
             self.assertNotIn("needle\nneedle", result.content)
+
+    def test_broad_search_defaults_to_bounded_file_summary(self) -> None:
+        home = Path.home()
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp)
+            executor = ToolExecutor(
+                workspace=home,
+                path_guard=PathGuard(home),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=home,
+                ),
+                artifacts=ArtifactStore(home, data),
+                events=EventBus(data),
+                data_dir=data,
+            )
+            with (
+                patch("sunus.tools.find_ripgrep", return_value="/usr/bin/rg"),
+                patch.object(
+                    executor,
+                    "_search_with_ripgrep",
+                    return_value=(["repo/src/app.py:2:max_tokens"], False, ""),
+                ) as search,
+            ):
+                result = executor.execute(
+                    "search_text",
+                    {"query": "max_tokens", "output": "lines"},
+                )
+        self.assertTrue(result.ok)
+        self.assertIn("repo/src/app.py\t1 命中", result.content)
+        self.assertIn("broad_root=metadata_first", result.content)
+        self.assertEqual(search.call_args.kwargs["limit"], 1_000)
+
+    def test_explicit_global_line_search_is_still_allowed(self) -> None:
+        home = Path.home()
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp)
+            executor = ToolExecutor(
+                workspace=home,
+                path_guard=PathGuard(home),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=home,
+                ),
+                artifacts=ArtifactStore(home, data),
+                events=EventBus(data),
+                data_dir=data,
+            )
+            with (
+                patch("sunus.tools.find_ripgrep", return_value="/usr/bin/rg"),
+                patch.object(
+                    executor,
+                    "_search_with_ripgrep",
+                    return_value=(["repo/src/app.py:2:max_tokens"], False, ""),
+                ),
+            ):
+                result = executor.execute(
+                    "search_text",
+                    {
+                        "query": "max_tokens",
+                        "output": "lines",
+                        "allow_broad": True,
+                    },
+                )
+        self.assertTrue(result.ok)
+        self.assertIn("repo/src/app.py:2:max_tokens", result.content)
+        self.assertNotIn("broad_root=metadata_first", result.content)
+
+    def test_inspect_code_state_returns_context_and_git_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "src" / "app.py"
+            source.parent.mkdir()
+            source.write_text("value = 1\nmax_tokens = 256\n", encoding="utf-8")
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            subprocess.run(
+                ["git", "config", "user.name", "Test"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "add token budget"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            executor = self.make_executor(root)
+
+            result = executor.execute(
+                "inspect_code_state",
+                {
+                    "path": "src/app.py",
+                    "symbol": "max_tokens",
+                    "context_lines": 2,
+                },
+            )
+
+            self.assertTrue(result.ok)
+            payload = json.loads(result.content)
+            self.assertTrue(payload["version_verified"])
+            self.assertTrue(payload["head"])
+            self.assertEqual(payload["matches"][0]["line"], 2)
+            self.assertIn("max_tokens", payload["matches"][0]["text"])
+            self.assertTrue(payload["file_commit"]["commit"])
+            self.assertTrue(payload["line_commits"]["2"]["commit"])
 
     def test_list_files_can_filter_and_sort_by_mtime(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -666,6 +791,39 @@ class ToolTests(unittest.TestCase):
                 self.assertFalse(result.ok)
                 self.assertIn("没有明确要求", result.content)
             self.assertFalse((root / "new.txt").exists())
+
+    def test_fetch_url_timeout_returns_structured_network_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root)
+            executor.approvals.grant_capabilities(["network"])
+            executor.begin_request(
+                "读取 https://en.wikipedia.org/wiki/Raven%27s_Progressive_Matrices"
+            )
+            with patch(
+                "sunus.tools.urllib.request.urlopen",
+                side_effect=urllib.error.URLError(
+                    socket.timeout("handshake timed out")
+                ),
+            ) as urlopen:
+                result = executor.execute(
+                    "fetch_url",
+                    {
+                        "url": (
+                            "https://en.wikipedia.org/wiki/"
+                            "Raven%27s_Progressive_Matrices"
+                        ),
+                        "timeout_sec": 7,
+                    },
+                )
+
+            self.assertFalse(result.ok)
+            payload = json.loads(result.content)
+            self.assertEqual(payload["error"], "network_timeout")
+            self.assertEqual(payload["host"], "en.wikipedia.org")
+            self.assertEqual(payload["timeout_sec"], 7)
+            self.assertTrue(payload["retryable"])
+            self.assertEqual(urlopen.call_args.kwargs["timeout"], 7)
 
     def test_explicit_request_path_is_writable_for_that_turn_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

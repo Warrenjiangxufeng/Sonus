@@ -118,7 +118,8 @@ def plan_conversation_turn(text: str) -> ConversationTurnPlan:
         return ConversationTurnPlan(
             input_chars=length,
             target_style=(
-                "这是很短的接话或情绪感叹；通常回应一句，别把一句话扩成小作文。"
+                "这是很短的接话或亲密邀请。直接接住当下这一句，通常只回一句；"
+                "最多保留一个具体动作或感受，不扩写场景、不补动作链、不翻旧账。"
             ),
             max_chars=32,
         )
@@ -126,9 +127,10 @@ def plan_conversation_turn(text: str) -> ConversationTurnPlan:
         return ConversationTurnPlan(
             input_chars=length,
             target_style=(
-                "这是简短聊天；通常一两句话，围绕一个具体点接住即可。"
+                "这是简短聊天；通常一两句话，围绕一个具体点接住。"
+                "亲密内容只回应对方刚说的动作或感受，不主动增加新的场景描述。"
             ),
-            max_chars=72,
+            max_chars=56,
         )
     if length <= 48:
         return ConversationTurnPlan(
