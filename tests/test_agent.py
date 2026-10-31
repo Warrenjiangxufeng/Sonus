@@ -1336,6 +1336,59 @@ class BatchPatchModel:
         )
 
 
+class SequentialWriteModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.calls += 1
+        if self.calls == 1:
+            name = "write_file"
+            arguments = {"path": "a.txt", "content": "alpha\n"}
+        elif self.calls == 2:
+            name = "write_file"
+            arguments = {"path": "b.txt", "content": "beta\n"}
+        else:
+            name = "submit_result"
+            arguments = {
+                "kind": "change_report",
+                "status": "completed",
+                "summary": "两个文件已写入。",
+                "changes": [
+                    {
+                        "path": "a.txt",
+                        "action": "created",
+                        "purpose": "测试串行写入",
+                    },
+                    {
+                        "path": "b.txt",
+                        "action": "created",
+                        "purpose": "测试串行写入",
+                    },
+                ],
+            }
+        return ModelReply(
+            message={
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": f"call_sequential_write_{self.calls}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(
+                                arguments,
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+            },
+            usage={"total_tokens": 5},
+            finish_reason="tool_calls",
+        )
+
+
 class ApplyAndVerifyModel:
     def __init__(self) -> None:
         self.calls = 0
@@ -2264,6 +2317,52 @@ class AgentTests(unittest.TestCase):
                 [trace["name"] for trace in result.tool_traces],
                 ["patch_file_batch", "submit_result"],
             )
+            memory.close()
+
+    def test_sequential_writes_emit_generic_batch_opportunity_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=5,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_batch_hint", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            agent = Agent(
+                config=config,
+                model=SequentialWriteModel(),  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("创建 a.txt 和 b.txt")
+
+            self.assertEqual(result.reason, "completed")
+            events_text = events.path.read_text(encoding="utf-8")
+            self.assertIn("batch_opportunity_hint", events_text)
+            self.assertIn("batch_opportunity_missed", events_text)
+            self.assertIn("输出预算", events_text)
             memory.close()
 
     def test_apply_and_verify_uses_one_tool_round(self) -> None:

@@ -566,6 +566,19 @@ class ToolTests(unittest.TestCase):
             self.assertTrue(result.ok, result.content)
             self.assertIn("verify-ok", result.content)
 
+    def test_verification_prefix_matches_absolute_executable_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            executor = self.make_executor(
+                Path(temp),
+                verification_command_prefixes=("check",),
+            )
+
+            self.assertTrue(
+                executor._verification_command_allowed(
+                    "/usr/local/bin/check --full"
+                )
+            )
+
     def test_read_only_tool_result_is_cached_until_state_change(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

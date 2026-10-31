@@ -173,7 +173,9 @@ sunus --budget deep
 `request_budget_extension` 和 `submit_result`。模型必须说明尚未完成的子目标、
 已排除假设和下一批动作，最多一次申请 20 次；批准量同时受硬上限和终态预留约束。
 扩容会记录 `budget_review_started`、`budget_extension_granted` 或
-`budget_extension_denied` 事件，不会静默提高预算。
+`budget_extension_denied` 事件，不会静默提高预算。复核阶段若模型返回白名单之外
+的工具，该阻断记录为结构化 `budget_review_blocked`，不累计普通失败或无进展，
+也不会因此误触发下一次熔断。
 
 控制器追踪新证据、文件变化、重复动作和连续失败。连续 2 轮无新证据或同类错误重复 2 次时，会注入结构化恢复契约：列出目标、证据缺口、失败动作签名、当前实际可用能力和相关记忆召回，由模型自主提出下一步；代码不维护固定工具替代表。继续跨动作无改善则熔断。
 同一个工具以完全相同参数返回完全相同的证据后，该调用签名会被视为无增益重复；
@@ -364,7 +366,7 @@ Tab/Esc 仍只用于打断。取消下一轮输入会同时清空暂存。
 | `schedule_proactive_file_write` | 把用户明确要求的后续文件写入保存为一次性或每日主动待办。 |
 | `run_command` | 在工作区运行 shell 命令，返回退出码和输出。 |
 | `run_command_batch` | 一次并发执行最多 4 条互不依赖的 R0 或已配置只读命令，并分别返回退出码、stdout 和 stderr。 |
-| `verification_batch` | 一次并发执行最多 4 条独立验证命令，支持 pytest、unittest、npm/cargo/go test、ruff、mypy、eslint、tsc 和自定义前缀。 |
+| `verification_batch` | 一次并发执行最多 4 条独立验证命令；可用通用运行时前缀配置限定项目允许的验证入口。 |
 | `fetch_url` | 获取 HTTP(S) 文本，属于高风险网络操作。 |
 | `fetch_url_batch` | 一次并发获取最多 5 个独立 HTTP(S) URL，并分别返回内容。 |
 | `list_skills` | 列出本地技能及适用场景。 |
@@ -411,6 +413,11 @@ Tab/Esc 仍只用于打断。取消下一轮输入会同时清空暂存。
   }
 }
 ```
+
+一次单项 `write_file` 或 `patch_file` 完成后，运行时会在下一次模型调用前给出通用
+批量机会提示，并记录 `batch_opportunity_hint`；后续使用批量工具记录
+`batch_opportunity_used`，继续单项变更记录 `batch_opportunity_missed`。提示不会
+强制合并：单个产物很大、总输出超过预算或后一步依赖中间结果时，串行仍然正确。
 
 stdio MCP 使用用户级 `~/.sunus/config.json` 配置。MCP 工具默认风险为 R2，
 默认要求审批，不继承任务的 R1 自动授权：

@@ -249,6 +249,9 @@ class Agent:
         self._turn_perception: Perception | None = None
         self._turn_started_at = 0.0
         self._last_strategy_id = ""
+        self._batch_hint_pending = False
+        self._batch_hint_active = False
+        self._batch_hint_seen = False
         self.reset()
 
     def reset(self) -> None:
@@ -274,6 +277,9 @@ class Agent:
         self._turn_perception = None
         self._turn_started_at = 0.0
         self._last_strategy_id = ""
+        self._batch_hint_pending = False
+        self._batch_hint_active = False
+        self._batch_hint_seen = False
         self._session_memory_flushed = False
         self._base_context = self._base_system_prompt()
         self.messages = [{"role": "system", "content": ""}]
@@ -431,6 +437,9 @@ class Agent:
         self._remembered_this_turn = False
         self._response_mode = ""
         self._last_prompt_tokens = 0
+        self._batch_hint_pending = False
+        self._batch_hint_active = False
+        self._batch_hint_seen = False
         self.messages = [{"role": "system", "content": ""}, *repaired]
         self._apply_system_message()
 
@@ -579,6 +588,7 @@ class Agent:
 26. 判断“当前状态”时先识别证据域：历史记忆只证明过去说过或发生过什么；配置文件只证明声明意图；源码只证明当前实现；实际生效必须看运行时结果。任何一类证据都不能替代另一类。
 27. 低功耗是所有执行方式的第一约束：证据足够时优先单次专用工具、最小目录、最少命令、最少网络和最少模型往返；先扩大便宜范围再精确读取，不为“更全面”重复已完成检查。
 28. 复杂任务开始、真正切换假设或收到认知收束检查点时，可用 update_reasoning_state 写回当前子目标、假设、证据缺口、成功判据和决策理由；不要机械地每步调用。工具选择和具体操作策略仍由你根据情境提出，不由固定代码替你规定。
+29. 运行验证或命令前，若执行入口、解释器与依赖关系不明确，先调用 inspect_environment 获取实际可执行文件、版本和环境映射；不要在同类命令的不同解释器之间盲试。拿到可验证入口后优先直接执行。
 
 任务边界：
 - 只执行用户当前消息明确要求的动作。建议、假设、示例、推测、可选优化和未点名待办都不是执行指令。
@@ -1323,7 +1333,11 @@ class Agent:
                 invocation.arguments,
             )
             if blocked:
-                results[index] = ToolResult(False, blocked)
+                results[index] = ToolResult(
+                    False,
+                    blocked,
+                    control_outcome=controller.last_block_outcome,
+                )
                 self.events.emit(
                     "tool_call",
                     turn_id=turn_id,
@@ -1393,6 +1407,7 @@ class Agent:
                 "ok": result.ok,
                 "state_changed": result.state_changed,
                 "changed_files": result.changed_files,
+                "control_outcome": result.control_outcome,
                 "content": result.content[:12000],
             },
             self.config.api_key,
@@ -1429,7 +1444,43 @@ class Agent:
             content=result.content,
             changed_files=result.changed_files,
             state_changed=result.state_changed,
+            control_outcome=result.control_outcome,
         )
+        single_mutation_tools = {
+            "write_file",
+            "write_document",
+            "patch_file",
+        }
+        batch_mutation_tools = {
+            "write_file_batch",
+            "patch_file_batch",
+            "apply_and_verify",
+        }
+        if self._batch_hint_active:
+            if invocation.name in batch_mutation_tools:
+                self.events.emit(
+                    "batch_opportunity_used",
+                    turn_id=turn_id,
+                    name=invocation.name,
+                    summary="已使用批量变更工具",
+                )
+            elif invocation.name in single_mutation_tools:
+                self.events.emit(
+                    "batch_opportunity_missed",
+                    turn_id=turn_id,
+                    name=invocation.name,
+                    summary=(
+                        "批处理机会提示后仍使用单项变更；"
+                        "可能受输出预算或依赖关系约束"
+                    ),
+                )
+            self._batch_hint_active = False
+        if (
+            result.ok
+            and invocation.name in single_mutation_tools
+            and not self._batch_hint_seen
+        ):
+            self._batch_hint_pending = True
         self._task_state.record_tool(
             invocation.name,
             invocation.arguments,
@@ -1764,6 +1815,9 @@ class Agent:
         self._turn_perception = None
         self._runtime_policy_prompt = ""
         self._tool_visibility_prompt = ""
+        self._batch_hint_pending = False
+        self._batch_hint_active = False
+        self._batch_hint_seen = False
         self.events.emit(
             "turn_started",
             turn_id=turn_id,
@@ -2082,6 +2136,28 @@ class Agent:
                             if controller.finalizing
                             else "已注入恢复策略提示"
                         ),
+                    )
+                if (
+                    self._batch_hint_pending
+                    and not controller.finalizing
+                    and not controller.reviewing_budget
+                ):
+                    self._runtime_policy_prompt = (
+                        self._runtime_policy_prompt
+                        + "\n\n批量变更机会检查：上一个单项变更已经完成。"
+                        "如果剩余变更已经全部明确，且内容能在当前单次输出预算内"
+                        "完整生成，优先使用批量写入、批量 patch 或修改后验证工具；"
+                        "如果单个产物很大、需要先观察中间结果或后一步依赖前一步，"
+                        "继续串行。不要为了批量而截断内容或重复生成已验证的文件。"
+                    )
+                    self._apply_system_message()
+                    self._batch_hint_pending = False
+                    self._batch_hint_seen = True
+                    self._batch_hint_active = True
+                    self.events.emit(
+                        "batch_opportunity_hint",
+                        turn_id=turn_id,
+                        summary="已提示评估剩余变更是否适合批量执行",
                     )
                 response_limit = (
                     self.config.max_tokens
@@ -2666,7 +2742,11 @@ class Agent:
                         # The invalid submission already emitted tool_call above.
                         pass
                     elif blocked:
-                        result = ToolResult(False, blocked)
+                        result = ToolResult(
+                            False,
+                            blocked,
+                            control_outcome=controller.last_block_outcome,
+                        )
                         self.events.emit(
                             "tool_call",
                             turn_id=turn_id,

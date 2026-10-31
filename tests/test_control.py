@@ -145,6 +145,39 @@ class TurnControllerTests(unittest.TestCase):
         self.assertIn("额外 1 次", content)
         self.assertEqual(controller.effective_model_limit, 2)
 
+    def test_budget_review_noncompliant_tool_does_not_count_as_failure(self) -> None:
+        events = RecordingEvents()
+        controller = TurnController(
+            LoopBudgetConfig(
+                base_model_calls=1,
+                max_model_calls=4,
+                finalization_reserve=1,
+                no_progress_soft=10,
+                no_progress_hard=11,
+            ),
+            events=events,  # type: ignore[arg-type]
+        )
+        controller.before_model_call()
+        controller.before_model_call()
+        before_progress = controller.no_progress_rounds
+        before_failures = controller.consecutive_failures
+
+        controller.record_tool_result(
+            "run_command",
+            {"command": "verify --fast"},
+            ok=False,
+            content="基础模型调用预算已用完；只能申请扩容或提交结果。",
+            changed_files=[],
+            control_outcome="budget_review_blocked",
+        )
+
+        self.assertEqual(controller.no_progress_rounds, before_progress)
+        self.assertEqual(controller.consecutive_failures, before_failures)
+        self.assertIn(
+            "budget_review_noncompliant",
+            [event_type for event_type, _ in events.events],
+        )
+
     def test_token_soft_limit_enters_finalization_before_hard_limit(self) -> None:
         controller = TurnController(
             LoopBudgetConfig(

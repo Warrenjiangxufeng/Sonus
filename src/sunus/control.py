@@ -88,6 +88,7 @@ class TurnController:
         self._warned: set[str] = set()
         self._started = False
         self.finalizing = False
+        self.last_block_outcome = ""
 
     def start(self) -> None:
         if self._started:
@@ -356,9 +357,11 @@ class TurnController:
         self._check_hard_limits(include_model=False)
 
     def before_tool(self, name: str, arguments: dict[str, Any]) -> str | None:
+        self.last_block_outcome = ""
         self._check_hard_limits(include_model=False)
         if self.finalizing:
             reason = "已进入终态阶段；只能提交结果，不能执行新的工具动作。"
+            self.last_block_outcome = "finalization_blocked"
             self._emit(
                 "finalization_tool_blocked",
                 name=name,
@@ -373,6 +376,7 @@ class TurnController:
                 "基础模型调用预算已用完；只能申请一次有明确计划的扩容，"
                 "或提交当前结果。"
             )
+            self.last_block_outcome = "budget_review_blocked"
             self._emit(
                 "budget_review_tool_blocked",
                 name=name,
@@ -437,7 +441,21 @@ class TurnController:
         content: str,
         changed_files: list[str],
         state_changed: bool = False,
+        control_outcome: str = "",
     ) -> None:
+        if (
+            control_outcome == "budget_review_blocked"
+            and not ok
+        ):
+            self._emit(
+                "budget_review_noncompliant",
+                name=name,
+                summary=(
+                    "预算复核阶段返回了非白名单工具；不计入失败或无进展，"
+                    "下一轮进入终态收口"
+                ),
+            )
+            return
         signature = self._tool_signature(name, arguments)
         normalized = self._normalize(content)
         evidence = self._hash(

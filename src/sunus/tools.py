@@ -6,6 +6,7 @@ import json
 import os
 import re
 import selectors
+import shlex
 import shutil
 import signal
 import socket
@@ -71,25 +72,6 @@ _TURN_CACHEABLE_TOOLS = {
     "read_skill",
     "run_command_batch",
 }
-_BUILTIN_VERIFICATION_PREFIXES = (
-    "pytest",
-    "python -m pytest",
-    "python3 -m pytest",
-    "python -m unittest",
-    "python3 -m unittest",
-    "npm test",
-    "pnpm test",
-    "yarn test",
-    "cargo test",
-    "go test",
-    "make test",
-    "ruff check",
-    "mypy",
-    "eslint",
-    "tsc",
-)
-
-
 def _is_broad_search_root(path: Path) -> bool:
     try:
         return path.resolve() in _BROAD_SEARCH_ROOTS
@@ -262,6 +244,7 @@ class ToolResult:
     approval_barrier: bool = False
     halt: bool = False
     cache_hit: bool = False
+    control_outcome: str = ""
 
     def as_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"ok": self.ok, "content": self.content}
@@ -277,6 +260,8 @@ class ToolResult:
             payload["halt"] = True
         if self.cache_hit:
             payload["cache_hit"] = True
+        if self.control_outcome:
+            payload["control_outcome"] = self.control_outcome
         return payload
 
 
@@ -752,11 +737,9 @@ def tool_schemas() -> list[dict[str, Any]]:
         ),
         fn(
             "verification_batch",
-            "Run up to four independent verification commands in one tool call. "
-            "Commands must start with a supported verification executable such "
-            "as pytest, unittest, npm test, cargo test, go test, ruff, mypy, "
-            "eslint, or tsc. Add project-specific prefixes in "
-            "runtime.verification_command_prefixes.",
+            "Run up to four independent single-command verification steps in "
+            "one tool call. If runtime.verification_command_prefixes is set, "
+            "commands must match one of those generic configured prefixes.",
             {
                 "commands": {
                     "type": "array",
@@ -1397,6 +1380,7 @@ class ToolExecutor:
                 artifact=cached.artifact,
                 state_changed=False,
                 cache_hit=True,
+                control_outcome=cached.control_outcome,
             )
         if spec.source == "mcp":
             if spec.approval_mode == "deny":
@@ -1499,11 +1483,12 @@ class ToolExecutor:
         head = self._command_after_leading_cd(command)
         if not head or ";" in head or "&&" in head or "||" in head:
             return False
-        prefixes = (
-            self.verification_command_prefixes
-            or _BUILTIN_VERIFICATION_PREFIXES
+        if not self.verification_command_prefixes:
+            return True
+        return self._matches_command_prefix(
+            head,
+            self.verification_command_prefixes,
         )
-        return self._matches_command_prefix(head, prefixes)
 
     @staticmethod
     def _command_after_leading_cd(command: str) -> str:
@@ -1528,6 +1513,20 @@ class ToolExecutor:
         for prefix in prefixes:
             if text == prefix or text.startswith(prefix + " "):
                 return True
+            try:
+                command_parts = shlex.split(text)
+                prefix_parts = shlex.split(prefix)
+            except ValueError:
+                continue
+            if not command_parts or not prefix_parts:
+                continue
+            if len(command_parts) < len(prefix_parts):
+                continue
+            if Path(command_parts[0]).name != Path(prefix_parts[0]).name:
+                continue
+            if command_parts[1 : len(prefix_parts)] != prefix_parts[1:]:
+                continue
+            return True
         return False
 
     def _truncate(self, value: str, *, prefix: str) -> tuple[str, str | None]:
