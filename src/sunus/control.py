@@ -60,10 +60,16 @@ class TurnController:
         self.clock = clock
         self.started_at: float | None = None
         self.model_calls = 0
+        self.granted_model_call_extensions = 0
+        self.budget_extension_requests = 0
+        self.reviewing_budget = False
         self.tool_calls = 0
         self.total_tokens = 0
         self.no_progress_rounds = 0
         self.round_has_progress = False
+        self.steps_without_state_change = 0
+        self.last_cognitive_checkpoint_tool = 0
+        self.cognitive_checkpoint_count = 0
         self.consecutive_failures = 0
         self.recovery_count = 0
         self.evidence_seen: set[str] = set()
@@ -108,10 +114,17 @@ class TurnController:
         return {
             "profile": self.budget.profile,
             "model_calls": self.model_calls,
+            "base_model_calls": self.base_model_limit,
+            "effective_model_limit": self.effective_model_limit,
+            "granted_model_call_extensions": self.granted_model_call_extensions,
+            "budget_extension_requests": self.budget_extension_requests,
+            "reviewing_budget": self.reviewing_budget,
             "tool_calls": self.tool_calls,
             "elapsed_seconds": round(self.elapsed_seconds(), 3),
             "total_tokens": self.total_tokens,
             "no_progress_rounds": self.no_progress_rounds,
+            "steps_without_state_change": self.steps_without_state_change,
+            "cognitive_checkpoint_count": self.cognitive_checkpoint_count,
             "consecutive_failures": self.consecutive_failures,
             "recovery_count": self.recovery_count,
             "blocked_tools": len(self.blocked_tool_signatures),
@@ -133,12 +146,43 @@ class TurnController:
         )
 
     @property
+    def base_model_limit(self) -> int:
+        return min(
+            max(1, self.budget.base_model_calls),
+            max(1, self.budget.max_model_calls),
+        )
+
+    @property
+    def effective_model_limit(self) -> int:
+        return min(
+            max(1, self.budget.max_model_calls - self.finalization_reserve),
+            self.base_model_limit + self.granted_model_call_extensions,
+        )
+
+    @property
     def tool_model_limit(self) -> int:
-        return max(1, self.budget.max_model_calls - self.finalization_reserve)
+        return self.effective_model_limit
 
     def before_model_call(self) -> str | None:
         self.start()
         self._finalize_previous_round()
+        if (
+            not self.finalizing
+            and not self.reviewing_budget
+            and self.model_calls >= self.effective_model_limit
+            and self.effective_model_limit
+            < max(1, self.budget.max_model_calls - self.finalization_reserve)
+        ):
+            self.reviewing_budget = True
+            self._emit(
+                "budget_review_started",
+                model_calls=self.model_calls,
+                base_model_calls=self.base_model_limit,
+                effective_model_limit=self.effective_model_limit,
+                hard_model_limit=self.budget.max_model_calls,
+                summary="基础模型调用预算已用完，等待显式扩容申请",
+            )
+            return self._budget_review_prompt()
         if (
             self.finalization_reserve > 0
             and not self.finalizing
@@ -194,9 +238,89 @@ class TurnController:
                     search_calls=self.search_calls,
                     summary="搜索达到 4 次，要求收束",
                 )
+            if (
+                recovery is None
+                and not self.finalizing
+                and self.steps_without_state_change
+                >= self.budget.cognitive_checkpoint_after
+                and self.tool_calls - self.last_cognitive_checkpoint_tool
+                >= self.budget.cognitive_checkpoint_repeat
+            ):
+                recovery = self._cognitive_checkpoint_prompt()
+                self.last_cognitive_checkpoint_tool = self.tool_calls
+                self.cognitive_checkpoint_count += 1
+                self._emit(
+                    "cognitive_checkpoint",
+                    count=self.cognitive_checkpoint_count,
+                    steps_without_state_change=self.steps_without_state_change,
+                    summary="连续动作没有改变目标状态，要求重新评估假设",
+                )
         self._emit_warnings()
         self.model_calls += 1
         return recovery
+
+    def _budget_review_prompt(self) -> str:
+        return (
+            "基础模型调用预算已经用完。现在只能二选一："
+            "1. 调用 request_budget_extension，说明尚未完成的具体子目标、"
+            "已排除的假设、下一批动作和所需额外模型调用数；"
+            "2. 直接调用 submit_result 提交当前已完成、部分完成或阻塞结果。"
+            "不得继续调用其他工具，也不得仅因为“可能还需要检查”申请扩容。"
+        )
+
+    def request_budget_extension(
+        self,
+        additional_calls: int,
+        *,
+        reason: str,
+    ) -> tuple[bool, str]:
+        self.budget_extension_requests += 1
+        limit = max(
+            1,
+            self.budget.max_model_calls - self.finalization_reserve,
+        )
+        available = max(0, limit - self.effective_model_limit)
+        requested = max(1, min(20, int(additional_calls)))
+        granted = min(requested, available)
+        if not self.reviewing_budget:
+            self._emit(
+                "budget_extension_denied",
+                requested_calls=requested,
+                reason="尚未进入预算复核阶段",
+                summary="预算扩容请求被拒绝：尚未进入复核阶段",
+            )
+            return False, "当前未进入预算复核阶段，不能申请扩容。"
+        if not str(reason).strip():
+            self._emit(
+                "budget_extension_denied",
+                requested_calls=requested,
+                reason="缺少具体扩容理由",
+                summary="预算扩容请求被拒绝：缺少具体理由",
+            )
+            return False, "扩容申请必须说明尚未完成的子目标和下一批动作。"
+        if granted <= 0:
+            self._emit(
+                "budget_extension_denied",
+                requested_calls=requested,
+                reason="已经达到硬上限",
+                summary="预算扩容请求被拒绝：已经达到硬上限",
+            )
+            return False, "已经达到模型调用硬上限，请提交当前结果。"
+        self.granted_model_call_extensions += granted
+        self.reviewing_budget = False
+        self._emit(
+            "budget_extension_granted",
+            requested_calls=requested,
+            granted_calls=granted,
+            effective_model_limit=self.effective_model_limit,
+            hard_model_limit=self.budget.max_model_calls,
+            reason=str(reason).strip()[:1000],
+            summary=f"预算扩容 +{granted} 次模型调用",
+        )
+        return True, (
+            f"已批准额外 {granted} 次模型调用；当前可用上限 "
+            f"{self.effective_model_limit}。优先执行能一次补足证据缺口的批量检查。"
+        )
 
     def record_usage(self, usage: dict[str, Any] | None) -> None:
         if not usage:
@@ -237,6 +361,20 @@ class TurnController:
             reason = "已进入终态阶段；只能提交结果，不能执行新的工具动作。"
             self._emit(
                 "finalization_tool_blocked",
+                name=name,
+                summary=reason,
+            )
+            return reason
+        if self.reviewing_budget and name not in {
+            "request_budget_extension",
+            "submit_result",
+        }:
+            reason = (
+                "基础模型调用预算已用完；只能申请一次有明确计划的扩容，"
+                "或提交当前结果。"
+            )
+            self._emit(
+                "budget_review_tool_blocked",
                 name=name,
                 summary=reason,
             )
@@ -326,9 +464,15 @@ class TurnController:
                 summary="发现新证据" if not changed_files else "文件状态已变化",
             )
 
+        cognitive_update = name == "update_reasoning_state"
+        if changed_files or state_changed or cognitive_update:
+            self.steps_without_state_change = 0
+        else:
+            self.steps_without_state_change += 1
+
         if ok:
             self.consecutive_failures = 0
-            if changed_files or state_changed:
+            if (changed_files or state_changed) and not cognitive_update:
                 self._clear_failure_state(
                     reason=(
                         "文件状态已变化"
@@ -396,6 +540,22 @@ class TurnController:
             summary=error_label,
         )
         self._check_hard_limits()
+
+    def _cognitive_checkpoint_prompt(self) -> str:
+        return (
+            "认知收束检查点："
+            f"本轮已有 {self.steps_without_state_change} 个连续动作"
+            "没有产生文件或目标状态变化。\n"
+            "不要把“工具返回了不同内容”自动当成目标进展。"
+            "下一步前在内部重新确认：\n"
+            "- 当前子目标、成功判据和证据缺口是什么；\n"
+            "- 最近结果支持、否定，还是仍未触及当前假设；\n"
+            "- 若仍依赖同一假设，停止继续更换同类参数或查询；\n"
+            "- 若假设、子目标或证据缺口确实改变，可用 update_reasoning_state "
+            "写回结构化状态；\n"
+            "- 选择一种能区分剩余假设的不同证据来源。"
+            "如果没有新的可区分检查，应直接回答、提问或如实部分收口。"
+        )
 
     def _clear_failure_state(self, *, reason: str) -> None:
         """A real state change invalidates previous retry thresholds."""

@@ -18,7 +18,6 @@ from sunus.model_events import ModelEvent
 from sunus.model import ModelCancelled, ModelError, ModelReply
 from sunus.policy import ApprovalManager, PathGuard
 from sunus.relationship import RelationshipConfig
-from sunus.scope import classify_request
 from sunus.storage import ArtifactStore, SessionLogger
 from sunus.tools import ToolExecutor, ToolResult
 
@@ -128,6 +127,124 @@ class CapturingReplyModel:
             usage={"prompt_tokens": 10, "completion_tokens": 5},
             finish_reason="stop",
         )
+
+
+class ReflectionToolModel:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.reflection_trace: dict | None = None
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.calls += 1
+        if self.calls == 1:
+            return ModelReply(
+                message={
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_missing_a",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"path":"missing-a.txt"}',
+                            },
+                        },
+                        {
+                            "id": "call_missing_b",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"path":"missing-b.txt"}',
+                            },
+                        },
+                    ],
+                },
+                usage={"prompt_tokens": 10, "completion_tokens": 5},
+                finish_reason="tool_calls",
+            )
+        return ModelReply(
+            message={
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_result",
+                        "type": "function",
+                        "function": {
+                            "name": "submit_result",
+                            "arguments": json.dumps(
+                                {
+                                    "kind": "answer",
+                                    "status": "completed",
+                                    "summary": "目录检查完成。",
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+            },
+            usage={"prompt_tokens": 10, "completion_tokens": 5},
+            finish_reason="tool_calls",
+        )
+
+    def reflect_strategy(self, trace):
+        self.reflection_trace = trace
+        return (
+            {
+                "strategy": "先取得最小目录证据，再判断是否需要深入。",
+                "when_to_use": ["只需确认目录结构"],
+                "avoid_when": ["目标需要文件内容证据"],
+                "decisive_evidence": ["目录返回"],
+                "unproductive_patterns": ["没有明确缺口时重复列目录"],
+                "confidence": 0.7,
+            },
+            {"prompt_tokens": 20, "completion_tokens": 10},
+        )
+
+
+class CleanHighCostReflectionModel(ReflectionToolModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reflection_calls = 0
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        if self.calls == 0:
+            self.calls = 1
+            return ModelReply(
+                message={
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_list_a",
+                            "type": "function",
+                            "function": {
+                                "name": "list_files",
+                                "arguments": '{"path":".","depth":1}',
+                            },
+                        },
+                        {
+                            "id": "call_list_b",
+                            "type": "function",
+                            "function": {
+                                "name": "list_files",
+                                "arguments": '{"path":".","depth":2}',
+                            },
+                        },
+                    ],
+                },
+                usage={"total_tokens": 5},
+                finish_reason="tool_calls",
+            )
+        return super().chat(
+            messages,
+            tools=tools,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+    def reflect_strategy(self, trace):
+        self.reflection_calls += 1
+        return super().reflect_strategy(trace)
 
 
 class SemanticAffectModel(CapturingReplyModel):
@@ -1036,9 +1153,11 @@ class TextualDSMLResultModel:
 class ParallelReadModel:
     def __init__(self) -> None:
         self.calls = 0
+        self.last_messages: list[dict] = []
 
     def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
         self.calls += 1
+        self.last_messages = messages
         if self.calls == 1:
             return ModelReply(
                 message={
@@ -1063,6 +1182,213 @@ class ParallelReadModel:
             message={"role": "assistant", "content": "三个文件已读取。"},
             usage={"total_tokens": 2},
             finish_reason="stop",
+        )
+
+
+class BudgetExtensionModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.calls += 1
+        tool_names = {
+            item["function"]["name"]
+            for item in tools or []
+        }
+        if self.calls == 1:
+            name = "list_files"
+            arguments = {"path": ".", "depth": 1}
+        elif self.calls == 2:
+            if "request_budget_extension" not in tool_names:
+                raise AssertionError("budget extension tool missing")
+            name = "request_budget_extension"
+            arguments = {
+                "additional_calls": 1,
+                "reason": "已定位目录，下一步只需读取目标文件并提交结果。",
+            }
+        else:
+            name = "submit_result"
+            arguments = {
+                "kind": "answer",
+                "status": "completed",
+                "summary": "预算扩展后完成检查。",
+            }
+        return ModelReply(
+            message={
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": f"call_budget_{self.calls}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(
+                                arguments,
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+            },
+            usage={"total_tokens": 5},
+            finish_reason="tool_calls",
+        )
+
+
+class CommandBatchModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.calls += 1
+        if self.calls == 1:
+            name = "run_command_batch"
+            arguments = {
+                "commands": [
+                    {"command": "cat a.txt"},
+                    {"command": "cat b.txt"},
+                ]
+            }
+        else:
+            name = "submit_result"
+            arguments = {
+                "kind": "answer",
+                "status": "completed",
+                "summary": "两个文件已通过一次批量命令读取。",
+            }
+        return ModelReply(
+            message={
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": f"call_batch_{self.calls}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(
+                                arguments,
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+            },
+            usage={"total_tokens": 5},
+            finish_reason="tool_calls",
+        )
+
+
+class BatchPatchModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.calls += 1
+        if self.calls == 1:
+            name = "patch_file_batch"
+            arguments = {
+                "edits": [
+                    {
+                        "path": "note.txt",
+                        "old_text": "alpha",
+                        "new_text": "ALPHA",
+                    },
+                    {
+                        "path": "note.txt",
+                        "old_text": "beta",
+                        "new_text": "BETA",
+                    },
+                ]
+            }
+        else:
+            name = "submit_result"
+            arguments = {
+                "kind": "change_report",
+                "status": "completed",
+                "summary": "两处替换已通过一次批量调用完成。",
+                "changes": [
+                    {
+                        "path": "note.txt",
+                        "action": "modified",
+                        "purpose": "同步替换两个标记",
+                    }
+                ],
+            }
+        return ModelReply(
+            message={
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": f"call_patch_batch_{self.calls}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(
+                                arguments,
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+            },
+            usage={"total_tokens": 5},
+            finish_reason="tool_calls",
+        )
+
+
+class ApplyAndVerifyModel:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(self, messages, *, tools=None, max_tokens=None, temperature=0.2):
+        self.calls += 1
+        if self.calls == 1:
+            name = "apply_and_verify"
+            arguments = {
+                "edits": [
+                    {
+                        "path": "note.txt",
+                        "old_text": "alpha",
+                        "new_text": "beta",
+                    }
+                ],
+                "verification_commands": [
+                    {"command": "python3 -m unittest --help"},
+                ],
+            }
+        else:
+            name = "submit_result"
+            arguments = {
+                "kind": "change_report",
+                "status": "completed",
+                "summary": "修改与验证已在一次工具调用中完成。",
+                "changes": [
+                    {
+                        "path": "note.txt",
+                        "action": "modified",
+                        "purpose": "完成单处修改",
+                    }
+                ],
+            }
+        return ModelReply(
+            message={
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": f"call_apply_verify_{self.calls}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(
+                                arguments,
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ],
+            },
+            usage={"total_tokens": 5},
+            finish_reason="tool_calls",
         )
 
 
@@ -1134,7 +1460,6 @@ class AgentTests(unittest.TestCase):
             tools.begin_request(f"把文件写到 {diary / 'note.md'}")
             schemas = agent._request_tool_schemas(
                 tools.schemas(),
-                tools.request_scope or classify_request("只是聊聊天"),
                 conversation=False,
             )
             names = {
@@ -1143,8 +1468,189 @@ class AgentTests(unittest.TestCase):
             }
 
             self.assertIn("write_file", names)
+            self.assertIn("write_file_batch", names)
+            self.assertIn("patch_file_batch", names)
+            self.assertIn("apply_and_verify", names)
+            self.assertIn("run_command_batch", names)
+            self.assertIn("verification_batch", names)
+            self.assertIn("fetch_url_batch", names)
             self.assertIn("configure_permissions", names)
             self.assertIn("schedule_proactive_file_write", names)
+            memory.close()
+
+    def test_high_cost_turn_records_model_strategy_reflection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            (root / "note.txt").write_text("content", encoding="utf-8")
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+                loop_budget=LoopBudgetConfig(
+                    strategy_reflection_after=1,
+                ),
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_reflection", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=True,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+            )
+            model = ReflectionToolModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("请列出当前目录")
+
+            self.assertEqual(result.reason, "completed")
+            self.assertIsNotNone(model.reflection_trace)
+            self.assertEqual(
+                model.reflection_trace["objective"],  # type: ignore[index]
+                "请列出当前目录",
+            )
+            rows = memory.search(
+                "候选策略复盘",
+                scope=str(root.resolve()),
+                limit=5,
+            )
+            self.assertTrue(
+                any(
+                    row.get("source") == "model_strategy_reflection"
+                    for row in rows
+                )
+            )
+            events_text = events.path.read_text(encoding="utf-8")
+            self.assertIn('"type":"strategy_reflection_recorded"', events_text)
+            event_types = [
+                json.loads(line).get("type")
+                for line in events_text.splitlines()
+                if line.strip()
+            ]
+            self.assertLess(
+                event_types.index("turn_end"),
+                event_types.index("strategy_reflection_recorded"),
+            )
+            memory.close()
+
+    def test_clean_high_cost_turn_skips_strategy_reflection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+                loop_budget=LoopBudgetConfig(
+                    strategy_reflection_after=1,
+                ),
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_reflection_skip", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+            )
+            model = CleanHighCostReflectionModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("检查当前目录")
+
+            self.assertEqual(result.reason, "completed")
+            self.assertEqual(model.reflection_calls, 0)
+            self.assertIn(
+                "strategy_reflection_skipped",
+                events.path.read_text(encoding="utf-8"),
+            )
+            memory.close()
+
+    def test_agent_requests_and_uses_explicit_budget_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            (root / "note.txt").write_text("content", encoding="utf-8")
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=3,
+                loop_budget=LoopBudgetConfig(
+                    base_model_calls=1,
+                    max_model_calls=3,
+                    finalization_reserve=1,
+                ),
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_budget_extension", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+            )
+            model = BudgetExtensionModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("检查当前目录")
+
+            self.assertEqual(result.reason, "completed")
+            self.assertIn("预算扩展后完成检查", result.text)
+            events_text = events.path.read_text(encoding="utf-8")
+            self.assertIn("budget_review_started", events_text)
+            self.assertIn("budget_extension_granted", events_text)
             memory.close()
 
     def test_tool_loop_and_receipt(self) -> None:
@@ -1392,7 +1898,7 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(result.reason, "completed")
             self.assertEqual(model.calls, 2)
             self.assertIn("request_authorization", model.tool_name_sets[0])
-            self.assertNotIn("patch_file", model.tool_name_sets[0])
+            self.assertIn("patch_file", model.tool_name_sets[0])
             self.assertIn("patch_file", model.tool_name_sets[1])
             self.assertIn("run_command", model.tool_name_sets[1])
             memory.close()
@@ -1614,7 +2120,7 @@ class AgentTests(unittest.TestCase):
 
             agent = Agent(
                 config=config,
-                model=ParallelReadModel(),  # type: ignore[arg-type]
+                model=(parallel_model := ParallelReadModel()),  # type: ignore[arg-type]
                 memory=memory,
                 tools=tools,
                 events=events,
@@ -1632,6 +2138,182 @@ class AgentTests(unittest.TestCase):
             self.assertIn(
                 "parallel_tool_batch",
                 events.path.read_text(encoding="utf-8"),
+            )
+            tool_messages = [
+                message
+                for message in parallel_model.last_messages
+                if message.get("role") == "tool"
+            ]
+            self.assertEqual(
+                [message.get("tool_call_id") for message in tool_messages],
+                ["call_0", "call_1", "call_2"],
+            )
+            self.assertTrue(
+                all(
+                    "content 0" in message.get("content", "")
+                    or "content 1" in message.get("content", "")
+                    or "content 2" in message.get("content", "")
+                    for message in tool_messages
+                )
+            )
+            memory.close()
+
+    def test_command_batch_uses_one_tool_round_for_two_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            (root / "a.txt").write_text("alpha", encoding="utf-8")
+            (root / "b.txt").write_text("beta", encoding="utf-8")
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_command_batch", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = CommandBatchModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("检查 a.txt 和 b.txt")
+
+            self.assertEqual(result.reason, "completed")
+            self.assertEqual(model.calls, 2)
+            self.assertEqual(
+                [trace["name"] for trace in result.tool_traces],
+                ["run_command_batch", "submit_result"],
+            )
+            self.assertIn(
+                "两个文件已通过一次批量命令读取",
+                result.text,
+            )
+            memory.close()
+
+    def test_batch_patch_uses_one_tool_round_for_two_edits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            path = root / "note.txt"
+            path.write_text("alpha\nbeta\n", encoding="utf-8")
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_patch_batch", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = BatchPatchModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("修改 note.txt 中的两个标记")
+
+            self.assertEqual(result.reason, "completed")
+            self.assertEqual(model.calls, 2)
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                "ALPHA\nBETA\n",
+            )
+            self.assertEqual(
+                [trace["name"] for trace in result.tool_traces],
+                ["patch_file_batch", "submit_result"],
+            )
+            memory.close()
+
+    def test_apply_and_verify_uses_one_tool_round(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            path = root / "note.txt"
+            path.write_text("alpha\n", encoding="utf-8")
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            events = EventBus(data)
+            session = SessionLogger("s_apply_verify", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = ApplyAndVerifyModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+
+            result = agent.run_turn("修改 note.txt 并运行验证")
+
+            self.assertEqual(result.reason, "completed")
+            self.assertEqual(model.calls, 2)
+            self.assertEqual(path.read_text(encoding="utf-8"), "beta\n")
+            self.assertEqual(
+                [trace["name"] for trace in result.tool_traces],
+                ["apply_and_verify", "submit_result"],
             )
             memory.close()
 
@@ -2418,7 +3100,9 @@ class AgentTests(unittest.TestCase):
             self.assertIn("stage_directions_removed", events_text)
             memory.close()
 
-    def test_consultation_filters_unauthorized_command_tool(self) -> None:
+    def test_consultation_exposes_side_effect_tools_behind_runtime_approval(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "workspace"
             root.mkdir()
@@ -2461,8 +3145,8 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(result.reason, "completed")
             self.assertIn("read_file", model.tool_names)
             self.assertIn("submit_result", model.tool_names)
-            self.assertNotIn("run_command", model.tool_names)
-            self.assertNotIn("write_file", model.tool_names)
+            self.assertIn("run_command", model.tool_names)
+            self.assertIn("write_file", model.tool_names)
             system_prompt = model.last_messages[0]["content"]
             self.assertIn(f"权威运行数据目录：{data.resolve()}", system_prompt)
             self.assertIn(
@@ -2472,7 +3156,10 @@ class AgentTests(unittest.TestCase):
             self.assertIn("仍不唯一或不存在时，向用户询问一个明确路径", system_prompt)
             self.assertIn("本轮未注入某项工具", system_prompt)
             self.assertIn("不代表 Sunus 永久没有该能力", system_prompt)
-            self.assertIn("未开放: fetch_url, patch_file, run_command", system_prompt)
+            self.assertIn(
+                "未预先授权的调用会由运行时请求明确授权",
+                system_prompt,
+            )
             memory.close()
 
     def test_mutation_exposes_command_tool_for_verification(self) -> None:
@@ -2672,7 +3359,7 @@ class AgentTests(unittest.TestCase):
                 item for item in result.tool_traces if item["name"] == "write_file"
             )
             self.assertFalse(write_trace["ok"])
-            self.assertIn("没有明确要求", write_trace["content"])
+            self.assertIn("需要明确授权", write_trace["content"])
             memory.close()
 
     def test_unexpected_exception_still_writes_failure_receipt(self) -> None:

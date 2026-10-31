@@ -252,6 +252,12 @@ class ModelClient(Protocol):
     ) -> tuple[str, dict[str, Any]]:
         ...
 
+    def reflect_strategy(
+        self,
+        trace: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        ...
+
 
 class BaseModelClient:
     def __init__(self, config: RuntimeConfig) -> None:
@@ -436,11 +442,11 @@ class BaseModelClient:
         headers["Accept"] = "text/event-stream"
 
         self._cancel_event.clear()
-        connection: http.client.HTTPConnection | None = None
-        response: http.client.HTTPResponse | None = None
         last_error = ""
         for attempt in range(3):
-            connected = False
+            connection: http.client.HTTPConnection | None = None
+            response: http.client.HTTPResponse | None = None
+            emitted_stream_data = False
             try:
                 connection = self._open_connection(parsed)
                 with self._connection_lock:
@@ -456,9 +462,32 @@ class BaseModelClient:
                         f"HTTP {response.status} {response.reason}: "
                         f"{redact_text(raw, self.config.api_key)[:1000]}"
                     )
-                connected = True
-                break
+
+                data_lines: list[str] = []
+                while True:
+                    if self._cancel_event.is_set():
+                        raise ModelCancelled("思考已中断")
+                    raw_line = response.readline()
+                    if not raw_line:
+                        break
+                    line = raw_line.decode(
+                        "utf-8",
+                        errors="replace",
+                    ).rstrip("\r\n")
+                    if line.startswith("data:"):
+                        data_lines.append(line[5:].lstrip())
+                        continue
+                    if line == "" and data_lines:
+                        emitted_stream_data = True
+                        yield "\n".join(data_lines)
+                        data_lines.clear()
+                if data_lines:
+                    emitted_stream_data = True
+                    yield "\n".join(data_lines)
+                return
             except ModelCancelled:
+                raise
+            except ModelError:
                 raise
             except (
                 http.client.HTTPException,
@@ -466,38 +495,24 @@ class BaseModelClient:
                 OSError,
                 TimeoutError,
                 socket.timeout,
+                ValueError,
+                AttributeError,
             ) as error:
-                self._release_connection(connection)
-                last_error = redact_text(error, self.config.api_key)
-                if attempt < 2:
+                last_error = redact_text(
+                    f"{type(error).__name__}: {error}",
+                    self.config.api_key,
+                )
+                # A malformed or prematurely closed chunked response can be
+                # retried safely only before any SSE data reached the caller.
+                if not emitted_stream_data and attempt < 2:
                     time.sleep(1.5 * (attempt + 1))
                     continue
-                raise ModelError(f"模型流式请求失败: {last_error}") from error
+                raise ModelError(
+                    f"模型流式响应中断: {last_error}"
+                ) from error
             finally:
-                if not connected and connection is not None:
-                    self._release_connection(connection)
-        if connection is None or response is None:
-            raise ModelError(f"模型流式请求失败: {last_error}")
-
-        data_lines: list[str] = []
-        try:
-            while True:
-                if self._cancel_event.is_set():
-                    raise ModelCancelled("思考已中断")
-                raw_line = response.readline()
-                if not raw_line:
-                    break
-                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
-                if line.startswith("data:"):
-                    data_lines.append(line[5:].lstrip())
-                    continue
-                if line == "" and data_lines:
-                    yield "\n".join(data_lines)
-                    data_lines.clear()
-            if data_lines:
-                yield "\n".join(data_lines)
-        finally:
-            self._release_connection(connection)
+                self._release_connection(connection)
+        raise ModelError(f"模型流式响应中断: {last_error or '未知错误'}")
 
     def list_models(self) -> list[str]:
         payload = self._request("GET", "/models")
@@ -631,6 +646,65 @@ class BaseModelClient:
             if reply.finish_reason != "length":
                 break
         raise ModelError("回合类型判别没有返回 CASUAL 或 TASK")
+
+    def reflect_strategy(
+        self,
+        trace: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Summarize a completed decision trace into a reusable candidate strategy."""
+        system = (
+            "你是 Sunus 的策略复盘器。只根据给定的可观察目标、工具动作、"
+            "状态变化、结果和成本进行归纳，不猜测隐藏思维过程。\n"
+            "提炼一条可在相似任务中检验的候选策略，必须说明适用条件、"
+            "反例条件、决定性证据和低信息增益动作。不要写站点固定脚本，"
+            "也不要从单次事件断言普遍规律。只输出 JSON object，字段为：\n"
+            "strategy: string\n"
+            "when_to_use: string[]\n"
+            "avoid_when: string[]\n"
+            "decisive_evidence: string[]\n"
+            "unproductive_patterns: string[]\n"
+            "confidence: number between 0 and 1"
+        )
+        user = json.dumps(trace, ensure_ascii=False, default=str)
+        complete_with_usage = getattr(self, "complete_with_usage", None)
+        if callable(complete_with_usage):
+            content, usage = complete_with_usage(
+                system,
+                user,
+                max_tokens=1600,
+                temperature=0,
+            )
+            content = str(content or "").strip()
+        else:
+            reply = self.chat(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                tools=None,
+                max_tokens=1600,
+                temperature=0,
+            )
+            content = str(reply.message.get("content") or "").strip()
+            usage = {
+                key: value
+                for key, value in reply.usage.items()
+                if isinstance(value, (int, float))
+            }
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*", "", content)
+            content = re.sub(r"\s*```$", "", content)
+        start = content.find("{")
+        end = content.rfind("}")
+        if start < 0 or end < start:
+            raise ModelError("策略复盘没有返回 JSON object")
+        try:
+            payload = json.loads(content[start : end + 1])
+        except json.JSONDecodeError as error:
+            raise ModelError(f"策略复盘 JSON 无法解析: {error}") from error
+        if not isinstance(payload, dict) or not str(payload.get("strategy") or "").strip():
+            raise ModelError("策略复盘缺少 strategy")
+        return payload, usage
 
 
 class ChatCompletionsClient(BaseModelClient):

@@ -158,20 +158,33 @@ Sunus/
 
 `TurnController` 同时监控多个维度，避免只限制模型轮次：
 
-| Profile | 模型调用 | 工具调用 | 墙钟时间 | 总 Token | 单次回答 Token | 终态预留 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `quick` | 8 | 24 | 3 分钟 | 50,000 | 1,024 | 1 |
-| `standard` | 60 | 180 | 60 分钟 | 2,000,000 | 8,192 | 2 |
-| `deep` | 120 | 360 | 120 分钟 | 4,000,000 | 16,384 | 2 |
+| Profile | 基础模型调用 | 硬上限 | 工具调用 | 墙钟时间 | 总 Token | 单次回答 Token | 终态预留 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `quick` | 6 | 8 | 24 | 3 分钟 | 50,000 | 1,024 | 1 |
+| `standard` | 20 | 60 | 180 | 60 分钟 | 2,000,000 | 8,192 | 2 |
+| `deep` | 40 | 120 | 360 | 120 分钟 | 4,000,000 | 16,384 | 2 |
 
 ```bash
 sunus --budget quick
 sunus --budget deep
 ```
 
+基础模型调用预算耗尽后，运行时只向模型暴露
+`request_budget_extension` 和 `submit_result`。模型必须说明尚未完成的子目标、
+已排除假设和下一批动作，最多一次申请 20 次；批准量同时受硬上限和终态预留约束。
+扩容会记录 `budget_review_started`、`budget_extension_granted` 或
+`budget_extension_denied` 事件，不会静默提高预算。
+
 控制器追踪新证据、文件变化、重复动作和连续失败。连续 2 轮无新证据或同类错误重复 2 次时，会注入结构化恢复契约：列出目标、证据缺口、失败动作签名、当前实际可用能力和相关记忆召回，由模型自主提出下一步；代码不维护固定工具替代表。继续跨动作无改善则熔断。
 同一个工具以完全相同参数返回完全相同的证据后，该调用签名会被视为无增益重复；
 下一次相同调用直接阻止。文件或外部状态发生变化后解除该阻止。
+
+控制器还会单独统计连续“有返回、但文件或目标状态没有变化”的动作。达到
+`cognitive_checkpoint_after` 后注入认知收束检查点，要求模型重新确认子目标、
+成功判据、当前假设和证据缺口；返回内容不同本身不再被当作目标进展。该机制不
+规定应使用哪种工具，只要求下一次选择能区分剩余假设的证据来源。复杂任务开始、
+真正切换假设或完成收束检查后，模型可用 `update_reasoning_state` 将当前子目标、
+假设、证据缺口、成功判据和决策说明写回任务状态；该工具不执行外部副作用。
 
 恢复阶段沿用同一认知自主契约，不另设固定算子组合；模型可自行判断是否需要类比、批判、决策优化、元认知或其他视角：
 
@@ -182,7 +195,13 @@ sunus --budget deep
 
 错误指纹包含工具、退出码或异常类型，并对错误正文中的时间戳、PID、临时路径、UUID 和内存地址做归一化。进入恢复阶段后，已经失败的具体调用签名会被阻止；不同参数、不同工具或不同证据源仍由模型根据信息增益判断。恢复时召回的策略记忆只作为候选，不是强制路线；单次成功不会直接升级为长期规则。
 
-命令执行还会检查被管道掩盖的失败，例如退出码为 0 但输出中出现 Python traceback、命令不存在或 DNS 失败。此时运行时标记语义失败，而不是把整条命令视为成功。
+命令执行默认启用 `pipefail`，并继续检查输出中的 Python traceback、命令不存在、
+DNS 失败和 Playwright 操作超时。被管道或复合命令掩盖的失败不会再只凭末尾退出码
+被当作成功。
+
+高成本任务结束后，模型会基于目标、工具动作、状态变化、耗时和结果提炼一条候选
+策略，记录适用条件、反例条件、决定性证据和低信息增益模式。候选策略不会因单次
+事件直接升级为长期规则；复用后的结果继续通过现有策略信用机制升级或降权。
 
 接近模型轮次上限，或累计 Token 达到 `warning_ratio`（默认 80%）时，会提前预留 1-2 次终态调用。终态阶段只向模型暴露 `submit_result`，禁止读取、执行、安装或修改；模型必须基于已有证据提交 `completed`、`partial` 或 `blocked` 结果。即使终态请求使本次总 Token 超过硬上限，合法 `submit_result` 仍会被接收，不能被预算检查提前拦截。
 
@@ -237,9 +256,10 @@ Sunus 的最终回答默认遵循：
 判定失败时默认按任务模式继续，避免把待生成正文截断在 512 tokens。明确的技术
 问题、授权动作和社交问候仍走规则快速路径，不额外调用模型。
 
-技术问答仍可按需使用只读工具；当前消息没有授权的写文件、shell 和联网工具
-不会直接出现。任务确实需要时，模型可调用 `request_authorization` 发起授权菜单；
-批准后立即刷新当前回合的工具列表。
+技术问答与任务模式会按需挂载只读及副作用工具。写文件、shell 和联网操作不再
+依赖固定关键词判断；若当前任务尚无对应授权，运行时会按能力和实际参数弹出
+明确确认，批准后在本任务内复用。也可先用 `request_authorization` 为多步骤任务
+预先申请能力。
 
 ### 结构化终态
 
@@ -335,12 +355,18 @@ Tab/Esc 仍只用于打断。取消下一轮输入会同时清空暂存。
 | `inspect_runtime_history` | 查询最近会话、最近失败、365 天错误趋势或单回合时间线，只返回有界摘要。 |
 | `memory_context_metrics` | 统计当前查询实际注入的偏好、召回记忆字符数和无依赖 Token 估算；只读，并标记 `exact=false`。 |
 | `write_file` | 创建或完整覆盖文件。 |
+| `write_file_batch` | 一次校验并写入最多 20 个独立文件。 |
 | `write_document` | 按固定模板生成带元数据和必选章节的 Markdown 文档。 |
 | `patch_file` | 替换一个文件中的精确文本。 |
+| `patch_file_batch` | 一次校验并应用最多 20 处精确替换，支持同文件多 hunk 或多文件。 |
+| `apply_and_verify` | 一次提交多处替换，并在落盘后运行最多 4 条明确验证命令。 |
 | `configure_permissions` | 在用户明确授意后持久化权限模式和写入白名单。 |
 | `schedule_proactive_file_write` | 把用户明确要求的后续文件写入保存为一次性或每日主动待办。 |
 | `run_command` | 在工作区运行 shell 命令，返回退出码和输出。 |
+| `run_command_batch` | 一次并发执行最多 4 条互不依赖的 R0 或已配置只读命令，并分别返回退出码、stdout 和 stderr。 |
+| `verification_batch` | 一次并发执行最多 4 条独立验证命令，支持 pytest、unittest、npm/cargo/go test、ruff、mypy、eslint、tsc 和自定义前缀。 |
 | `fetch_url` | 获取 HTTP(S) 文本，属于高风险网络操作。 |
+| `fetch_url_batch` | 一次并发获取最多 5 个独立 HTTP(S) URL，并分别返回内容。 |
 | `list_skills` | 列出本地技能及适用场景。 |
 | `read_skill` | 读取某个技能的完整流程。 |
 | `submit_result` | 提交最终结构化结果；校验通过后结束回合。 |
@@ -349,7 +375,8 @@ Tab/Esc 仍只用于打断。取消下一轮输入会同时清空暂存。
 再读取候选文件的相关行。即使全部历史都有错误，也只向模型返回聚合结果和少量
 最新样本；只有用户指定时间/turn_id 时才下钻原始记录。
 
-跨轮 `TaskState` 保存目标、约束、所需能力、已获证据、尝试路径和阻塞类型。
+跨轮 `TaskState` 保存目标、约束、成功判据、当前子目标、证据缺口、已尝试证据层、
+决策日志、连续无状态变化步骤、已获证据、尝试路径和阻塞类型。
 复杂任务在首次工具调用前执行规划检查点；工具失败先归因为权限、路径、超时、
 模型或验证失败，再选择恢复路径。工具只是取证手段，不参与认知路线或思维轮次
 的计数。每次取证后都要重新判断：它消除了哪个未知、改变了哪个判断、缩小了
@@ -362,8 +389,28 @@ Tab/Esc 仍只用于打断。取消下一轮输入会同时清空暂存。
 完整工具输出硬上限仍为 60,000 字符。
 
 工具由 `ToolRegistry` 统一注册。只读且无请求间依赖的工具可以在同一轮模型中
-有限并行执行，默认最多 4 个；结果仍按原始 `tool_calls` 顺序回填。写文件、
-命令、网络、MCP 工具和 `submit_result` 始终串行，`submit_result` 是终止屏障。
+有限并行执行，默认最多 4 个；每个结果按原始 `tool_call_id` 回填，所有结果
+到齐后只进入下一次模型采样。多个独立只读 shell 检查优先合并为一次
+`run_command_batch`，其内部同样并发执行并聚合成一个工具结果。写文件、单条
+命令、MCP 工具和 `submit_result` 保持串行；独立 URL 可用
+`fetch_url_batch`，独立验证可用 `verification_batch`。
+同一轮内完全相同的成功只读工具结果会直接复用；任何状态变化或副作用工具会
+清空该轮缓存。
+已经确认的多处代码修改应合并为一次 `patch_file_batch`：运行时先校验全部路径、
+匹配次数和替换结果，再统一写入；任一编辑无效时不落盘。该优化适用于任意项目，
+不依赖具体知识库或脚本。
+独立生成多个文件时使用 `write_file_batch`；修改和验证参数已经同时明确时使用
+`apply_and_verify`。项目自己的只读查询程序或验证程序可通过运行时前缀配置纳入
+通用批次，不需要为项目新增专用工具：
+
+```json
+{
+  "runtime": {
+    "read_only_command_prefixes": ["./probe.sh"],
+    "verification_command_prefixes": ["./verify.sh --fast"]
+  }
+}
+```
 
 stdio MCP 使用用户级 `~/.sunus/config.json` 配置。MCP 工具默认风险为 R2，
 默认要求审批，不继承任务的 R1 自动授权：
@@ -372,7 +419,9 @@ stdio MCP 使用用户级 `~/.sunus/config.json` 配置。MCP 工具默认风险
 {
   "runtime": {
     "streaming": true,
-    "max_parallel_tools": 4
+    "max_parallel_tools": 4,
+    "read_only_command_prefixes": [],
+    "verification_command_prefixes": []
   },
   "mcp_servers": {
     "docs": {
@@ -853,6 +902,8 @@ sunus config relationship --clear
   "model_options": {},
   "budget": {
     "profile": "standard",
+    "base_model_calls": 20,
+    "max_model_calls": 60,
     "no_progress_soft": 2,
     "no_progress_hard": 3,
     "same_error_soft": 2,
@@ -864,6 +915,9 @@ sunus config relationship --clear
     "context_hard_tokens": 96000,
     "context_keep_recent": 24,
     "context_summary_chars": 16000,
+    "cognitive_checkpoint_after": 5,
+    "cognitive_checkpoint_repeat": 4,
+    "strategy_reflection_after": 8,
     "max_response_tokens": 8192,
     "max_total_tokens": 2000000
   },

@@ -183,6 +183,7 @@ experimental_bearer_token ="sk-test-secret-value"
                 ),
             )
             self.assertEqual(config.loop_budget.profile, "standard")
+            self.assertEqual(config.loop_budget.base_model_calls, 20)
             self.assertEqual(config.loop_budget.max_model_calls, 60)
             self.assertEqual(config.loop_budget.max_response_tokens, 8192)
             self.assertEqual(config.loop_budget.finalization_reserve, 2)
@@ -190,6 +191,18 @@ experimental_bearer_token ="sk-test-secret-value"
             self.assertEqual(config.loop_budget.context_hard_tokens, 96_000)
             self.assertEqual(config.loop_budget.context_keep_recent, 24)
             self.assertEqual(config.loop_budget.context_summary_chars, 16_000)
+            self.assertEqual(
+                config.loop_budget.cognitive_checkpoint_after,
+                5,
+            )
+            self.assertEqual(
+                config.loop_budget.cognitive_checkpoint_repeat,
+                4,
+            )
+            self.assertEqual(
+                config.loop_budget.strategy_reflection_after,
+                8,
+            )
             self.assertEqual(config.loop_budget.max_total_tokens, 2_000_000)
             self.assertNotIn("sk-test-env", repr(config))
             mode = stat.S_IMODE(data.stat().st_mode)
@@ -351,6 +364,7 @@ experimental_bearer_token ="sk-test-secret-value"
                     budget_profile="quick",
                 )
             self.assertEqual(config.loop_budget.profile, "quick")
+            self.assertEqual(config.loop_budget.base_model_calls, 6)
             self.assertEqual(config.loop_budget.max_model_calls, 8)
             self.assertEqual(config.loop_budget.max_tool_calls, 77)
             self.assertEqual(config.loop_budget.max_response_tokens, 1024)
@@ -376,6 +390,46 @@ experimental_bearer_token ="sk-test-secret-value"
             self.assertEqual(config.loop_budget.max_total_tokens, 4_000_000)
             self.assertEqual(config.loop_budget.max_response_tokens, 16_384)
             self.assertEqual(config.max_tokens, 16_384)
+
+    def test_runtime_command_prefixes_are_validated_and_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            data = root / "data"
+            data.mkdir()
+            (data / "config.json").write_text(
+                json.dumps(
+                    {
+                        "runtime": {
+                            "read_only_command_prefixes": [
+                                "./probe.sh",
+                                "./probe.sh",
+                            ],
+                            "verification_command_prefixes": [
+                                "./verify.sh",
+                            ],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {
+                    "SUNUS_DATA_DIR": str(data),
+                    "SUNUS_API_KEY": "sk-test",
+                },
+                clear=True,
+            ):
+                config = resolve_config(root / "workspace")
+
+            self.assertEqual(
+                config.read_only_command_prefixes,
+                ("./probe.sh",),
+            )
+            self.assertEqual(
+                config.verification_command_prefixes,
+                ("./verify.sh",),
+            )
 
     def test_proactive_topic_gender_and_custom_focus(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

@@ -43,6 +43,7 @@ PERSONA_CONTEXT_LABELS: dict[str, str] = {
 }
 LOOP_BUDGET_PROFILES: dict[str, dict[str, int | float]] = {
     "quick": {
+        "base_model_calls": 6,
         "max_model_calls": 8,
         "max_tool_calls": 24,
         "max_wall_seconds": 180,
@@ -54,8 +55,12 @@ LOOP_BUDGET_PROFILES: dict[str, dict[str, int | float]] = {
         "context_hard_tokens": 24_000,
         "context_keep_recent": 10,
         "context_summary_chars": 8_000,
+        "cognitive_checkpoint_after": 3,
+        "cognitive_checkpoint_repeat": 3,
+        "strategy_reflection_after": 4,
     },
     "standard": {
+        "base_model_calls": 20,
         "max_model_calls": 60,
         "max_tool_calls": 180,
         "max_wall_seconds": 3600,
@@ -66,8 +71,12 @@ LOOP_BUDGET_PROFILES: dict[str, dict[str, int | float]] = {
         "context_hard_tokens": 96_000,
         "context_keep_recent": 24,
         "context_summary_chars": 16_000,
+        "cognitive_checkpoint_after": 5,
+        "cognitive_checkpoint_repeat": 4,
+        "strategy_reflection_after": 8,
     },
     "deep": {
+        "base_model_calls": 40,
         "max_model_calls": 120,
         "max_tool_calls": 360,
         "max_wall_seconds": 7200,
@@ -78,6 +87,9 @@ LOOP_BUDGET_PROFILES: dict[str, dict[str, int | float]] = {
         "context_hard_tokens": 960_000,
         "context_keep_recent": 64,
         "context_summary_chars": 64_000,
+        "cognitive_checkpoint_after": 8,
+        "cognitive_checkpoint_repeat": 6,
+        "strategy_reflection_after": 12,
     },
 }
 
@@ -134,6 +146,7 @@ class ModelSettings:
 @dataclass(frozen=True)
 class LoopBudgetConfig:
     profile: str = "standard"
+    base_model_calls: int = 20
     max_model_calls: int = 60
     max_tool_calls: int = 180
     max_wall_seconds: int = 3600
@@ -151,6 +164,9 @@ class LoopBudgetConfig:
     context_hard_tokens: int = 96_000
     context_keep_recent: int = 24
     context_summary_chars: int = 16_000
+    cognitive_checkpoint_after: int = 5
+    cognitive_checkpoint_repeat: int = 4
+    strategy_reflection_after: int = 8
 
 
 @dataclass(frozen=True)
@@ -241,6 +257,8 @@ class RuntimeConfig:
     persona: PersonaConfig = field(default_factory=PersonaConfig)
     mcp_servers: tuple[MCPServerConfig, ...] = ()
     max_parallel_tools: int = 4
+    read_only_command_prefixes: tuple[str, ...] = ()
+    verification_command_prefixes: tuple[str, ...] = ()
     streaming: bool = True
     core_identity: CoreIdentityState = field(default_factory=CoreIdentityState)
 
@@ -831,6 +849,26 @@ def resolve_config(
     runtime_payload = user.get("runtime", {})
     if not isinstance(runtime_payload, dict):
         raise ConfigError("runtime 必须是 JSON object")
+    command_prefixes: dict[str, tuple[str, ...]] = {}
+    for key in (
+        "read_only_command_prefixes",
+        "verification_command_prefixes",
+    ):
+        raw_prefixes = runtime_payload.get(key, [])
+        if not isinstance(raw_prefixes, list):
+            raise ConfigError(f"runtime.{key} 必须是字符串数组")
+        values = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for value in raw_prefixes
+                if str(value).strip()
+            )
+        )
+        if len(values) > 32:
+            raise ConfigError(f"runtime.{key} 最多允许 32 项")
+        if any(len(value) > 300 for value in values):
+            raise ConfigError(f"runtime.{key} 单条前缀不能超过 300 字符")
+        command_prefixes[key] = values
     permissions_payload = runtime_payload.get("permissions", {})
     if not isinstance(permissions_payload, dict):
         raise ConfigError("runtime.permissions 必须是 JSON object")
@@ -942,6 +980,7 @@ def resolve_config(
             for key, value in budget_payload.items()
             if key
             in {
+                "base_model_calls",
                 "max_model_calls",
                 "max_tool_calls",
                 "max_wall_seconds",
@@ -959,6 +998,9 @@ def resolve_config(
                 "context_hard_tokens",
                 "context_keep_recent",
                 "context_summary_chars",
+                "cognitive_checkpoint_after",
+                "cognitive_checkpoint_repeat",
+                "strategy_reflection_after",
             }
         }
     )
@@ -979,6 +1021,13 @@ def resolve_config(
     )
     loop_budget = LoopBudgetConfig(
         profile=profile,
+        base_model_calls=max(
+            1,
+            min(
+                int(budget_values["max_model_calls"]),
+                int(budget_values["base_model_calls"]),
+            ),
+        ),
         max_model_calls=max(1, int(budget_values["max_model_calls"])),
         max_tool_calls=max(1, int(budget_values["max_tool_calls"])),
         max_wall_seconds=max(1, int(budget_values["max_wall_seconds"])),
@@ -1003,6 +1052,18 @@ def resolve_config(
         context_summary_chars=max(
             1_000,
             int(budget_values["context_summary_chars"]),
+        ),
+        cognitive_checkpoint_after=max(
+            2,
+            int(budget_values["cognitive_checkpoint_after"]),
+        ),
+        cognitive_checkpoint_repeat=max(
+            1,
+            int(budget_values["cognitive_checkpoint_repeat"]),
+        ),
+        strategy_reflection_after=max(
+            1,
+            int(budget_values["strategy_reflection_after"]),
         ),
     )
     return RuntimeConfig(
@@ -1034,6 +1095,12 @@ def resolve_config(
             1,
             min(16, int(runtime_payload.get("max_parallel_tools", 4))),
         ),
+        read_only_command_prefixes=command_prefixes[
+            "read_only_command_prefixes"
+        ],
+        verification_command_prefixes=command_prefixes[
+            "verification_command_prefixes"
+        ],
         streaming=bool(runtime_payload.get("streaming", True)),
         core_identity=core_identity,
     )
@@ -1136,6 +1203,12 @@ def config_summary(config: RuntimeConfig) -> dict[str, Any]:
         "runtime": {
             "streaming": config.streaming,
             "max_parallel_tools": config.max_parallel_tools,
+            "read_only_command_prefixes": list(
+                config.read_only_command_prefixes
+            ),
+            "verification_command_prefixes": list(
+                config.verification_command_prefixes
+            ),
             "permissions": {
                 **dict(config.permission_modes),
                 "write_allowlist": [
@@ -1169,6 +1242,7 @@ def config_summary(config: RuntimeConfig) -> dict[str, Any]:
         },
         "budget": {
             "profile": config.loop_budget.profile,
+            "base_model_calls": config.loop_budget.base_model_calls,
             "max_model_calls": config.loop_budget.max_model_calls,
             "max_tool_calls": config.loop_budget.max_tool_calls,
             "max_wall_seconds": config.loop_budget.max_wall_seconds,
@@ -1179,6 +1253,15 @@ def config_summary(config: RuntimeConfig) -> dict[str, Any]:
             "context_hard_tokens": config.loop_budget.context_hard_tokens,
             "context_keep_recent": config.loop_budget.context_keep_recent,
             "context_summary_chars": config.loop_budget.context_summary_chars,
+            "cognitive_checkpoint_after": (
+                config.loop_budget.cognitive_checkpoint_after
+            ),
+            "cognitive_checkpoint_repeat": (
+                config.loop_budget.cognitive_checkpoint_repeat
+            ),
+            "strategy_reflection_after": (
+                config.loop_budget.strategy_reflection_after
+            ),
         },
         "proactive": {
             "enabled": config.proactive.enabled,

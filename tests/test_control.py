@@ -76,6 +76,75 @@ class TurnControllerTests(unittest.TestCase):
         )
         self.assertEqual(controller.tool_calls, 2)
 
+    def test_base_budget_requires_explicit_extension_before_hard_limit(
+        self,
+    ) -> None:
+        events = RecordingEvents()
+        controller = TurnController(
+            LoopBudgetConfig(
+                base_model_calls=2,
+                max_model_calls=5,
+                finalization_reserve=1,
+                no_progress_soft=10,
+                no_progress_hard=11,
+            ),
+            events=events,  # type: ignore[arg-type]
+        )
+
+        self.assertIsNone(controller.before_model_call())
+        self.assertIsNone(controller.before_model_call())
+        prompt = controller.before_model_call()
+
+        self.assertTrue(controller.reviewing_budget)
+        self.assertIn("request_budget_extension", prompt or "")
+        blocked = controller.before_tool("list_files", {"path": "."})
+        self.assertIn("只能申请", blocked or "")
+
+        ok, content = controller.request_budget_extension(
+            2,
+            reason="已确认候选文件，下一步批量读取并比较。",
+        )
+
+        self.assertTrue(ok)
+        self.assertIn("额外 2 次", content)
+        self.assertFalse(controller.reviewing_budget)
+        self.assertEqual(controller.effective_model_limit, 4)
+        self.assertIn(
+            "budget_extension_granted",
+            [event_type for event_type, _ in events.events],
+        )
+
+    def test_budget_extension_requires_reason_and_respects_hard_limit(self) -> None:
+        events = RecordingEvents()
+        controller = TurnController(
+            LoopBudgetConfig(
+                base_model_calls=1,
+                max_model_calls=3,
+                finalization_reserve=1,
+                no_progress_soft=10,
+                no_progress_hard=11,
+            ),
+            events=events,  # type: ignore[arg-type]
+        )
+        controller.before_model_call()
+        controller.before_model_call()
+
+        ok, content = controller.request_budget_extension(
+            10,
+            reason="",
+        )
+        self.assertFalse(ok)
+        self.assertIn("必须说明", content)
+        self.assertTrue(controller.reviewing_budget)
+
+        ok, content = controller.request_budget_extension(
+            10,
+            reason="剩余工作必须依赖一次新的验证结果。",
+        )
+        self.assertTrue(ok)
+        self.assertIn("额外 1 次", content)
+        self.assertEqual(controller.effective_model_limit, 2)
+
     def test_token_soft_limit_enters_finalization_before_hard_limit(self) -> None:
         controller = TurnController(
             LoopBudgetConfig(
@@ -114,6 +183,75 @@ class TurnControllerTests(unittest.TestCase):
         )
         controller.before_model_call()
         self.assertEqual(controller.no_progress_rounds, 0)
+
+    def test_distinct_results_without_state_change_trigger_cognition_checkpoint(
+        self,
+    ) -> None:
+        events = RecordingEvents()
+        controller = TurnController(
+            replace(
+                LoopBudgetConfig(),
+                cognitive_checkpoint_after=2,
+                cognitive_checkpoint_repeat=1,
+            ),
+            events=events,  # type: ignore[arg-type]
+        )
+        controller.before_model_call()
+        for index in range(2):
+            args = {"command": f"inspect-{index}"}
+            controller.before_tool("run_command", args)
+            controller.record_tool_result(
+                "run_command",
+                args,
+                ok=True,
+                content=f"different output {index}",
+                changed_files=[],
+            )
+
+        checkpoint = controller.before_model_call()
+
+        self.assertEqual(controller.no_progress_rounds, 0)
+        self.assertEqual(controller.steps_without_state_change, 2)
+        self.assertIn("认知收束检查点", checkpoint or "")
+        self.assertIn("不要把“工具返回了不同内容”", checkpoint or "")
+        self.assertEqual(controller.cognitive_checkpoint_count, 1)
+        self.assertIn(
+            "cognitive_checkpoint",
+            [event_type for event_type, _payload in events.events],
+        )
+
+    def test_target_state_change_resets_cognition_stall_counter(self) -> None:
+        controller = TurnController(
+            replace(
+                LoopBudgetConfig(),
+                cognitive_checkpoint_after=2,
+                cognitive_checkpoint_repeat=1,
+            )
+        )
+        controller.before_model_call()
+        for index in range(2):
+            args = {"command": f"inspect-{index}"}
+            controller.before_tool("run_command", args)
+            controller.record_tool_result(
+                "run_command",
+                args,
+                ok=True,
+                content=f"output {index}",
+                changed_files=[],
+            )
+        args = {"command": "publish"}
+        controller.before_tool("run_command", args)
+        controller.record_tool_result(
+            "run_command",
+            args,
+            ok=True,
+            content="published=true",
+            changed_files=[],
+            state_changed=True,
+        )
+
+        self.assertIsNone(controller.before_model_call())
+        self.assertEqual(controller.steps_without_state_change, 0)
 
     def test_same_error_is_normalized_and_triggers_recovery(self) -> None:
         events = RecordingEvents()

@@ -484,7 +484,13 @@ def command_risk(command: str, *, workspace: Path | None = None) -> RiskLevel:
             target = tokens[index + 1]
             if target != "/dev/null" and _contains_outside_path([target], root):
                 return "R2"
-            risk: RiskLevel = "R0" if token == "<" else "R1"
+            # Redirecting either stdin or output to /dev/null does not change
+            # persistent filesystem state, so it remains a read-only probe.
+            risk: RiskLevel = (
+                "R0"
+                if token == "<" or target == "/dev/null"
+                else "R1"
+            )
             redirect_risk = (
                 risk
                 if redirect_risk is None or _RISK_ORDER[risk] > _RISK_ORDER[redirect_risk]
@@ -705,6 +711,7 @@ class ApprovalManager:
         self.after_prompt = after_prompt
         self._interactive_decision = ""
         self.capability_overrides: dict[str, bool] = {}
+        self.task_capabilities: set[str] = set()
         for capability, mode in (persistent_permissions or {}).items():
             if capability not in CAPABILITIES:
                 continue
@@ -736,6 +743,7 @@ class ApprovalManager:
             raise ValueError("权限模式必须是 auto/allow/deny")
 
     def begin_task(self, risk_ceiling: RiskLevel | None = None) -> TaskGrant:
+        self.task_capabilities.clear()
         self.grant = (
             TaskGrant(risk_ceiling=risk_ceiling)
             if risk_ceiling is not None
@@ -744,7 +752,13 @@ class ApprovalManager:
         return self.grant
 
     def end_task(self) -> None:
+        self.task_capabilities.clear()
         self.grant = TaskGrant(risk_ceiling="R0")
+
+    def grant_task_capabilities(self, capabilities: Iterable[str]) -> set[str]:
+        selected = normalize_capabilities(capabilities)
+        self.task_capabilities.update(selected)
+        return selected
 
     def describe(self) -> dict[str, object]:
         return {
@@ -811,6 +825,7 @@ class ApprovalManager:
         *,
         risk: RiskLevel = "R1",
         capability: str | None = None,
+        use_task_grant: bool = True,
     ) -> bool:
         if capability:
             override = self.capability_overrides.get(capability)
@@ -818,7 +833,11 @@ class ApprovalManager:
                 return False
             if override is True:
                 return True
-        if self.session_allow or self.grant.allows(risk):
+            if capability in self.task_capabilities:
+                return True
+        if self.session_allow or (
+            use_task_grant and self.grant.allows(risk)
+        ):
             return True
         if not self.interactive:
             print(

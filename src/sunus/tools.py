@@ -17,6 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -33,6 +34,7 @@ from sunus.policy import (
     PathGuard,
     PolicyError,
     command_denial_reason,
+    command_risk,
     explicit_write_paths,
     is_sensitive_write_path,
     normalize_capabilities,
@@ -57,6 +59,35 @@ _BROAD_SEARCH_ROOTS = {
     (Path.home() / "Documents").resolve(),
     (Path.home() / "Desktop").resolve(),
 }
+_TURN_CACHEABLE_TOOLS = {
+    "read_file",
+    "list_files",
+    "search_text",
+    "inspect_code_state",
+    "search_memory",
+    "memory_context_metrics",
+    "inspect_environment",
+    "list_skills",
+    "read_skill",
+    "run_command_batch",
+}
+_BUILTIN_VERIFICATION_PREFIXES = (
+    "pytest",
+    "python -m pytest",
+    "python3 -m pytest",
+    "python -m unittest",
+    "python3 -m unittest",
+    "npm test",
+    "pnpm test",
+    "yarn test",
+    "cargo test",
+    "go test",
+    "make test",
+    "ruff check",
+    "mypy",
+    "eslint",
+    "tsc",
+)
 
 
 def _is_broad_search_root(path: Path) -> bool:
@@ -88,6 +119,11 @@ def _semantic_command_failure(output: str) -> str:
         (r"(?m)^(?:zsh|sh|bash): .*command not found", "命令不存在"),
         (r"(?m)^(?:zsh|sh|bash): .*no matches found", "路径或参数不存在"),
         (r"(?m)^(?:curl|wget): .*(?:Could not resolve host|Connection refused)", "网络失败"),
+        (
+            r"(?:waiting for element to be visible, enabled and stable|"
+            r"element is outside of the viewport|Timeout \d+ms exceeded)",
+            "Playwright 操作未完成",
+        ),
     )
     for pattern, label in checks:
         match = re.search(pattern, output)
@@ -108,7 +144,10 @@ _TARGET_STATE_COMMAND_PATTERN = re.compile(
     r"(?i)(?:"
     r"\bopen\s+-a\s+[^;&|]*\b(?:chrome|safari|firefox|edge)\b|"
     r"\bosascript\b[^;&|]*(?:make\s+new\s+window|set\s+url\s+of)|"
-    r"\bplaywright(?:-cli)?\b[^;&|]*\b(?:open|goto|navigate)\b"
+    r"\b(?:playwright(?:-cli)?|pw\.sh)\b[^\n]*(?:"
+    r"\b(?:open|goto|navigate|reload|click|dblclick|fill|type|press|"
+    r"select|upload|check|uncheck|drag|drop|mousemove|mousedown|mouseup)\b"
+    r")"
     r")"
 )
 
@@ -222,6 +261,7 @@ class ToolResult:
     state_changed: bool = False
     approval_barrier: bool = False
     halt: bool = False
+    cache_hit: bool = False
 
     def as_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"ok": self.ok, "content": self.content}
@@ -235,6 +275,8 @@ class ToolResult:
             payload["approval_barrier"] = True
         if self.halt:
             payload["halt"] = True
+        if self.cache_hit:
+            payload["cache_hit"] = True
         return payload
 
 
@@ -520,6 +562,29 @@ def tool_schemas() -> list[dict[str, Any]]:
             ["path", "content"],
         ),
         fn(
+            "write_file_batch",
+            "Create or overwrite up to 20 files in one validated tool call. "
+            "Use this for independent generated files; all paths and sizes are "
+            "validated before any file is written.",
+            {
+                "files": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                        "required": ["path", "content"],
+                    },
+                }
+            },
+            ["files"],
+        ),
+        fn(
             "write_document",
             "Render and write a structured Markdown document using a predefined "
             f"template. Profiles and required headings: {document_profile_text}. "
@@ -566,6 +631,84 @@ def tool_schemas() -> list[dict[str, Any]]:
             ["path", "old_text", "new_text"],
         ),
         fn(
+            "patch_file_batch",
+            "Apply up to 20 validated exact-text replacements across one or more "
+            "files in one tool call. Edits are applied in order. All paths and "
+            "matches are validated before writing; use this instead of repeated "
+            "patch_file calls when multiple replacements are already known.",
+            {
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "path": {"type": "string"},
+                            "old_text": {"type": "string"},
+                            "new_text": {"type": "string"},
+                            "replace_all": {
+                                "type": "boolean",
+                                "default": False,
+                            },
+                        },
+                        "required": ["path", "old_text", "new_text"],
+                    },
+                }
+            },
+            ["edits"],
+        ),
+        fn(
+            "apply_and_verify",
+            "Apply multiple exact-text edits and then run up to four verification "
+            "commands in one tool call. The patch batch is committed only after "
+            "all edits validate; verification failures are returned with the "
+            "successful file changes.",
+            {
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "path": {"type": "string"},
+                            "old_text": {"type": "string"},
+                            "new_text": {"type": "string"},
+                            "replace_all": {
+                                "type": "boolean",
+                                "default": False,
+                            },
+                        },
+                        "required": ["path", "old_text", "new_text"],
+                    },
+                },
+                "verification_commands": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "command": {"type": "string"},
+                            "cwd": {"type": "string", "default": "."},
+                            "timeout_sec": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 300,
+                                "default": 120,
+                            },
+                        },
+                        "required": ["command"],
+                    },
+                },
+            },
+            ["edits", "verification_commands"],
+        ),
+        fn(
             "run_command",
             "Run a shell command in the workspace and return exit code and combined output. "
             "Prefer search_text for file or text discovery; broad recursive grep/rg searches "
@@ -576,6 +719,67 @@ def tool_schemas() -> list[dict[str, Any]]:
                 "timeout_sec": {"type": "integer", "minimum": 1, "maximum": 1800, "default": 120},
             },
             ["command"],
+        ),
+        fn(
+            "run_command_batch",
+            "Run up to four independent read-only shell commands in one tool call. "
+            "Use this instead of separate run_command calls when the checks do not "
+            "depend on each other. Every command must be classified R0; commands "
+            "that mutate files, Git state, processes, packages, or network are rejected.",
+            {
+                "commands": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "command": {"type": "string"},
+                            "cwd": {"type": "string", "default": "."},
+                            "timeout_sec": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 120,
+                                "default": 30,
+                            },
+                        },
+                        "required": ["command"],
+                    },
+                }
+            },
+            ["commands"],
+        ),
+        fn(
+            "verification_batch",
+            "Run up to four independent verification commands in one tool call. "
+            "Commands must start with a supported verification executable such "
+            "as pytest, unittest, npm test, cargo test, go test, ruff, mypy, "
+            "eslint, or tsc. Add project-specific prefixes in "
+            "runtime.verification_command_prefixes.",
+            {
+                "commands": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "command": {"type": "string"},
+                            "cwd": {"type": "string", "default": "."},
+                            "timeout_sec": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 300,
+                                "default": 120,
+                            },
+                        },
+                        "required": ["command"],
+                    },
+                }
+            },
+            ["commands"],
         ),
         fn(
             "request_authorization",
@@ -689,6 +893,58 @@ def tool_schemas() -> list[dict[str, Any]]:
             ["url"],
         ),
         fn(
+            "fetch_url_batch",
+            "Fetch up to five independent HTTP(S) URLs in one tool call and "
+            "return each status and content separately. Do not use for ordered "
+            "login, form submission, or state-changing workflows.",
+            {
+                "requests": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 5,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "url": {"type": "string"},
+                            "max_chars": {
+                                "type": "integer",
+                                "minimum": 1000,
+                                "maximum": 100000,
+                                "default": 30000,
+                            },
+                            "timeout_sec": {
+                                "type": "integer",
+                                "minimum": 3,
+                                "maximum": 30,
+                                "default": 15,
+                            },
+                        },
+                        "required": ["url"],
+                    },
+                }
+            },
+            ["requests"],
+        ),
+        fn(
+            "update_reasoning_state",
+            "Update the current task's observable reasoning frame when the subgoal, "
+            "hypothesis, evidence gap, success criteria, or decision changes. This "
+            "does not execute an external action. Use it at task start or a genuine "
+            "decision change, not mechanically after every tool result.",
+            {
+                "current_subgoal": {"type": "string"},
+                "working_hypothesis": {"type": "string"},
+                "evidence_gap": {"type": "string"},
+                "success_criteria": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "decision": {"type": "string"},
+            },
+            [],
+        ),
+        fn(
             "list_skills",
             "List locally defined skills (name + description + when to use). "
             "Call read_skill to load a skill's full instructions.",
@@ -721,6 +977,8 @@ class ToolExecutor:
         memory: MemoryStore | None = None,
         mcp_servers: tuple[Any, ...] = (),
         max_parallel_tools: int = 4,
+        read_only_command_prefixes: tuple[str, ...] = (),
+        verification_command_prefixes: tuple[str, ...] = (),
     ) -> None:
         self.workspace = workspace
         self.path_guard = path_guard
@@ -734,7 +992,15 @@ class ToolExecutor:
         self.proactive_scheduler: Any | None = None
         self.skills = SkillLibrary(workspace)
         self.request_scope: RequestScope | None = None
+        self.task_state: Any | None = None
         self.max_parallel_tools = max(1, int(max_parallel_tools))
+        self.read_only_command_prefixes = tuple(
+            read_only_command_prefixes
+        )
+        self.verification_command_prefixes = tuple(
+            verification_command_prefixes
+        )
+        self._turn_result_cache: dict[str, ToolResult] = {}
         self.registry = ToolRegistry()
         self.mcp_manager: Any | None = None
         self._initialize_registry(mcp_servers)
@@ -751,16 +1017,23 @@ class ToolExecutor:
             "inspect_environment": self._inspect_environment,
             "inspect_runtime_history": self._inspect_runtime_history,
             "inspect_browser": self._inspect_browser,
+            "update_reasoning_state": self._update_reasoning_state,
             "write_file": self._write_file,
+            "write_file_batch": self._write_file_batch,
             "write_document": self._write_document,
             "patch_file": self._patch_file,
+            "patch_file_batch": self._patch_file_batch,
+            "apply_and_verify": self._apply_and_verify,
             "run_command": self._run_command,
+            "run_command_batch": self._run_command_batch,
+            "verification_batch": self._verification_batch,
             "request_authorization": self._request_authorization,
             "configure_permissions": self._configure_permissions,
             "schedule_proactive_file_write": (
                 self._schedule_proactive_file_write
             ),
             "fetch_url": self._fetch_url,
+            "fetch_url_batch": self._fetch_url_batch,
             "list_skills": self._list_skills,
             "read_skill": self._read_skill,
         }
@@ -775,18 +1048,26 @@ class ToolExecutor:
             "inspect_runtime_history",
             "list_skills",
             "read_skill",
+            "run_command_batch",
             "submit_result",
         }
-        parallel_safe = set(read_only) - {"submit_result"}
+        parallel_safe = set(read_only) - {"submit_result", "run_command_batch"}
         risks = {
             "fetch_url": "R2",
             "inspect_browser": "R2",
+            "update_reasoning_state": "R0",
             "write_file": "R1",
             "write_document": "R1",
             "patch_file": "R1",
+            "patch_file_batch": "R1",
             "run_command": "R1",
+            "run_command_batch": "R1",
             "configure_permissions": "R1",
             "schedule_proactive_file_write": "R1",
+            "write_file_batch": "R1",
+            "apply_and_verify": "R1",
+            "verification_batch": "R1",
+            "fetch_url_batch": "R2",
         }
         capabilities = {
             "read_file": "workspace_text",
@@ -799,14 +1080,21 @@ class ToolExecutor:
             "inspect_environment": "runtime_environment",
             "inspect_runtime_history": "session_history",
             "inspect_browser": "browser_state",
+            "update_reasoning_state": "task_cognition",
             "write_file": "workspace_write",
+            "write_file_batch": "workspace_write",
             "write_document": "document_write",
             "patch_file": "workspace_edit",
+            "patch_file_batch": "workspace_edit",
+            "apply_and_verify": "edit_and_verify",
             "run_command": "command_execution",
+            "run_command_batch": "command_execution",
+            "verification_batch": "verification",
             "request_authorization": "permission_request",
             "configure_permissions": "permission_config",
             "schedule_proactive_file_write": "proactive_schedule",
             "fetch_url": "remote_http",
+            "fetch_url_batch": "remote_http",
             "list_skills": "skill_inventory",
             "read_skill": "skill_instructions",
             "submit_result": "terminal_result",
@@ -822,14 +1110,21 @@ class ToolExecutor:
             "inspect_environment": "environment_facts",
             "inspect_runtime_history": "runtime_events",
             "inspect_browser": "browser_page",
+            "update_reasoning_state": "reasoning_state",
             "write_file": "file_change",
+            "write_file_batch": "file_change",
             "write_document": "document_change",
             "patch_file": "file_change",
+            "patch_file_batch": "file_change",
+            "apply_and_verify": "edit_and_verification",
             "run_command": "command_output",
+            "run_command_batch": "command_output",
+            "verification_batch": "verification_output",
             "request_authorization": "authorization_state",
             "configure_permissions": "permission_state",
             "schedule_proactive_file_write": "scheduled_task",
             "fetch_url": "remote_page",
+            "fetch_url_batch": "remote_pages",
             "list_skills": "skill_catalog",
             "read_skill": "skill_instructions",
             "submit_result": "final_result",
@@ -844,15 +1139,26 @@ class ToolExecutor:
                 "当前请求具有网络能力",
             ),
             "run_command": ("当前请求允许本地命令",),
+            "run_command_batch": ("当前请求允许本地命令",),
             "write_file": ("当前请求允许写入",),
+            "write_file_batch": ("当前请求允许写入",),
             "write_document": ("当前请求允许写入",),
             "patch_file": ("当前请求允许修改",),
+            "patch_file_batch": ("当前请求允许修改",),
+            "apply_and_verify": (
+                "当前请求允许修改",
+                "当前请求允许本地命令",
+            ),
             "search_memory": ("本地记忆库可用",),
+            "verification_batch": ("当前请求允许本地命令",),
         }
         failure_modes = {
             "inspect_browser": ("浏览器未运行", "页面权限或脚本限制"),
             "fetch_url": ("DNS 失败", "TLS 失败", "网络超时", "HTTP 错误"),
+            "fetch_url_batch": ("DNS 失败", "TLS 失败", "网络超时", "HTTP 错误"),
             "run_command": ("命令不存在", "依赖缺失", "权限拒绝", "非零退出"),
+            "run_command_batch": ("命令不存在", "非只读命令", "权限拒绝", "非零退出"),
+            "verification_batch": ("验证命令不支持", "依赖缺失", "非零退出"),
             "read_file": ("路径不存在", "编码或文件大小限制"),
             "search_text": ("路径错误", "超时或结果过宽"),
             "search_memory": ("索引不可用", "无相关记忆"),
@@ -927,9 +1233,10 @@ class ToolExecutor:
             )
         else:
             self.path_guard.clear_request_write_paths()
+        self._turn_result_cache.clear()
         return self.request_scope
 
-    def _scope_denial(
+    def _scope_authorization(
         self,
         name: str,
         arguments: dict[str, Any],
@@ -941,42 +1248,156 @@ class ToolExecutor:
             "configure_permissions",
             "schedule_proactive_file_write",
         }:
+            capability = "write"
             allowed = scope.allows_mutation
-        elif name in {"write_file", "write_document", "patch_file"}:
-            allowed = scope.allows_mutation
-            raw_path = str(arguments.get("path") or "").strip()
-            if raw_path and self.approvals.capability_overrides.get("write") is not False:
-                try:
-                    candidate = self.path_guard.resolve(
-                        raw_path,
-                        for_write=True,
-                    )
-                except PolicyError:
-                    candidate = None
-                allowed = allowed or bool(
-                    candidate
-                    and self.path_guard.is_write_permitted(candidate)
-                )
-        elif name == "run_command":
+            risk = "R1"
+        elif name == "apply_and_verify":
+            capability = "write_and_command"
+            allowed = scope.allows_mutation and scope.allows_commands
+            risk = "R1"
+        elif name == "verification_batch":
+            capability = "command"
             allowed = scope.allows_commands
-        elif name == "fetch_url":
+            risk = "R1"
+        elif name in {
+            "write_file",
+            "write_file_batch",
+            "write_document",
+            "patch_file",
+            "patch_file_batch",
+        }:
+            capability = "write"
+            allowed = scope.allows_mutation
+            risk = "R1"
+            raw_paths = (
+                [
+                    str(item.get("path") or "").strip()
+                    for item in (
+                        arguments.get("files")
+                        if name == "write_file_batch"
+                        else arguments.get("edits")
+                    )
+                    or []
+                    if isinstance(item, dict)
+                ]
+                if name in {"patch_file_batch", "write_file_batch"}
+                else [str(arguments.get("path") or "").strip()]
+            )
+            if (
+                any(raw_paths)
+                and self.approvals.capability_overrides.get("write") is not False
+            ):
+                for raw_path in raw_paths:
+                    if not raw_path:
+                        continue
+                    try:
+                        candidate = self.path_guard.resolve(
+                            raw_path,
+                            for_write=True,
+                        )
+                    except PolicyError:
+                        continue
+                    if self.path_guard.is_write_permitted(candidate):
+                        allowed = True
+                        break
+        elif name in {"run_command", "run_command_batch"}:
+            capability = "command"
+            allowed = scope.allows_commands
+            if name == "run_command":
+                command = str(arguments.get("command") or "").strip()
+                denial = command_denial_reason(command) if command else ""
+                risk = command_risk(command, workspace=self.workspace)
+            else:
+                commands = arguments.get("commands") or []
+                command = json.dumps(commands, ensure_ascii=False)[:4000]
+                command_values = [
+                    str(item.get("command") or "").strip()
+                    for item in commands
+                    if isinstance(item, dict)
+                ]
+                denial = next(
+                    (
+                        command_denial_reason(value)
+                        for value in command_values
+                        if command_denial_reason(value)
+                    ),
+                    "",
+                )
+                risks = [
+                    command_risk(value, workspace=self.workspace)
+                    for value in command_values
+                ]
+                risk = max(
+                    risks,
+                    key={"R0": 0, "R1": 1, "R2": 2, "R3": 3}.get,
+                    default="R2",
+                )
+            if not command:
+                return ""
+            if denial:
+                return denial
+        elif name in {"fetch_url", "fetch_url_batch"}:
+            capability = "network"
             allowed = scope.allows_network
+            risk = "R2"
         else:
             allowed = True
+            capability = ""
+            risk = "R1"
         if allowed:
             return ""
-        return (
-            "当前用户消息没有明确要求该副作用操作；"
-            "不得依据推测、示例或建议自行执行。"
+        approved = self.approvals.require(
+            "授权本轮能力",
+            (
+                f"能力：{capability}\n"
+                f"工具：{name}\n"
+                f"参数：{json.dumps(arguments, ensure_ascii=False)[:2000]}"
+            ),
+            risk=risk,
+            capability=capability,
+            use_task_grant=False,
         )
+        if not approved:
+            return "该操作需要明确授权，但用户拒绝或当前运行无法确认授权。"
+        self.approvals.grant_task_capabilities([capability])
+        self.request_scope = replace(
+            self.request_scope,
+            allows_mutation=(
+                self.request_scope.allows_mutation or capability == "write"
+            ),
+            allows_commands=(
+                self.request_scope.allows_commands or capability == "command"
+            ),
+            allows_network=(
+                self.request_scope.allows_network or capability == "network"
+            ),
+        )
+        self.approvals.consume_interactive_decision()
+        return ""
 
     def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
-        denial = self._scope_denial(name, arguments)
+        denial = self._scope_authorization(name, arguments)
         if denial:
-            return ToolResult(False, denial)
+            return self._attach_approval_decision(ToolResult(False, denial))
         spec = self.registry.get(name)
         if spec is None:
             return ToolResult(False, f"未知工具: {name}")
+        cache_key = self._cache_key(name, arguments)
+        if cache_key and cache_key in self._turn_result_cache:
+            cached = self._turn_result_cache[cache_key]
+            self.events.emit(
+                "tool_cache_hit",
+                name=name,
+                summary=f"复用本轮已获取结果 · {name}",
+            )
+            return ToolResult(
+                ok=cached.ok,
+                content=cached.content,
+                changed_files=list(cached.changed_files),
+                artifact=cached.artifact,
+                state_changed=False,
+                cache_hit=True,
+            )
         if spec.source == "mcp":
             if spec.approval_mode == "deny":
                 return ToolResult(False, f"用户配置拒绝 MCP 工具: {name}")
@@ -1016,6 +1437,20 @@ class ToolExecutor:
                     f"full output: {artifact}]"
                 )
                 result.artifact = artifact
+            if cache_key and result.ok:
+                self._turn_result_cache[cache_key] = ToolResult(
+                    ok=result.ok,
+                    content=result.content,
+                    changed_files=list(result.changed_files),
+                    artifact=result.artifact,
+                    state_changed=result.state_changed,
+                )
+            if (
+                not spec.read_only
+                or result.state_changed
+                or bool(result.changed_files)
+            ):
+                self._turn_result_cache.clear()
             return self._attach_approval_decision(result)
         except (PolicyError, OSError, ValueError) as error:
             return self._attach_approval_decision(
@@ -1036,6 +1471,64 @@ class ToolExecutor:
         result.approval_barrier = True
         result.halt = decision in {"denied", "cancelled"}
         return result
+
+    @staticmethod
+    def _cache_key(name: str, arguments: dict[str, Any]) -> str:
+        if name not in _TURN_CACHEABLE_TOOLS:
+            return ""
+        return json.dumps(
+            [name, arguments],
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        )
+
+    def _read_only_command_allowed(self, command: str) -> bool:
+        if command_risk(command, workspace=self.workspace) == "R0":
+            return True
+        head = self._command_after_leading_cd(command)
+        return self._matches_command_prefix(
+            head,
+            self.read_only_command_prefixes,
+        )
+
+    def _verification_command_allowed(self, command: str) -> bool:
+        if command_denial_reason(command):
+            return False
+        head = self._command_after_leading_cd(command)
+        if not head or ";" in head or "&&" in head or "||" in head:
+            return False
+        prefixes = (
+            self.verification_command_prefixes
+            or _BUILTIN_VERIFICATION_PREFIXES
+        )
+        return self._matches_command_prefix(head, prefixes)
+
+    @staticmethod
+    def _command_after_leading_cd(command: str) -> str:
+        text = str(command).strip()
+        text = re.sub(
+            r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*",
+            "",
+            text,
+        )
+        if text.startswith("cd "):
+            parts = text.split("&&", 1)
+            if len(parts) == 2:
+                text = parts[1].strip()
+        return text
+
+    @staticmethod
+    def _matches_command_prefix(
+        command: str,
+        prefixes: tuple[str, ...],
+    ) -> bool:
+        text = str(command).strip()
+        for prefix in prefixes:
+            if text == prefix or text.startswith(prefix + " "):
+                return True
+        return False
 
     def _truncate(self, value: str, *, prefix: str) -> tuple[str, str | None]:
         value = redact_text(value, self.secret)
@@ -1807,6 +2300,39 @@ class ToolExecutor:
             json.dumps(payload, ensure_ascii=False),
         )
 
+    def _update_reasoning_state(self, args: dict[str, Any]) -> ToolResult:
+        if self.task_state is None:
+            return ToolResult(False, "当前没有可更新的任务推理状态")
+        criteria = args.get("success_criteria") or []
+        if not isinstance(criteria, list):
+            return ToolResult(False, "success_criteria 必须是数组")
+        current_subgoal = str(args.get("current_subgoal") or "")
+        working_hypothesis = str(args.get("working_hypothesis") or "")
+        evidence_gap = str(args.get("evidence_gap") or "")
+        decision = str(args.get("decision") or "")
+        if not any(
+            (
+                current_subgoal.strip(),
+                working_hypothesis.strip(),
+                evidence_gap.strip(),
+                decision.strip(),
+                any(str(item).strip() for item in criteria),
+            )
+        ):
+            return ToolResult(False, "没有需要更新的推理状态")
+        self.task_state.update_cognition(
+            current_subgoal=current_subgoal,
+            working_hypothesis=working_hypothesis,
+            evidence_gap=evidence_gap,
+            success_criteria=[str(item) for item in criteria],
+            decision=decision,
+        )
+        return ToolResult(
+            True,
+            "已更新当前任务的推理状态。",
+            state_changed=True,
+        )
+
     def _write_file(self, args: dict[str, Any]) -> ToolResult:
         path = self.path_guard.resolve(str(args["path"]), for_write=True)
         self.path_guard.assert_writable(path)
@@ -1825,6 +2351,82 @@ class ToolExecutor:
             True,
             f"已写入 {path} ({len(content.encode('utf-8'))} bytes)",
             changed_files=[self.path_guard.relative(path)],
+        )
+
+    def _write_file_batch(self, args: dict[str, Any]) -> ToolResult:
+        files = args.get("files")
+        if not isinstance(files, list) or not files:
+            return ToolResult(False, "files 必须是非空数组")
+        if len(files) > 20:
+            return ToolResult(False, "单次最多批量写入 20 个文件")
+
+        staged: dict[Path, str] = {}
+        originals: dict[Path, str | None] = {}
+        previews: list[str] = []
+        for index, item in enumerate(files, 1):
+            if not isinstance(item, dict):
+                return ToolResult(False, f"第 {index} 个文件参数不合法")
+            path = self.path_guard.resolve(
+                str(item.get("path") or ""),
+                for_write=True,
+            )
+            self.path_guard.assert_writable(path)
+            content = str(item.get("content") or "")
+            encoded = content.encode("utf-8")
+            if len(encoded) > MAX_FILE_BYTES:
+                return ToolResult(False, f"第 {index} 个文件超过大小限制")
+            if path in staged and staged[path] != content:
+                return ToolResult(
+                    False,
+                    f"第 {index} 个文件与前面的写入目标重复: {path}",
+                )
+            staged[path] = content
+            originals[path] = (
+                path.read_text(encoding="utf-8")
+                if path.is_file()
+                else None
+            )
+            previews.append(
+                f"{index}. {path} ({len(encoded)} bytes)"
+            )
+
+        if not self.approvals.require(
+            "批量写入文件",
+            "\n".join(previews),
+            capability="write",
+        ):
+            return ToolResult(False, "用户拒绝批量写入文件")
+
+        written: list[Path] = []
+        try:
+            for path, content in staged.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                self._atomic_write_text(path, content)
+                written.append(path)
+        except OSError as error:
+            rollback_errors: list[str] = []
+            for path in reversed(written):
+                original = originals[path]
+                try:
+                    if original is None:
+                        path.unlink(missing_ok=True)
+                    else:
+                        self._atomic_write_text(path, original)
+                except OSError as rollback_error:
+                    rollback_errors.append(f"{path}: {rollback_error}")
+            detail = f"批量写入失败，已尝试回滚: {error}"
+            if rollback_errors:
+                detail += "\n回滚失败: " + "; ".join(rollback_errors)
+            return ToolResult(False, detail)
+
+        changed_files = [
+            self.path_guard.relative(path)
+            for path in staged
+        ]
+        return ToolResult(
+            True,
+            f"已批量写入 {len(changed_files)} 个文件。",
+            changed_files=changed_files,
         )
 
     def _write_document(self, args: dict[str, Any]) -> ToolResult:
@@ -1892,6 +2494,144 @@ class ToolExecutor:
             changed_files=[self.path_guard.relative(path)],
         )
 
+    def _patch_file_batch(self, args: dict[str, Any]) -> ToolResult:
+        edits = args.get("edits")
+        if not isinstance(edits, list) or not edits:
+            return ToolResult(False, "edits 必须是非空数组")
+        if len(edits) > 20:
+            return ToolResult(False, "单次最多批量应用 20 处替换")
+
+        staged: dict[Path, str] = {}
+        originals: dict[Path, str] = {}
+        previews: list[str] = []
+        for index, edit in enumerate(edits, 1):
+            if not isinstance(edit, dict):
+                return ToolResult(False, f"第 {index} 处替换参数不合法")
+            path = self.path_guard.resolve(
+                str(edit.get("path") or ""),
+                must_exist=True,
+                for_write=True,
+            )
+            self.path_guard.assert_writable(path)
+            if not path.is_file():
+                return ToolResult(False, f"第 {index} 处不是文件: {path}")
+            if path not in staged:
+                staged[path] = path.read_text(encoding="utf-8")
+                originals[path] = staged[path]
+            content = staged[path]
+            old_text = str(edit.get("old_text") or "")
+            new_text = str(edit.get("new_text") or "")
+            if not old_text:
+                return ToolResult(False, f"第 {index} 处 old_text 不能为空")
+            occurrences = content.count(old_text)
+            if occurrences == 0:
+                return ToolResult(
+                    False,
+                    f"第 {index} 处未找到待替换文本: {path}",
+                )
+            replace_all = bool(edit.get("replace_all", False))
+            if occurrences > 1 and not replace_all:
+                return ToolResult(
+                    False,
+                    f"第 {index} 处文本出现 {occurrences} 次；"
+                    "请提供更长上下文或设置 replace_all=true",
+                )
+            staged[path] = content.replace(
+                old_text,
+                new_text,
+                -1 if replace_all else 1,
+            )
+            previews.append(
+                f"{index}. {path}\n"
+                f"替换 {occurrences if replace_all else 1} 处\n"
+                f"--- old ---\n{old_text[:500]}"
+            )
+
+        changed = {
+            path: content
+            for path, content in staged.items()
+            if content != originals[path]
+        }
+        if not changed:
+            return ToolResult(False, "批量替换没有产生任何文件变化")
+        if not self.approvals.require(
+            "批量修改文件",
+            "\n\n".join(previews)[:6000],
+            capability="write",
+        ):
+            return ToolResult(False, "用户拒绝批量修改文件")
+
+        written: list[Path] = []
+        try:
+            for path, content in changed.items():
+                self._atomic_write_text(path, content)
+                written.append(path)
+        except OSError as error:
+            rollback_errors: list[str] = []
+            for path in written:
+                try:
+                    self._atomic_write_text(path, originals[path])
+                except OSError as rollback_error:
+                    rollback_errors.append(f"{path}: {rollback_error}")
+            detail = f"批量写入失败，已尝试回滚: {error}"
+            if rollback_errors:
+                detail += "\n回滚失败: " + "; ".join(rollback_errors)
+            return ToolResult(False, detail)
+
+        changed_files = [
+            self.path_guard.relative(path)
+            for path in changed
+        ]
+        return ToolResult(
+            True,
+            f"已批量应用 {len(edits)} 处替换，修改 {len(changed_files)} 个文件。",
+            changed_files=changed_files,
+        )
+
+    def _apply_and_verify(self, args: dict[str, Any]) -> ToolResult:
+        patch = self._patch_file_batch(
+            {"edits": args.get("edits") or []}
+        )
+        if not patch.ok:
+            return patch
+        verification = self._verification_batch(
+            {"commands": args.get("verification_commands") or []}
+        )
+        content = "\n\n".join(
+            (
+                "=== 文件修改 ===",
+                patch.content,
+                "=== 验证结果 ===",
+                verification.content,
+            )
+        )
+        return ToolResult(
+            verification.ok,
+            content,
+            changed_files=list(patch.changed_files),
+            artifact=verification.artifact,
+            state_changed=True,
+        )
+
+    @staticmethod
+    def _atomic_write_text(path: Path, content: str) -> None:
+        mode = path.stat().st_mode if path.exists() else 0o600
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            dir=path.parent,
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary)
+        try:
+            temporary_path.write_text(content, encoding="utf-8")
+            os.chmod(temporary_path, mode)
+            os.replace(temporary_path, path)
+        finally:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+
     def _run_command(self, args: dict[str, Any]) -> ToolResult:
         command = str(args["command"]).strip()
         if not command:
@@ -1905,10 +2645,191 @@ class ToolExecutor:
         if not self.approvals.require_command(command):
             return ToolResult(False, "用户拒绝执行命令")
         timeout = min(1800, max(1, int(args.get("timeout_sec", 120))))
+        result = self._execute_shell_command(
+            command,
+            cwd=cwd,
+            timeout=timeout,
+        )
+        if result.ok:
+            result.state_changed = _command_changes_target_state(command)
+        return result
+
+    def _run_command_batch(self, args: dict[str, Any]) -> ToolResult:
+        raw_commands = args.get("commands")
+        if not isinstance(raw_commands, list) or not raw_commands:
+            return ToolResult(False, "commands 必须是非空数组")
+        if len(raw_commands) > 4:
+            return ToolResult(False, "单次最多批量执行 4 条命令")
+
+        commands: list[tuple[str, Path, int]] = []
+        for index, item in enumerate(raw_commands, 1):
+            if not isinstance(item, dict):
+                return ToolResult(False, f"第 {index} 条命令参数不合法")
+            command = str(item.get("command") or "").strip()
+            if not command:
+                return ToolResult(False, f"第 {index} 条命令为空")
+            denial = command_denial_reason(command)
+            if denial:
+                return ToolResult(False, f"第 {index} 条命令被拒绝: {denial}")
+            if not self._read_only_command_allowed(command):
+                return ToolResult(
+                    False,
+                    f"第 {index} 条命令不是只读 R0，也未命中只读命令配置，"
+                    "不能进入批量执行。",
+                )
+            cwd = self.path_guard.resolve(
+                str(item.get("cwd", ".")),
+                must_exist=True,
+            )
+            if not cwd.is_dir():
+                return ToolResult(False, f"第 {index} 条命令 cwd 不是目录: {cwd}")
+            timeout = min(
+                120,
+                max(1, int(item.get("timeout_sec", 30))),
+            )
+            commands.append((command, cwd, timeout))
+
+        approval_summary = "\n".join(
+            f"{index}. [{cwd}] {command}"
+            for index, (command, cwd, _timeout) in enumerate(commands, 1)
+        )
+        if not self.approvals.require(
+            "运行只读命令批次",
+            approval_summary,
+            risk="R1",
+            capability="command",
+        ):
+            return ToolResult(False, "用户拒绝执行命令批次")
+
+        with ThreadPoolExecutor(
+            max_workers=min(4, len(commands)),
+        ) as pool:
+            futures = [
+                pool.submit(
+                    self._execute_shell_command,
+                    command,
+                    cwd=cwd,
+                    timeout=timeout,
+                )
+                for command, cwd, timeout in commands
+            ]
+            results = [future.result() for future in futures]
+
+        sections: list[str] = []
+        for index, ((command, cwd, _timeout), result) in enumerate(
+            zip(commands, results),
+            1,
+        ):
+            sections.append(
+                "\n".join(
+                    (
+                        f"=== [{index}] {command}",
+                        f"cwd={cwd}",
+                        result.content,
+                    )
+                )
+            )
+        output = "\n\n".join(sections)
+        content, artifact = self._truncate(output, prefix="command-batch")
+        return ToolResult(
+            all(result.ok for result in results),
+            content,
+            artifact=artifact,
+        )
+
+    def _verification_batch(self, args: dict[str, Any]) -> ToolResult:
+        raw_commands = args.get("commands")
+        if not isinstance(raw_commands, list) or not raw_commands:
+            return ToolResult(False, "commands 必须是非空数组")
+        if len(raw_commands) > 4:
+            return ToolResult(False, "单次最多并发执行 4 条验证命令")
+
+        commands: list[tuple[str, Path, int]] = []
+        for index, item in enumerate(raw_commands, 1):
+            if not isinstance(item, dict):
+                return ToolResult(False, f"第 {index} 条验证参数不合法")
+            command = str(item.get("command") or "").strip()
+            if not self._verification_command_allowed(command):
+                return ToolResult(
+                    False,
+                    f"第 {index} 条命令不是受支持的单项验证命令: {command}",
+                )
+            cwd = self.path_guard.resolve(
+                str(item.get("cwd", ".")),
+                must_exist=True,
+            )
+            if not cwd.is_dir():
+                return ToolResult(False, f"第 {index} 条 cwd 不是目录: {cwd}")
+            timeout = min(
+                300,
+                max(1, int(item.get("timeout_sec", 120))),
+            )
+            commands.append((command, cwd, timeout))
+
+        summary = "\n".join(
+            f"{index}. [{cwd}] {command}"
+            for index, (command, cwd, _timeout) in enumerate(commands, 1)
+        )
+        if not self.approvals.require(
+            "运行验证命令批次",
+            summary,
+            risk="R1",
+            capability="command",
+        ):
+            return ToolResult(False, "用户拒绝执行验证命令批次")
+
+        with ThreadPoolExecutor(
+            max_workers=min(4, len(commands)),
+        ) as pool:
+            futures = [
+                pool.submit(
+                    self._execute_shell_command,
+                    command,
+                    cwd=cwd,
+                    timeout=timeout,
+                )
+                for command, cwd, timeout in commands
+            ]
+            results = [future.result() for future in futures]
+
+        sections: list[str] = []
+        for index, ((command, cwd, _timeout), result) in enumerate(
+            zip(commands, results),
+            1,
+        ):
+            sections.append(
+                "\n".join(
+                    (
+                        f"=== [{index}] {command}",
+                        f"cwd={cwd}",
+                        result.content,
+                    )
+                )
+            )
+        content, artifact = self._truncate(
+            "\n\n".join(sections),
+            prefix="verification-batch",
+        )
+        return ToolResult(
+            all(result.ok for result in results),
+            content,
+            artifact=artifact,
+        )
+
+    def _execute_shell_command(
+        self,
+        command: str,
+        *,
+        cwd: Path,
+        timeout: int,
+    ) -> ToolResult:
         try:
             shell = login_shell()
+            shell_command = command
+            if Path(shell).name.lower() not in {"pwsh", "powershell"}:
+                shell_command = f"set -o pipefail\n{command}"
             process = subprocess.Popen(
-                shell_invocation(shell, command),
+                shell_invocation(shell, shell_command),
                 cwd=cwd,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -1942,11 +2863,6 @@ class ToolExecutor:
             process.returncode == 0 and not semantic_failure,
             content,
             artifact=artifact,
-            state_changed=(
-                process.returncode == 0
-                and not semantic_failure
-                and _command_changes_target_state(command)
-            ),
         )
 
     def _request_authorization(self, args: dict[str, Any]) -> ToolResult:
@@ -1997,6 +2913,8 @@ class ToolExecutor:
 
         mutation = "write" in requested
         commands = "command" in requested
+        self.approvals.grant_task_capabilities(requested)
+        self.approvals.consume_interactive_decision()
         self.request_scope = replace(
             self.request_scope,
             allows_mutation=self.request_scope.allows_mutation or mutation,
@@ -2175,12 +3093,17 @@ class ToolExecutor:
             state_changed=True,
         )
 
-    def _fetch_url(self, args: dict[str, Any]) -> ToolResult:
+    def _fetch_url(
+        self,
+        args: dict[str, Any],
+        *,
+        _approved: bool = False,
+    ) -> ToolResult:
         url = str(args["url"])
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             return ToolResult(False, "仅支持 http/https URL")
-        if not self.approvals.require(
+        if not _approved and not self.approvals.require(
             "访问网络",
             url,
             risk="R2",
@@ -2290,6 +3213,76 @@ class ToolExecutor:
         text = raw.decode(charset, errors="replace")[:max_chars]
         content, artifact = self._truncate(text, prefix="fetch")
         return ToolResult(True, content, artifact=artifact)
+
+    def _fetch_url_batch(self, args: dict[str, Any]) -> ToolResult:
+        requests = args.get("requests")
+        if not isinstance(requests, list) or not requests:
+            return ToolResult(False, "requests 必须是非空数组")
+        if len(requests) > 5:
+            return ToolResult(False, "单次最多并发获取 5 个 URL")
+        normalized: list[dict[str, Any]] = []
+        for index, item in enumerate(requests, 1):
+            if not isinstance(item, dict):
+                return ToolResult(False, f"第 {index} 个请求参数不合法")
+            url = str(item.get("url") or "").strip()
+            parsed = urllib.parse.urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                return ToolResult(False, f"第 {index} 个 URL 不是 http/https")
+            normalized.append(
+                {
+                    "url": url,
+                    "max_chars": item.get("max_chars", 30000),
+                    "timeout_sec": item.get("timeout_sec", 15),
+                }
+            )
+        summary = "\n".join(
+            f"{index}. {item['url']}"
+            for index, item in enumerate(normalized, 1)
+        )
+        if not self.approvals.require(
+            "批量访问网络",
+            summary,
+            risk="R2",
+            capability="network",
+        ):
+            return ToolResult(False, "用户拒绝批量访问网络")
+
+        with ThreadPoolExecutor(
+            max_workers=min(5, len(normalized)),
+        ) as pool:
+            futures = [
+                pool.submit(
+                    lambda item=item: self._fetch_url(
+                        item,
+                        _approved=True,
+                    )
+                )
+                for item in normalized
+            ]
+            results = [future.result() for future in futures]
+
+        sections: list[str] = []
+        for index, (item, result) in enumerate(
+            zip(normalized, results),
+            1,
+        ):
+            sections.append(
+                "\n".join(
+                    (
+                        f"=== [{index}] {item['url']}",
+                        result.content,
+                    )
+                )
+            )
+        content, artifact = self._truncate(
+            "\n\n".join(sections),
+            prefix="fetch-batch",
+        )
+        return ToolResult(
+            all(result.ok for result in results),
+            content,
+            artifact=artifact,
+        )
 
     def _list_skills(self, args: dict[str, Any]) -> ToolResult:
         skills = self.skills.discover()

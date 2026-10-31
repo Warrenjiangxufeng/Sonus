@@ -6,6 +6,7 @@ import os
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -19,8 +20,10 @@ from sunus.memory import MemoryStore
 from sunus.policy import ApprovalManager, PathGuard
 from sunus.proactive import ProactiveScheduler
 from sunus.storage import ArtifactStore
+from sunus.task_state import TaskState
 from sunus.tools import (
     ToolExecutor,
+    ToolResult,
     _command_changes_target_state,
     _is_broad_search_root,
     find_ripgrep,
@@ -33,6 +36,11 @@ class ToolTests(unittest.TestCase):
         names = {item["function"]["name"] for item in tool_schemas()}
         self.assertIn("submit_result", names)
         self.assertIn("write_document", names)
+        self.assertIn("write_file_batch", names)
+        self.assertIn("patch_file_batch", names)
+        self.assertIn("apply_and_verify", names)
+        self.assertIn("verification_batch", names)
+        self.assertIn("fetch_url_batch", names)
         self.assertIn("memory_context_metrics", names)
         self.assertIn("search_memory", names)
         self.assertIn("inspect_code_state", names)
@@ -41,6 +49,40 @@ class ToolTests(unittest.TestCase):
         self.assertIn("inspect_browser", names)
         self.assertIn("inspect_runtime_history", names)
         self.assertIn("request_authorization", names)
+        self.assertIn("update_reasoning_state", names)
+        self.assertIn("run_command_batch", names)
+
+    def test_reasoning_state_tool_updates_only_task_cognition(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root)
+            state = TaskState(objective="定位并验证目标")
+            executor.task_state = state
+
+            result = executor.execute(
+                "update_reasoning_state",
+                {
+                    "current_subgoal": "区分两个候选目标",
+                    "working_hypothesis": "当前证据层无法访问目标内部",
+                    "evidence_gap": "缺少跨证据层的可操作性检查",
+                    "success_criteria": ["目标状态发生预期变化"],
+                    "decision": "停止更换同类查询",
+                },
+            )
+
+            self.assertTrue(result.ok)
+            self.assertTrue(result.state_changed)
+            self.assertEqual(state.current_subgoal, "区分两个候选目标")
+            self.assertEqual(
+                state.working_hypothesis,
+                "当前证据层无法访问目标内部",
+            )
+            self.assertEqual(
+                state.success_criteria,
+                ["目标状态发生预期变化"],
+            )
+            self.assertEqual(state.stalled_steps, 0)
+            self.assertIn("cognition: 停止更换同类查询", state.decision_log[-1])
 
     def test_broad_home_roots_are_rejected_before_recursive_search(self) -> None:
         self.assertTrue(_is_broad_search_root(Path.home()))
@@ -55,6 +97,8 @@ class ToolTests(unittest.TestCase):
         *,
         memory: MemoryStore | None = None,
         interactive: bool = False,
+        read_only_command_prefixes: tuple[str, ...] = (),
+        verification_command_prefixes: tuple[str, ...] = (),
     ) -> ToolExecutor:
         return ToolExecutor(
             workspace=root,
@@ -68,6 +112,8 @@ class ToolTests(unittest.TestCase):
             events=EventBus(root / ".data"),
             data_dir=root / ".data",
             memory=memory,
+            read_only_command_prefixes=read_only_command_prefixes,
+            verification_command_prefixes=verification_command_prefixes,
         )
 
     def test_read_write_patch_search_and_list(self) -> None:
@@ -87,6 +133,156 @@ class ToolTests(unittest.TestCase):
             self.assertIn("a.txt", search.content)
             listing = executor.execute("list_files", {"depth": 2})
             self.assertIn("a.txt", listing.content)
+
+    def test_batch_patch_applies_multiple_hunks_and_preserves_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "script.py"
+            path.write_text("alpha\nbeta\n", encoding="utf-8")
+            path.chmod(0o755)
+            executor = self.make_executor(root)
+
+            result = executor.execute(
+                "patch_file_batch",
+                {
+                    "edits": [
+                        {
+                            "path": "script.py",
+                            "old_text": "alpha",
+                            "new_text": "ALPHA",
+                        },
+                        {
+                            "path": "script.py",
+                            "old_text": "beta",
+                            "new_text": "BETA",
+                        },
+                    ]
+                },
+            )
+
+            self.assertTrue(result.ok, result.content)
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                "ALPHA\nBETA\n",
+            )
+            self.assertEqual(path.stat().st_mode & 0o777, 0o755)
+            self.assertEqual(result.changed_files, ["script.py"])
+            self.assertIn("2 处替换", result.content)
+
+    def test_batch_patch_validates_all_edits_before_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "script.py"
+            path.write_text("alpha\nbeta\n", encoding="utf-8")
+            executor = self.make_executor(root)
+
+            result = executor.execute(
+                "patch_file_batch",
+                {
+                    "edits": [
+                        {
+                            "path": "script.py",
+                            "old_text": "alpha",
+                            "new_text": "ALPHA",
+                        },
+                        {
+                            "path": "script.py",
+                            "old_text": "missing",
+                            "new_text": "MISSING",
+                        },
+                    ]
+                },
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("第 2 处未找到", result.content)
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                "alpha\nbeta\n",
+            )
+
+    def test_batch_write_creates_multiple_files_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root)
+
+            result = executor.execute(
+                "write_file_batch",
+                {
+                    "files": [
+                        {
+                            "path": "src/a.py",
+                            "content": "A = 1\n",
+                        },
+                        {
+                            "path": "src/b.py",
+                            "content": "B = 2\n",
+                        },
+                    ]
+                },
+            )
+
+            self.assertTrue(result.ok, result.content)
+            self.assertEqual(
+                (root / "src" / "a.py").read_text(encoding="utf-8"),
+                "A = 1\n",
+            )
+            self.assertEqual(
+                (root / "src" / "b.py").read_text(encoding="utf-8"),
+                "B = 2\n",
+            )
+            self.assertEqual(
+                result.changed_files,
+                ["src/a.py", "src/b.py"],
+            )
+
+    def test_batch_write_validation_prevents_partial_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root)
+
+            result = executor.execute(
+                "write_file_batch",
+                {
+                    "files": [
+                        {"path": "good.txt", "content": "ok"},
+                        {"path": "../outside.txt", "content": "bad"},
+                    ]
+                },
+            )
+
+            self.assertFalse(result.ok)
+            self.assertFalse((root / "good.txt").exists())
+
+    def test_apply_and_verify_returns_patch_and_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "note.txt"
+            path.write_text("alpha\n", encoding="utf-8")
+            executor = self.make_executor(root)
+
+            result = executor.execute(
+                "apply_and_verify",
+                {
+                    "edits": [
+                        {
+                            "path": "note.txt",
+                            "old_text": "alpha",
+                            "new_text": "beta",
+                        }
+                    ],
+                    "verification_commands": [
+                        {"command": "python3 -m unittest --help"},
+                    ],
+                },
+            )
+
+            self.assertTrue(result.ok, result.content)
+            self.assertEqual(path.read_text(encoding="utf-8"), "beta\n")
+            self.assertIn("=== 文件修改 ===", result.content)
+            self.assertIn("=== 验证结果 ===", result.content)
+            self.assertEqual(result.changed_files, ["note.txt"])
+            self.assertTrue(result.state_changed)
 
     def test_search_can_aggregate_hits_by_file_before_reading(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -257,6 +453,143 @@ class ToolTests(unittest.TestCase):
             self.assertIn("exit_code=0", result.content)
             self.assertIn("ok", result.content)
 
+    def test_read_only_command_batch_aggregates_labeled_results(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "a.txt").write_text("alpha", encoding="utf-8")
+            (root / "b.txt").write_text("beta", encoding="utf-8")
+            executor = self.make_executor(root)
+            original_execute = executor._execute_shell_command
+            lock = threading.Lock()
+            active = 0
+            maximum = 0
+
+            def tracked_execute(*args, **kwargs):
+                nonlocal active, maximum
+                with lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                try:
+                    time.sleep(0.05)
+                    return original_execute(*args, **kwargs)
+                finally:
+                    with lock:
+                        active -= 1
+
+            with patch.object(
+                executor,
+                "_execute_shell_command",
+                side_effect=tracked_execute,
+            ):
+                result = executor.execute(
+                    "run_command_batch",
+                    {
+                        "commands": [
+                            {"command": "cat a.txt"},
+                            {"command": "cat b.txt"},
+                        ]
+                    },
+                )
+
+            self.assertTrue(result.ok, result.content)
+            self.assertGreaterEqual(maximum, 2)
+            self.assertIn("=== [1] cat a.txt", result.content)
+            self.assertIn("=== [2] cat b.txt", result.content)
+            self.assertEqual(result.content.count("exit_code=0"), 2)
+            self.assertIn("alpha", result.content)
+            self.assertIn("beta", result.content)
+
+    def test_command_batch_rejects_non_read_only_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root)
+
+            result = executor.execute(
+                "run_command_batch",
+                {
+                    "commands": [
+                        {"command": "printf changed > state.txt"},
+                    ]
+                },
+            )
+
+            self.assertFalse(result.ok)
+            self.assertIn("不是只读 R0", result.content)
+            self.assertFalse((root / "state.txt").exists())
+
+    def test_command_batch_accepts_configured_read_only_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            helper = root / "helper.sh"
+            helper.write_text("#!/bin/sh\nprintf 'helper-ok\\n'\n", encoding="utf-8")
+            helper.chmod(0o755)
+            executor = self.make_executor(
+                root,
+                read_only_command_prefixes=("./helper.sh",),
+            )
+
+            result = executor.execute(
+                "run_command_batch",
+                {
+                    "commands": [
+                        {"command": "./helper.sh"},
+                    ]
+                },
+            )
+
+            self.assertTrue(result.ok, result.content)
+            self.assertIn("helper-ok", result.content)
+
+    def test_verification_batch_accepts_custom_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            verifier = root / "verify.sh"
+            verifier.write_text(
+                "#!/bin/sh\nprintf 'verify-ok\\n'\n",
+                encoding="utf-8",
+            )
+            verifier.chmod(0o755)
+            executor = self.make_executor(
+                root,
+                verification_command_prefixes=("./verify.sh",),
+            )
+
+            result = executor.execute(
+                "verification_batch",
+                {
+                    "commands": [
+                        {"command": "./verify.sh --fast"},
+                    ]
+                },
+            )
+
+            self.assertTrue(result.ok, result.content)
+            self.assertIn("verify-ok", result.content)
+
+    def test_read_only_tool_result_is_cached_until_state_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / "note.txt"
+            path.write_text("first", encoding="utf-8")
+            executor = self.make_executor(root)
+            executor.begin_request("读取 note.txt")
+
+            first = executor.execute("read_file", {"path": "note.txt"})
+            second = executor.execute("read_file", {"path": "note.txt"})
+            self.assertFalse(first.cache_hit)
+            self.assertTrue(second.cache_hit)
+
+            path.write_text("second", encoding="utf-8")
+            executor.task_state = TaskState(objective="刷新读取缓存")
+            executor.execute(
+                "update_reasoning_state",
+                {"decision": "文件状态可能变化，重新读取"},
+            )
+            third = executor.execute("read_file", {"path": "note.txt"})
+
+            self.assertFalse(third.cache_hit)
+            self.assertIn("second", third.content)
+
     def test_write_file_creates_missing_parent_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -418,6 +751,42 @@ class ToolTests(unittest.TestCase):
             self.assertTrue(executor.request_scope.allows_mutation)
             self.assertTrue(executor.request_scope.allows_commands)
 
+    def test_side_effect_approval_does_not_depend_on_request_words(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root, interactive=True)
+            scope = executor.begin_request(
+                "登陆了，你看看关掉后下次能不能带登陆态打开，"
+                "也许可以用mcp或者cdp模式我记得"
+            )
+            self.assertFalse(scope.allows_commands)
+            executor.approvals.begin_task()
+
+            with (
+                patch(
+                    "sunus.policy._choose_approval_option",
+                    return_value=0,
+                ) as choose,
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                first = executor.execute(
+                    "run_command",
+                    {"command": "printf first", "timeout_sec": 10},
+                )
+                second = executor.execute(
+                    "run_command",
+                    {"command": "printf second", "timeout_sec": 10},
+                )
+
+            self.assertTrue(first.ok, first.content)
+            self.assertTrue(second.ok, second.content)
+            self.assertIn("first", first.content)
+            self.assertIn("second", second.content)
+            self.assertEqual(choose.call_count, 1)
+            self.assertTrue(executor.request_scope.allows_commands)
+            executor.approvals.end_task()
+
     def test_remember_writes_supported_persistent_review(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -565,7 +934,7 @@ class ToolTests(unittest.TestCase):
                 },
             )
             self.assertFalse(result.ok)
-            self.assertIn("exit_code=0", result.content)
+            self.assertIn("exit_code=1", result.content)
             self.assertIn("semantic_check", result.content)
             self.assertIn("Python traceback", result.content)
 
@@ -585,6 +954,30 @@ class ToolTests(unittest.TestCase):
             self.assertIn("exit_code=0", result.content)
             self.assertIn("运行时版本不兼容", result.content)
 
+    def test_pipeline_failure_and_playwright_timeout_are_not_marked_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            executor = self.make_executor(Path(temp))
+            failed_pipe = executor.execute(
+                "run_command",
+                {"command": "sh -c 'exit 7' | tail -1"},
+            )
+            playwright_timeout = executor.execute(
+                "run_command",
+                {
+                    "command": (
+                        "printf 'waiting for element to be visible, "
+                        "enabled and stable\\n'"
+                    )
+                },
+            )
+
+            self.assertFalse(failed_pipe.ok)
+            self.assertIn("exit_code=7", failed_pipe.content)
+            self.assertFalse(playwright_timeout.ok)
+            self.assertIn("Playwright 操作未完成", playwright_timeout.content)
+
     def test_browser_navigation_is_marked_as_state_change(self) -> None:
         self.assertTrue(
             _command_changes_target_state(
@@ -595,6 +988,12 @@ class ToolTests(unittest.TestCase):
         self.assertTrue(
             _command_changes_target_state(
                 "playwright-cli open https://platform.deepseek.com/usage"
+            )
+        )
+        self.assertTrue(
+            _command_changes_target_state(
+                "P=skills/playwright-cli-launcher/scripts/pw.sh && "
+                "bash $P -s=xhs click e126"
             )
         )
         self.assertFalse(
@@ -789,7 +1188,7 @@ class ToolTests(unittest.TestCase):
             self.assertTrue(read.ok)
             for result in (write, command, fetch):
                 self.assertFalse(result.ok)
-                self.assertIn("没有明确要求", result.content)
+                self.assertIn("需要明确授权", result.content)
             self.assertFalse((root / "new.txt").exists())
 
     def test_fetch_url_timeout_returns_structured_network_error(self) -> None:
@@ -824,6 +1223,47 @@ class ToolTests(unittest.TestCase):
             self.assertEqual(payload["timeout_sec"], 7)
             self.assertTrue(payload["retryable"])
             self.assertEqual(urlopen.call_args.kwargs["timeout"], 7)
+
+    def test_fetch_url_batch_runs_independent_requests_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            executor = self.make_executor(root)
+            executor.approvals.session_allow = True
+            lock = threading.Lock()
+            active = 0
+            maximum = 0
+
+            def fake_fetch(arguments, *, _approved=False):
+                nonlocal active, maximum
+                with lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                try:
+                    time.sleep(0.05)
+                    return ToolResult(True, f"body:{arguments['url']}")
+                finally:
+                    with lock:
+                        active -= 1
+
+            with patch.object(
+                executor,
+                "_fetch_url",
+                side_effect=fake_fetch,
+            ):
+                result = executor.execute(
+                    "fetch_url_batch",
+                    {
+                        "requests": [
+                            {"url": "https://example.com/a"},
+                            {"url": "https://example.com/b"},
+                        ]
+                    },
+                )
+
+            self.assertTrue(result.ok)
+            self.assertGreaterEqual(maximum, 2)
+            self.assertIn("body:https://example.com/a", result.content)
+            self.assertIn("body:https://example.com/b", result.content)
 
     def test_explicit_request_path_is_writable_for_that_turn_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -878,7 +1318,7 @@ class ToolTests(unittest.TestCase):
                 {"path": "blocked.txt", "content": "blocked"},
             )
             self.assertFalse(result.ok)
-            self.assertIn("没有明确要求", result.content)
+            self.assertIn("需要明确授权", result.content)
             self.assertFalse((root / "blocked.txt").exists())
 
 

@@ -84,6 +84,13 @@ class PolicyTests(unittest.TestCase):
         self.assertTrue(command_denial_reason("security find-generic-password -s deepseek"))
         self.assertEqual(command_denial_reason("git status --short"), "")
         self.assertEqual(command_risk("ls -la", workspace=Path.cwd()), "R0")
+        self.assertEqual(
+            command_risk(
+                "find . -iname '*test*' 2>/dev/null | head -20",
+                workspace=Path.cwd(),
+            ),
+            "R0",
+        )
         self.assertEqual(command_risk("python3 -m unittest", workspace=Path.cwd()), "R1")
         self.assertEqual(
             command_risk("shasum -a 256 reports/summary.json", workspace=Path.cwd()),
@@ -353,6 +360,32 @@ class PolicyTests(unittest.TestCase):
             approvals.permission_state(),
             {"command": "auto", "network": "auto", "write": "auto"},
         )
+
+    def test_explicit_task_capability_expires_with_the_turn(self) -> None:
+        approvals = ApprovalManager(auto_approve=False, interactive=False)
+        approvals.begin_task()
+        approvals.grant_task_capabilities(["command"])
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertTrue(
+                approvals.require(
+                    "运行命令",
+                    "printf ok",
+                    risk="R2",
+                    capability="command",
+                    use_task_grant=False,
+                )
+            )
+            approvals.end_task()
+            self.assertFalse(
+                approvals.require(
+                    "运行命令",
+                    "printf blocked",
+                    risk="R2",
+                    capability="command",
+                    use_task_grant=False,
+                )
+            )
 
     def test_network_grant_bypasses_popup_but_revoke_denies(self) -> None:
         approvals = ApprovalManager(

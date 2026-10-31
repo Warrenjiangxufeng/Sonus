@@ -986,6 +986,8 @@ def build_components(
         memory=memory,
         mcp_servers=config.mcp_servers,
         max_parallel_tools=config.max_parallel_tools,
+        read_only_command_prefixes=config.read_only_command_prefixes,
+        verification_command_prefixes=config.verification_command_prefixes,
     )
     session = SessionLogger(
         session_name,

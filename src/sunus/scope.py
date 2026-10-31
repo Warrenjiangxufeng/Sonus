@@ -212,12 +212,12 @@ def conversation_hint(
         return "task"
     if scope.allows_mutation or scope.allows_commands or scope.allows_network:
         return "task"
-    if relationship_configured and len(stripped) <= 80:
-        return "casual"
     if _RELATIONAL_PATTERN.search(stripped):
         return "casual"
     if _CASUAL_PATTERN.search(stripped):
         return "casual"
+    if relationship_configured and len(stripped) <= 80:
+        return "ambiguous"
     if len(stripped) <= 24 and not _MUTATION_PATTERN.search(stripped):
         return "ambiguous"
     return "task"

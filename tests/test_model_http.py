@@ -319,6 +319,70 @@ class ModelHttpTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
 
+    def test_truncated_chunked_stream_retries_and_returns_model_error(
+        self,
+    ) -> None:
+        class BrokenResponse:
+            status = 200
+            reason = "OK"
+
+            def __init__(self, error: Exception) -> None:
+                self.error = error
+
+            def readline(self):
+                raise self.error
+
+        class BrokenConnection:
+            sock = None
+
+            def __init__(self, error: Exception) -> None:
+                self.response = BrokenResponse(error)
+                self.closed = False
+
+            def request(self, *args, **kwargs):
+                return None
+
+            def getresponse(self):
+                return self.response
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as temp:
+            config = RuntimeConfig(
+                workspace=Path(temp),
+                data_dir=Path(temp),
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="deepseek-flash",
+            )
+            client = DeepSeekClient(config)
+            connections = [
+                BrokenConnection(ValueError("invalid chunk size")),
+                BrokenConnection(
+                    AttributeError(
+                        "'NoneType' object has no attribute 'close'"
+                    )
+                ),
+                BrokenConnection(ValueError("invalid chunk size")),
+            ]
+            with patch.object(
+                client,
+                "_open_connection",
+                side_effect=connections,
+            ) as open_connection:
+                with self.assertRaisesRegex(
+                    ModelError,
+                    "模型流式响应中断",
+                ) as raised:
+                    client.chat_stream(
+                        [{"role": "user", "content": "hello"}],
+                    )
+
+            self.assertEqual(open_connection.call_count, 3)
+            self.assertNotIsInstance(raised.exception, AttributeError)
+            self.assertTrue(all(connection.closed for connection in connections))
+
     def test_normalizes_textual_dsml_tool_calls(self) -> None:
         content = (
             "<｜｜DSML｜｜ calls>\n"

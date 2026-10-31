@@ -6,6 +6,17 @@ from typing import Any
 from sunus.memory import MemoryStore
 
 
+def _string_list(value: Any, *, limit: int = 6) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    values: list[str] = []
+    for item in value:
+        text = " ".join(str(item or "").split())[:300]
+        if text and text not in values:
+            values.append(text)
+    return values[:limit]
+
+
 def _lesson_for(
     *,
     mode: str,
@@ -102,6 +113,70 @@ def record_reasoning_trace(
             "operator_checkpoints": list(operator_checkpoints),
             "outcome": outcome,
             "perception": perception or {},
+        },
+    )
+
+
+def record_strategy_reflection(
+    memory: MemoryStore,
+    *,
+    scope: str,
+    receipt_id: str,
+    trace_id: str,
+    objective: str,
+    reason: str,
+    reflection: dict[str, Any],
+) -> str | None:
+    """Store a model-derived strategy as a candidate, never as an established rule."""
+    strategy = " ".join(str(reflection.get("strategy") or "").split())[:1200]
+    if not strategy:
+        return None
+    when_to_use = _string_list(reflection.get("when_to_use"))
+    avoid_when = _string_list(reflection.get("avoid_when"))
+    decisive = _string_list(reflection.get("decisive_evidence"))
+    unproductive = _string_list(reflection.get("unproductive_patterns"))
+    try:
+        confidence = min(
+            1.0,
+            max(0.0, float(reflection.get("confidence") or 0.0)),
+        )
+    except (TypeError, ValueError):
+        confidence = 0.0
+    content = (
+        "候选策略复盘："
+        f"目标={objective[:300]}；"
+        f"策略={strategy}；"
+        f"适用条件={'；'.join(when_to_use) or '未明确'}；"
+        f"不适用条件={'；'.join(avoid_when) or '未明确'}；"
+        f"决定性证据={'；'.join(decisive) or '未明确'}；"
+        f"低信息增益模式={'；'.join(unproductive) or '未明确'}；"
+        f"置信度={confidence:.2f}"
+    )
+    tags = ["strategy", "reflection", "candidate"]
+    if reason == "completed":
+        tags.append("promising")
+    elif reason in {"circuit_open", "model_error", "internal_error"}:
+        tags.append("failed")
+    else:
+        tags.append("partial")
+    return memory.add(
+        content=content,
+        scope=scope,
+        kind="strategy",
+        status="candidate",
+        tags=tuple(tags),
+        source="model_strategy_reflection",
+        evidence_kind="strategy_reflection",
+        receipt_id=receipt_id,
+        metadata={
+            "trace_id": trace_id,
+            "reason": reason,
+            "outcome": "untested",
+            "when_to_use": when_to_use,
+            "avoid_when": avoid_when,
+            "decisive_evidence": decisive,
+            "unproductive_patterns": unproductive,
+            "confidence": confidence,
         },
     )
 

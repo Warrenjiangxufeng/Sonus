@@ -123,11 +123,15 @@ class RequestScopeTests(unittest.TestCase):
         self.assertEqual(conversation_hint("靠近一点"), "ambiguous")
         self.assertEqual(
             conversation_hint("靠近一点", relationship_configured=True),
-            "casual",
+            "ambiguous",
         )
         self.assertEqual(
             conversation_hint("今天想吃什么", relationship_configured=True),
-            "casual",
+            "ambiguous",
+        )
+        self.assertEqual(
+            conversation_hint("关掉再重新登录", relationship_configured=True),
+            "ambiguous",
         )
         self.assertEqual(
             conversation_hint("分析当前项目架构", relationship_configured=True),
