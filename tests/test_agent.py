@@ -202,6 +202,31 @@ class ReflectionToolModel:
         )
 
 
+class CorrectionReflectionModel(CapturingReplyModel):
+    def __init__(self) -> None:
+        super().__init__("按纠正后的可验证证据重新执行。")
+        self.correction_trace: dict | None = None
+
+    def reflect_strategy(self, trace):
+        self.correction_trace = trace
+        return (
+            {
+                "strategy": (
+                    "判断命令或工具是否可用时，先核对实际可执行入口及其环境，"
+                    "再用最小验证确认；未经环境证据不要继续修改业务逻辑。"
+                ),
+                "when_to_use": ["用户纠正上一轮环境或工具判断"],
+                "avoid_when": ["已有成功的最小验证结果"],
+                "decisive_evidence": [
+                    "/usr/local/bin/example-tool 在独立解释器环境中可执行"
+                ],
+                "unproductive_patterns": ["只更换解释器路径但不核对入口"],
+                "confidence": 0.81,
+            },
+            {"prompt_tokens": 30, "completion_tokens": 20},
+        )
+
+
 class CleanHighCostReflectionModel(ReflectionToolModel):
     def __init__(self) -> None:
         super().__init__()
@@ -1602,6 +1627,98 @@ class AgentTests(unittest.TestCase):
                 event_types.index("turn_end"),
                 event_types.index("strategy_reflection_recorded"),
             )
+            memory.close()
+
+    def test_next_turn_correction_links_previous_trace_and_surfaces_lesson(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "workspace"
+            root.mkdir()
+            data = Path(temp) / "data"
+            config = RuntimeConfig(
+                workspace=root,
+                data_dir=data,
+                api_key="sk-test",
+                base_url="https://example.invalid",
+                model="fake",
+                max_steps=4,
+            )
+            memory = MemoryStore(data / "memory.db")
+            trace_id = memory.add(
+                content="策略轨迹：上一轮尝试了错误的环境入口。",
+                scope=str(root.resolve()),
+                kind="strategy",
+                status="candidate",
+                tags=("strategy", "trace"),
+                source="reasoning_trace",
+                metadata={"outcome": "pending"},
+            )
+            events = EventBus(data)
+            session = SessionLogger("s_correction_reflection", root, data)
+            tools = ToolExecutor(
+                workspace=root,
+                path_guard=PathGuard(root),
+                approvals=ApprovalManager(
+                    auto_approve=False,
+                    interactive=False,
+                    workspace=root,
+                ),
+                artifacts=ArtifactStore(root, data),
+                events=events,
+                memory=memory,
+            )
+            model = CorrectionReflectionModel()
+            agent = Agent(
+                config=config,
+                model=model,  # type: ignore[arg-type]
+                memory=memory,
+                tools=tools,
+                events=events,
+                session=session,
+            )
+            agent._last_strategy_id = trace_id
+            agent.messages.append(
+                {
+                    "role": "assistant",
+                    "content": "上一轮我使用了错误的测试解释器。",
+                }
+            )
+
+            result = agent.run_turn(
+                "不对，你上一轮环境找错了，先核对可执行入口"
+            )
+
+            self.assertIsNotNone(model.correction_trace)
+            self.assertIn(
+                "错误的环境入口",
+                model.correction_trace["previous_strategy"],  # type: ignore[index]
+            )
+            self.assertTrue(result.text.startswith("复盘："))
+            self.assertIn("先核对实际可执行入口", result.text)
+            self.assertNotIn("/usr/local/bin/example-tool", result.text)
+            rows = [
+                row
+                for row in memory.recent(
+                    scope=str(root.resolve()),
+                    limit=20,
+                )
+                if row.get("source") == "correction_reflection"
+            ]
+            self.assertEqual(len(rows), 1)
+            metadata = json.loads(rows[0]["metadata"])
+            self.assertEqual(
+                metadata["previous_strategy_id"],
+                trace_id,
+            )
+            self.assertIn(
+                "/usr/local/bin/example-tool",
+                metadata["decisive_evidence"][0],
+            )
+            self.assertNotIn("/usr/local/bin/example-tool", rows[0]["content"])
+            events_text = events.path.read_text(encoding="utf-8")
+            self.assertIn("correction_reflection_recorded", events_text)
+            self.assertIn("correction_lesson_surfaced", events_text)
             memory.close()
 
     def test_clean_high_cost_turn_skips_strategy_reflection(self) -> None:

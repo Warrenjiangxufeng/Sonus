@@ -252,6 +252,7 @@ class Agent:
         self._batch_hint_pending = False
         self._batch_hint_active = False
         self._batch_hint_seen = False
+        self._correction_lesson = ""
         self.reset()
 
     def reset(self) -> None:
@@ -280,6 +281,7 @@ class Agent:
         self._batch_hint_pending = False
         self._batch_hint_active = False
         self._batch_hint_seen = False
+        self._correction_lesson = ""
         self._session_memory_flushed = False
         self._base_context = self._base_system_prompt()
         self.messages = [{"role": "system", "content": ""}]
@@ -440,6 +442,7 @@ class Agent:
         self._batch_hint_pending = False
         self._batch_hint_active = False
         self._batch_hint_seen = False
+        self._correction_lesson = ""
         self.messages = [{"role": "system", "content": ""}, *repaired]
         self._apply_system_message()
 
@@ -1655,10 +1658,10 @@ class Agent:
     def _apply_previous_strategy_feedback(
         self,
         perception: Perception,
-    ) -> None:
+    ) -> tuple[str, str] | None:
         feedback = set(perception.response_feedback)
         if not feedback:
-            return
+            return None
         if feedback & {
             "回应被纠正",
             "对方仍不安",
@@ -1675,7 +1678,7 @@ class Agent:
             outcome = "neutral"
         pending = self.memory.latest_pending_strategy(scope=self.scope)
         if pending is None:
-            return
+            return None
         memory_id = str(pending["id"])
         self.memory.resolve_strategy_outcome(
             memory_id,
@@ -1689,6 +1692,124 @@ class Agent:
             feedback=sorted(feedback),
             summary=f"上一轮策略效果结算为 {outcome}",
         )
+        return memory_id, outcome
+
+    def _reflect_correction(
+        self,
+        *,
+        user_input: str,
+        previous_assistant: str,
+        previous_strategy_id: str,
+        feedback: tuple[str, ...],
+        turn_id: str,
+    ) -> dict[str, Any]:
+        reflector = getattr(self.model, "reflect_strategy", None)
+        usage: dict[str, Any] = {}
+        reflection: dict[str, Any] | None = None
+        previous_strategy = (
+            self.memory.get(previous_strategy_id)
+            if previous_strategy_id
+            else None
+        )
+        if callable(reflector):
+            payload = {
+                "objective": "复盘用户对上一轮操作的明确纠正",
+                "correction": user_input[:4000],
+                "previous_assistant_reply": previous_assistant[:3000],
+                "previous_strategy": str(
+                    (previous_strategy or {}).get("content") or ""
+                )[:3000],
+                "feedback": list(feedback),
+                "requirements": [
+                    "strategy 必须写成环境无关的通用规则",
+                    "具体路径、解释器、测试框架和一次性环境事实只能放在 decisive_evidence",
+                    "不要猜测用户未表达的动机",
+                ],
+            }
+            try:
+                reflection, usage = reflector(payload)
+                if not isinstance(reflection, dict):
+                    reflection = None
+            except ModelCancelled:
+                raise
+            except Exception as error:
+                self.events.emit(
+                    "correction_reflection_error",
+                    turn_id=turn_id,
+                    summary=f"纠正复盘生成失败，使用确定性教训: {error}",
+                )
+        strategy = " ".join(
+            str((reflection or {}).get("strategy") or "").split()
+        )[:1200]
+        if not strategy:
+            strategy = (
+                "收到用户对上一轮的明确纠正时，先指出原判断错在哪个可观察事实，"
+                "再用新的运行证据重新判断；不要把未经环境验证的假设继续作为行动前提。"
+            )
+        raw_decisive = (reflection or {}).get("decisive_evidence", [])
+        raw_when = (reflection or {}).get("when_to_use", [])
+        raw_avoid = (reflection or {}).get("avoid_when", [])
+        decisive_evidence = [
+            str(item)[:1000]
+            for item in (raw_decisive if isinstance(raw_decisive, list) else [])
+            if str(item).strip()
+        ][:8]
+        when_to_use = [
+            str(item)[:500]
+            for item in (raw_when if isinstance(raw_when, list) else [])
+            if str(item).strip()
+        ][:8]
+        avoid_when = [
+            str(item)[:500]
+            for item in (raw_avoid if isinstance(raw_avoid, list) else [])
+            if str(item).strip()
+        ][:8]
+        try:
+            confidence = min(
+                1.0,
+                max(0.0, float((reflection or {}).get("confidence") or 0.6)),
+            )
+        except (TypeError, ValueError):
+            confidence = 0.6
+        lesson_id = self.memory.add(
+            content=f"纠正复盘通用教训：{strategy}",
+            scope=self.scope,
+            kind="lesson",
+            status="supported",
+            tags=("lesson", "correction", "visible", "reflection"),
+            source="correction_reflection",
+            evidence_kind="user_correction",
+            metadata={
+                "turn_id": turn_id,
+                "previous_strategy_id": previous_strategy_id,
+                "feedback": list(feedback),
+                "correction_text": user_input[:4000],
+                "decisive_evidence": decisive_evidence,
+                "when_to_use": when_to_use,
+                "avoid_when": avoid_when,
+                "confidence": confidence,
+            },
+        )
+        visible = (
+            "复盘：上一轮我的判断被你纠正。"
+            f"这次要记住的规则是：{strategy}"
+        )
+        self._correction_lesson = visible
+        self.events.emit(
+            "correction_reflection_recorded",
+            turn_id=turn_id,
+            memory_id=lesson_id,
+            previous_strategy_id=previous_strategy_id,
+            visible=True,
+            feedback=list(feedback),
+            usage=usage,
+            summary="已生成用户可见的纠正复盘",
+        )
+        return {
+            "lesson": visible,
+            "memory_id": lesson_id,
+            "usage": usage,
+        }
 
     def _finalize_circuit_answer(
         self,
@@ -1818,6 +1939,7 @@ class Agent:
         self._batch_hint_pending = False
         self._batch_hint_active = False
         self._batch_hint_seen = False
+        self._correction_lesson = ""
         self.events.emit(
             "turn_started",
             turn_id=turn_id,
@@ -1909,6 +2031,7 @@ class Agent:
         )
         affect_snapshot = None
         appraisal_usage: dict[str, Any] = {}
+        correction_usage: dict[str, Any] = {}
         relationship = (
             self._turn_relationship
             if self._relationship_update_pending
@@ -1933,12 +2056,38 @@ class Agent:
                 previous_assistant=previous_assistant,
             )
         self._turn_perception = perception
+        previous_strategy_feedback: tuple[str, str] | None = None
         try:
-            self._apply_previous_strategy_feedback(perception)
+            previous_strategy_feedback = self._apply_previous_strategy_feedback(
+                perception
+            )
         except Exception as error:
             self.events.emit(
                 "memory_write_error",
                 summary=f"上一轮策略效果结算失败: {error}",
+            )
+        if "回应被纠正" in perception.response_feedback:
+            previous_strategy_id = (
+                previous_strategy_feedback[0]
+                if previous_strategy_feedback is not None
+                else self._last_strategy_id
+            )
+            correction = self._reflect_correction(
+                user_input=user_input,
+                previous_assistant=previous_assistant,
+                previous_strategy_id=previous_strategy_id,
+                feedback=tuple(perception.response_feedback),
+                turn_id=turn_id,
+            )
+            correction_usage = dict(correction.get("usage") or {})
+            for key, value in correction_usage.items():
+                if isinstance(value, (int, float)):
+                    usage[key] = usage.get(key, 0) + value
+            self._runtime_policy_prompt = (
+                self._runtime_policy_prompt
+                + "\n\n用户纠正复盘（必须先在回复里承认具体错误，"
+                "再按该规则修正本轮行动）：\n"
+                + self._correction_lesson
             )
         try:
             affect_snapshot = self.affect.observe(
@@ -2087,6 +2236,11 @@ class Agent:
             controller.record_auxiliary_model_call(
                 appraisal_usage,
                 purpose="structured_perception",
+            )
+        if correction_usage:
+            controller.record_auxiliary_model_call(
+                correction_usage,
+                purpose="correction_reflection",
             )
 
         try:
@@ -2979,6 +3133,15 @@ class Agent:
                     limit=response_limit,
                     summary="闲聊回复已按配置压缩为短答",
                 )
+
+        if self._correction_lesson and self._correction_lesson not in final_text:
+            final_text = f"{self._correction_lesson}\n\n{final_text}".strip()
+            structured_result["summary"] = final_text
+            self.events.emit(
+                "correction_lesson_surfaced",
+                turn_id=turn_id,
+                summary="纠正复盘已加入用户可见回复",
+            )
 
         changed_files = sorted(set(changed_files))
         metrics = controller.snapshot()
